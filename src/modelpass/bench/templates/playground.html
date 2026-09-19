@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+{% block title %}Playground &middot; modelpass bench{% endblock %}
+{% block body %}
+
+<h2 style="margin-top:0">Test playground</h2>
+
+<div class="notice">
+  <strong>This page spends real allowance.</strong>
+  Every send is a genuine run on the connection you pick, against the subscription or
+  key it is configured with. Nothing here is simulated. The usage for each run is shown
+  at the bottom of its log, and the run is recorded in the
+  <a href="/runs">run log</a>.
+</div>
+
+{% if not connections %}
+  <div class="panel">
+    <p><strong>No connections configured</strong> &mdash; nothing to run against.</p>
+    <p class="muted small"><a href="/accounts/new">Add one</a> first.</p>
+  </div>
+{% else %}
+
+<div class="panel">
+  <div class="grid2">
+    <div class="field">
+      <label for="connection">Account</label>
+      <select id="connection">
+        {% for c in connections %}
+          <option value="{{ c.name }}" {{ 'disabled' if not c.enabled }}
+                  data-runtime="{{ c.runtime }}"
+                  data-auth="{{ c.auth_mode }}"
+                  data-tools="{{ 'yes' if c.tools_supported else 'no' }}"
+                  data-tools-support="{{ c.tools_support }}"
+                  data-tools-note="{{ c.tools_note or '' }}"
+                  data-guards="{{ 'yes' if c.guards_configured else 'no' }}"
+                  data-model="{{ c.model or '' }}"
+                  data-model-source="{{ c.model_source }}"
+                  data-model-exact="{{ 'yes' if c.model_exact else 'no' }}"
+                  data-model-problem="{{ c.model_problem or '' }}"
+                  data-model-notes="{{ c.model_notes | join(' | ') }}"
+                  data-models="{{ c.models | tojson | forceescape }}">
+            {{ c.display_name }}{% if c.display_name != c.name %} ({{ c.name }}){% endif %}
+            — {{ c.runtime }} / {{ c.auth_mode }}{{ ' (disabled)' if not c.enabled }}
+          </option>
+        {% endfor %}
+      </select>
+      <div class="small muted" id="conn-note" style="margin-top:6px"></div>
+    </div>
+
+    <div class="field">
+      <label for="model">Model</label>
+      <select id="model"></select>
+      <div class="small muted" id="model-source" style="margin-top:6px"></div>
+      <div class="field" id="model-free-wrap" style="margin-top:8px; display:none">
+        <label for="model-free">Exact model id</label>
+        <input type="text" id="model-free" autocomplete="off" spellcheck="false"
+               placeholder="e.g. claude-sonnet-4-6">
+      </div>
+    </div>
+  </div>
+
+  <div class="field">
+    <label for="message">Message</label>
+    <textarea id="message" rows="3"
+              placeholder="Say hello, then call the hello_world tool for Ada."></textarea>
+  </div>
+
+  <div class="row" style="margin-bottom:10px">
+    <label class="row" style="margin:0" id="tool-label">
+      <input type="checkbox" id="tool" style="width:auto">
+      Attach the <code>hello_world</code> tool
+    </label>
+    <span class="small muted" id="tool-note"></span>
+  </div>
+
+  <div class="row">
+    <button id="send" class="primary">Send &mdash; spends allowance</button>
+    <span class="small muted" id="status"></span>
+  </div>
+</div>
+
+<details class="panel">
+  <summary class="small muted">The tool that gets attached</summary>
+  <p class="small muted" style="margin-top:10px">
+    One caller-supplied tool, executed <strong>in this process</strong> and handed to
+    the runtime as an in-process MCP server. It returns a timestamp generated here, at
+    the moment of the call &mdash; which is the part a model could not have written
+    without actually calling it.
+  </p>
+  <pre>{{ tool | tojson(indent=2) }}</pre>
+</details>
+
+<h2>Event log</h2>
+<p class="small muted">
+  Every event exactly as the caller receives it, in arrival order. This stream
+  <em>is</em> the transparency story: the receipt, the deltas, the usage, the guard
+  events, and a terminal stamped with the connection and the auth mode that actually
+  paid for the run.
+</p>
+<div class="panel">
+  <div id="assistant" class="mono" style="white-space:pre-wrap; min-height:1.5em; margin-bottom:14px"></div>
+  <div class="table-wrap">
+    <table id="log">
+      <tr><th style="width:130px">event</th><th>payload</th></tr>
+    </table>
+  </div>
+  <div id="summary" class="small" style="margin-top:12px"></div>
+</div>
+
+<script>
+(function () {
+  var connectionEl = document.getElementById('connection');
+  var modelEl = document.getElementById('model');
+  var modelFreeWrap = document.getElementById('model-free-wrap');
+  var modelFreeEl = document.getElementById('model-free');
+  var modelSourceEl = document.getElementById('model-source');
+  var toolEl = document.getElementById('tool');
+  var toolNoteEl = document.getElementById('tool-note');
+  var connNoteEl = document.getElementById('conn-note');
+  var sendEl = document.getElementById('send');
+  var statusEl = document.getElementById('status');
+  var logEl = document.getElementById('log');
+  var assistantEl = document.getElementById('assistant');
+  var summaryEl = document.getElementById('summary');
+  var FREE = '__free__';
+
+  function selected() { return connectionEl.options[connectionEl.selectedIndex]; }
+
+  function refresh() {
+    var opt = selected();
+    if (!opt) { return; }
+
+    // Capability gate, shown rather than silently ignored.
+    var supported = opt.dataset.tools === 'yes';
+    toolEl.disabled = !supported;
+    if (!supported) { toolEl.checked = false; }
+    toolNoteEl.textContent = supported
+      ? ''
+      : 'tools_in_process is ' + opt.dataset.toolsSupport + ' on ' + opt.dataset.runtime
+        + (opt.dataset.toolsNote ? ' — ' + opt.dataset.toolsNote : '');
+
+    connNoteEl.textContent = opt.dataset.guards === 'yes'
+      ? 'Spend guards are configured on this connection.'
+      : 'No spend guards configured on this connection: nothing bounds what one run may spend.';
+
+    // Model picker, rebuilt per connection.
+    var models = [];
+    try { models = JSON.parse(opt.dataset.models || '[]'); } catch (e) { models = []; }
+    modelEl.innerHTML = '';
+    var dflt = document.createElement('option');
+    dflt.value = '';
+    dflt.textContent = opt.dataset.model
+      ? "the connection's model (" + opt.dataset.model + ')'
+      : "the runtime's default";
+    modelEl.appendChild(dflt);
+    models.forEach(function (m) {
+      var o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = m.label + (m.label === m.id ? '' : '  (' + m.id + ')');
+      if (m.description) { o.title = m.description; }
+      modelEl.appendChild(o);
+    });
+    var free = document.createElement('option');
+    free.value = FREE;
+    free.textContent = 'other — type an exact model id…';
+    modelEl.appendChild(free);
+
+    var bits = [];
+    bits.push(opt.dataset.modelExact === 'yes'
+      ? "The vendor's own list: " + opt.dataset.modelSource
+      : 'Not a vendor model list — ' + opt.dataset.modelSource);
+    if (opt.dataset.modelProblem) { bits.push(opt.dataset.modelProblem); }
+    if (opt.dataset.modelNotes) {
+      opt.dataset.modelNotes.split(' | ').forEach(function (n) { if (n) { bits.push(n); } });
+    }
+    modelSourceEl.textContent = bits.join(' ');
+    onModelChange();
+  }
+
+  function onModelChange() {
+    modelFreeWrap.style.display = modelEl.value === FREE ? 'block' : 'none';
+  }
+
+  function chosenModel() {
+    if (modelEl.value === FREE) { return modelFreeEl.value.trim(); }
+    return modelEl.value;
+  }
+
+  function row(label, cls, text) {
+    var tr = document.createElement('tr');
+    var th = document.createElement('td');
+    var span = document.createElement('span');
+    span.className = 'tag' + (cls ? ' ' + cls : '');
+    span.textContent = label;
+    th.appendChild(span);
+    var td = document.createElement('td');
+    var pre = document.createElement('pre');
+    pre.textContent = text;
+    td.appendChild(pre);
+    tr.appendChild(th);
+    tr.appendChild(td);
+    logEl.appendChild(tr);
+    return tr;
+  }
+
+  var CLASSES = {
+    terminal: 'ok', guard_stop: 'bad', guard_warning: 'warn',
+    failover: 'warn', tool_call: 'warn', tool_result: 'warn'
+  };
+
+  function render(event) {
+    var type = event.type || 'event';
+    var cls = CLASSES[type] || '';
+    if (type === 'terminal' && event.status && event.status !== 'ok') { cls = 'bad'; }
+    if (type === 'text_delta') {
+      assistantEl.textContent += event.text || '';
+    }
+    row(type, cls, JSON.stringify(event, null, 2));
+    if (type === 'terminal') {
+      var u = event.usage || {};
+      var parts = [
+        'Terminal: ' + event.status,
+        'connection ' + event.connection,
+        'auth mode ' + event.auth_mode,
+        (u.total_tokens || 0) + ' tokens (' + (u.input_tokens || 0) + ' in / '
+          + (u.output_tokens || 0) + ' out)'
+      ];
+      if (event.failed_over_from) {
+        parts.push('failed over from ' + event.failed_over_from);
+      }
+      if (event.reason) { parts.push(event.reason); }
+      summaryEl.textContent = parts.join(' · ');
+      summaryEl.className = 'small';
+      if (event.status !== 'ok') { summaryEl.className = 'small'; }
+    }
+  }
+
+  function send() {
+    var opt = selected();
+    if (!opt) { return; }
+    logEl.innerHTML = '<tr><th style="width:130px">event</th><th>payload</th></tr>';
+    assistantEl.textContent = '';
+    summaryEl.textContent = '';
+    sendEl.disabled = true;
+    statusEl.textContent = 'running…';
+
+    fetch('/playground/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        connection: opt.value,
+        message: document.getElementById('message').value,
+        model: chosenModel(),
+        tool: toolEl.checked
+      })
+    }).then(function (response) {
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = '';
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) {
+            handle(buffer);
+            sendEl.disabled = false;
+            statusEl.textContent = 'done';
+            return;
+          }
+          buffer += decoder.decode(chunk.value, { stream: true });
+          var lines = buffer.split('\n');
+          buffer = lines.pop();
+          lines.forEach(handle);
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function (err) {
+      row('transport', 'bad', String(err));
+      sendEl.disabled = false;
+      statusEl.textContent = 'failed';
+    });
+  }
+
+  function handle(line) {
+    line = (line || '').trim();
+    if (!line) { return; }
+    var payload;
+    try { payload = JSON.parse(line); } catch (e) { return; }
+    if (payload.kind === 'event') { render(payload.event); }
+    else if (payload.kind === 'error') {
+      row(payload.error_type || 'error', 'bad', payload.error);
+      summaryEl.textContent = 'The run did not complete: ' + payload.error;
+    } else if (payload.kind === 'run_started') {
+      row('run started', '', JSON.stringify(payload, null, 2));
+    }
+  }
+
+  connectionEl.addEventListener('change', refresh);
+  modelEl.addEventListener('change', onModelChange);
+  sendEl.addEventListener('click', send);
+  refresh();
+})();
+</script>
+
+{% endif %}
+{% endblock %}

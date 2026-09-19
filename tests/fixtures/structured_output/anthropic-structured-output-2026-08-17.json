@@ -1,0 +1,124 @@
+[
+  {
+    "class": "SystemMessage",
+    "subtype": "init",
+    "tools": [
+      "StructuredOutput"
+    ],
+    "capabilities": [
+      "interrupt_receipt_v1",
+      "interrupt_cancel_queued_v1",
+      "msg_lifecycle_v1"
+    ],
+    "apiKeySource": "none",
+    "mcp_servers": "[redacted: the machine's own configured servers]"
+  },
+  {
+    "class": "RateLimitEvent"
+  },
+  {
+    "class": "AssistantMessage",
+    "blocks": [
+      {
+        "class": "TextBlock",
+        "text": "4"
+      }
+    ],
+    "usage": {
+      "input_tokens": 2,
+      "cache_creation_input_tokens": 605,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 605
+      },
+      "output_tokens": 1,
+      "service_tier": "standard",
+      "inference_geo": "not_available"
+    }
+  },
+  {
+    "class": "AssistantMessage",
+    "blocks": [
+      {
+        "class": "ToolUseBlock",
+        "id": "toolu_FIXTURE",
+        "name": "StructuredOutput",
+        "input": {
+          "answer": "4",
+          "confidence": "high"
+        }
+      }
+    ],
+    "usage": {
+      "input_tokens": 2,
+      "cache_creation_input_tokens": 605,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 605
+      },
+      "output_tokens": 1,
+      "service_tier": "standard",
+      "inference_geo": "not_available"
+    }
+  },
+  {
+    "class": "UserMessage",
+    "blocks": [
+      {
+        "class": "ToolResultBlock",
+        "tool_use_id": "toolu_FIXTURE",
+        "is_error": null,
+        "content": "Structured output provided successfully"
+      }
+    ],
+    "usage": null
+  },
+  {
+    "class": "ResultMessage",
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 2,
+    "terminal_reason": "completed",
+    "stop_reason": "tool_use",
+    "result": "{\"answer\":\"4\",\"confidence\":\"high\"}",
+    "structured_output": {
+      "answer": "4",
+      "confidence": "high"
+    },
+    "usage": {
+      "input_tokens": 2,
+      "cache_creation_input_tokens": 605,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 77,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 605,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "not_available",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 77,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 605,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 605
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard"
+    }
+  }
+]

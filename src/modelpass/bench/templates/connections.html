@@ -1,0 +1,443 @@
+{% extends "base.html" %}
+{% block title %}Accounts &middot; modelpass bench{% endblock %}
+{% block body %}
+
+{% if note %}
+  <div class="notice {{ 'bad' if note_kind == 'error' else 'ok' }}">{{ note }}</div>
+{% endif %}
+
+<div class="between">
+  <h2 style="margin-top:0">Configured accounts</h2>
+  <a class="btn" href="/accounts/new">New account</a>
+</div>
+<p class="muted small">
+  From <code>{{ store_path }}</code>. Each profile combines a vendor account with its
+  storage boundary. Clients select the stable ID; people see the nickname.
+</p>
+
+{% if group_filter %}
+  <div class="notice">
+    Showing the accounts in group <code>{{ group_filter }}</code>.
+    <a href="/">Show all accounts</a> &middot; <a href="/groups">Groups</a>
+  </div>
+{% endif %}
+
+{% for n in store_notes %}
+  <div class="notice bad">{{ n }}</div>
+{% endfor %}
+
+{% if not connections %}
+  <div class="panel">
+    <p><strong>No accounts configured.</strong></p>
+    <p class="muted small">
+      A fresh install has no AI connectivity at all &mdash; that is the design, not a
+      missing step. Add one with the button above, or on the command line with
+      <code>modelpass connect anthropic</code>.
+    </p>
+  </div>
+{% endif %}
+
+{% for c in connections %}
+  <div class="panel {{ 'disabled-row' if not c.enabled }}">
+    <div class="between">
+      <h3>
+        {{ c.display_name }}
+        {% if c.nickname %}<span class="muted small">id: {{ c.name }}</span>{% endif %}
+        {% if not c.enabled %}<span class="tag bad">disabled</span>{% endif %}
+        {% if c.auth_mode == 'subscription' %}
+          <span class="tag ok">subscription</span>
+          {% if c.identity_verified %}
+            <span class="tag ok">identity verified</span>
+          {% else %}
+            <span class="tag warn">identity not verified</span>
+          {% endif %}
+        {% else %}
+          <span class="tag warn">metered api_key</span>
+        {% endif %}
+        {% if not c.guards_configured %}<span class="tag warn">no spend guards</span>{% endif %}
+        {% for g in c.groups %}<span class="tag"><a href="/?group={{ g }}">{{ g }}</a></span>{% endfor %}
+      </h3>
+      <div class="row">
+        <a class="btn" href="/?check={{ c.name }}#receipt">Check</a>
+        <a class="btn" href="/accounts/{{ c.name }}/edit">Edit</a>
+        <form class="inline" method="post" action="/accounts/{{ c.name }}/enabled">
+          <input type="hidden" name="enabled" value="{{ 'false' if c.enabled else 'true' }}">
+          <button type="submit">{{ 'Disable' if c.enabled else 'Enable' }}</button>
+        </form>
+        {% if c.auth_mode == 'subscription' %}
+          <form class="inline" method="post" action="/accounts/{{ c.name }}/verify"
+                onsubmit="return confirm('Pin {{ c.name }} to the vendor account currently logged in?');">
+            <button type="submit">{{ 'Re-verify' if c.verified_identity else 'Verify identity' }}</button>
+          </form>
+        {% elif c.is_compatible %}
+          {# The one button on this page that spends, so it says so before it does:
+             three short calls against whatever the base URL points at. #}
+          <form class="inline" method="post" action="/accounts/{{ c.name }}/verify"
+                onsubmit="return confirm('Drive {{ c.name }} with three short calls -- one chat, one tool round trip, one structured-output request? Against a metered endpoint this spends a few hundred tokens.');">
+            <button type="submit">{{ 'Re-verify capabilities' if c.verified_any else 'Verify capabilities' }}</button>
+          </form>
+        {% endif %}
+        <form class="inline" method="post" action="/accounts/{{ c.name }}/delete"
+              onsubmit="return confirm('Delete account {{ c.name }}? Its guard thresholds go with it.');">
+          <button type="submit">Delete</button>
+        </form>
+      </div>
+    </div>
+
+    <dl class="fields">
+      <dt>vendor</dt><dd class="mono">{{ c.vendor }}</dd>
+      <dt>stable ID</dt><dd class="mono">{{ c.name }}</dd>
+      <dt>runtime</dt><dd class="mono">{{ c.runtime }}</dd>
+      <dt>auth mode</dt><dd class="mono">{{ c.auth_mode }}</dd>
+      <dt>groups</dt>
+      <dd class="mono">
+        {{ c.groups | join(', ') }}
+        {% if not c.declared_groups %}
+          <span class="muted small">&mdash; this account names no group, which is what
+          puts it in <code>default</code>.</span>
+        {% endif %}
+      </dd>
+      <dt>credentialRef</dt>
+      <dd class="mono">
+        {{ c.credential_ref }}
+        <span class="muted">&mdash; {{ c.credential_describes }}</span>
+        {% if not c.credential_present %}
+          <span class="tag bad">not set in this environment</span>
+        {% endif %}
+      </dd>
+      {% if c.base_url %}<dt>base URL</dt><dd class="mono">{{ c.base_url }}</dd>{% endif %}
+      {% if c.model %}<dt>model</dt><dd class="mono">{{ c.model }}</dd>{% endif %}
+      <dt>timeout</dt>
+      <dd>
+        {% if c.timeout_seconds %}
+          {{ c.timeout_seconds }}s
+          <span class="muted small">&mdash; the default bound for calls here; a call
+          that names its own replaces it rather than being clamped by it.</span>
+        {% else %}
+          <span class="muted">unbounded &mdash; no <code>timeoutSeconds</code> is set,
+          so a call runs until it finishes or the caller passes a bound.</span>
+        {% endif %}
+      </dd>
+      <dt>retry</dt>
+      <dd>
+        {% if c.retry == 'never' %}
+          <span class="tag warn">never</span>
+          <span class="muted small">&mdash; every retryable verdict on this connection
+          reads <code>no</code>. modelpass never retries for you either way; this is what
+          your own loop is told.</span>
+        {% else %}
+          default
+          <span class="muted small">&mdash; verdicts are classified from typed facts.
+          modelpass never retries for you; the loop is yours.</span>
+        {% endif %}
+      </dd>
+      {% if c.verified_any %}
+        <dt>verified capabilities</dt>
+        <dd>
+          <span class="mono">{{ c.verified.supported | join(', ') or 'nothing' }}</span>
+          {% if c.verified.unsupported %}
+            <div class="small muted">not supported:
+              <span class="mono">{{ c.verified.unsupported | join(', ') }}</span></div>
+          {% endif %}
+          <div class="small muted">
+            checked {{ c.verified.checked_at or 'at an unrecorded time' }}
+            {% if c.verified.models %}
+              &mdash; models seen: <span class="mono">{{ c.verified.models | join(', ') }}</span>
+            {% endif %}
+          </div>
+        </dd>
+      {% elif c.is_compatible %}
+        <dt>verified capabilities</dt>
+        <dd class="tag warn">
+          Nothing yet. This runtime names an API <em>shape</em>, so every cell reads
+          <code>unverified</code> &mdash; including <code>chat</code> &mdash; until a
+          drive answers for your endpoint. Use Verify above.
+        </dd>
+      {% endif %}
+      {% if c.config_dir %}<dt>config root</dt><dd class="mono">{{ c.config_dir }}</dd>{% endif %}
+      {% if c.setup_note %}<dt>one-time setup</dt><dd>{{ c.setup_note }}</dd>{% endif %}
+      {% if c.verified_identity %}
+        <dt>pinned identity</dt>
+        <dd class="mono">
+          {% if c.verified_identity.email %}{{ c.verified_identity.email }}{% endif %}
+          {% if c.verified_identity.organization_id %}
+            {% if c.verified_identity.email %}; {% endif %}org {{ c.verified_identity.organization_id }}
+          {% endif %}
+        </dd>
+      {% elif c.auth_mode == 'subscription' %}
+        <dt>identity protection</dt>
+        <dd class="tag warn">Not pinned. Verify this account before relying on its nickname.</dd>
+      {% endif %}
+      {% if c.auth_mode == 'subscription' %}
+        <dt>live profile</dt>
+        <dd class="muted small">
+          This page reads only what is configured &mdash; it asks no vendor anything.
+          <a href="/?check={{ c.name }}#receipt">Check</a> runs the token-free identity
+          probe and shows the account the runtime is logged into right now.
+        </dd>
+      {% endif %}
+      <dt>guards</dt>
+      <dd>
+        {% if c.guards_configured %}
+          {{ c.guard_thresholds | join('; ') }}
+        {% else %}
+          <strong>no spend guards configured</strong>
+          <span class="muted">&mdash; nothing bounds what one run on this connection
+          may spend. modelpass ships no default threshold because it has no basis for a
+          number; see docs/guards.md.</span>
+        {% endif %}
+      </dd>
+      <dt>on quota exhausted</dt>
+      <dd>
+        {% if c.quota_failover %}
+          fail over to <code>{{ c.quota_failover }}</code>
+        {% else %}
+          stop cleanly
+        {% endif %}
+      </dd>
+      <dt>scrubbed at launch</dt>
+      <dd class="mono">
+        {% if c.scrubbed %}{{ c.scrubbed | join(', ') }}
+        {% else %}<span class="muted">nothing on the scrub list is set right now</span>{% endif %}
+      </dd>
+      {% if c.kept %}
+        <dt>kept</dt><dd class="mono">{{ c.kept | join(', ') }}</dd>
+      {% endif %}
+      {% if c.allow_env %}
+        <dt>allowEnv</dt><dd class="mono">{{ c.allow_env | join(', ') }}</dd>
+      {% endif %}
+      {% if c.description %}
+        <dt>note</dt><dd>{{ c.description }}</dd>
+      {% endif %}
+      {% if c.plan_problem %}
+        <dt>problem</dt><dd class="tag bad">{{ c.plan_problem }}</dd>
+      {% endif %}
+    </dl>
+  </div>
+{% endfor %}
+
+{% if receipt %}
+  <h2 id="receipt">Preflight receipt &mdash; {{ receipt.connection }}</h2>
+  {% if receipt.failed %}
+    <div class="notice bad">
+      <strong>The preflight could not run.</strong>
+      <div class="small mono" style="margin-top:6px">{{ receipt.failed }}</div>
+    </div>
+  {% else %}
+    <div class="panel">
+      <p class="mono">{{ receipt.summary }}</p>
+      <dl class="fields">
+        <dt>runtime</dt><dd class="mono">{{ receipt.runtime }}</dd>
+        <dt>requested mode</dt><dd class="mono">{{ receipt.requested_auth_mode }}</dd>
+        <dt>detected mode</dt>
+        <dd class="mono">
+          {% if receipt.detected_auth_mode %}
+            {{ receipt.detected_auth_mode }}
+          {% else %}
+            <span class="muted">declared, not confirmed &mdash; the runtime did not
+            report a mode</span>
+          {% endif %}
+        </dd>
+        <dt>credential source</dt><dd>{{ receipt.credential_source or '—' }}</dd>
+        {% if receipt.account %}<dt>account</dt><dd>{{ receipt.account }}</dd>{% endif %}
+        {% if receipt.plan_name %}<dt>plan</dt><dd>{{ receipt.plan_name }}</dd>{% endif %}
+        <dt>identity</dt>
+        <dd>
+          {% if receipt.identity_verified == true %}<span class="tag ok">VERIFIED</span>
+          {% elif receipt.identity_verified == false %}<span class="tag bad">MISMATCH</span>
+          {% else %}<span class="tag warn">NOT PINNED</span>{% endif %}
+        </dd>
+        {% if receipt.account_profile %}
+          {% if receipt.account_profile.organization_name %}
+            <dt>organization</dt><dd>{{ receipt.account_profile.organization_name }}</dd>
+          {% endif %}
+          {% if receipt.account_profile.organization_id %}
+            <dt>organization ID</dt><dd class="mono">{{ receipt.account_profile.organization_id }}</dd>
+          {% endif %}
+          {% if receipt.account_profile.auth_method %}
+            <dt>login method</dt><dd class="mono">{{ receipt.account_profile.auth_method }}</dd>
+          {% endif %}
+          {% if receipt.account_profile.api_provider %}
+            <dt>API provider</dt><dd class="mono">{{ receipt.account_profile.api_provider }}</dd>
+          {% endif %}
+          {% if receipt.account_profile.subscription_type %}
+            <dt>subscription type</dt><dd class="mono">{{ receipt.account_profile.subscription_type }}</dd>
+          {% endif %}
+          <dt>profile source</dt><dd class="mono">{{ receipt.account_profile.source }}</dd>
+        {% endif %}
+        <dt>scrubbed</dt>
+        <dd class="mono">
+          {% if receipt.scrubbed %}{{ receipt.scrubbed | join(', ') }}
+          {% else %}<span class="muted">nothing to scrub</span>{% endif %}
+        </dd>
+        {% if receipt.preserved %}
+          <dt>kept (credential)</dt><dd class="mono">{{ receipt.preserved | join(', ') }}</dd>
+        {% endif %}
+        {% if receipt.passthrough %}
+          <dt>kept (allowEnv)</dt><dd class="mono">{{ receipt.passthrough | join(', ') }}</dd>
+        {% endif %}
+        {% for d in receipt.directives %}
+          <dt>directive</dt>
+          <dd class="mono">{{ d.name }} = {{ d.value }}
+            <span class="muted">&mdash; {{ d.reason }}</span></dd>
+        {% endfor %}
+        {% for n in receipt.notes %}
+          <dt>note</dt><dd>{{ n }}</dd>
+        {% endfor %}
+        <dt>guards</dt>
+        <dd>{{ receipt.guard_note or 'configured' }}</dd>
+        {% if receipt.cache_note %}
+          <dt>cache</dt>
+          <dd>{{ receipt.cache_note }}</dd>
+        {% endif %}
+        <dt>status</dt>
+        <dd>
+          {% if receipt.ok %}<span class="tag ok">OK</span>
+          {% else %}<span class="tag bad">FAILED &mdash; {{ receipt.problem }}</span>{% endif %}
+          {% if not receipt.enabled %}
+            <span class="tag bad">disabled</span>
+            <span class="muted small">&mdash; the preflight still runs; what
+            <code>enabled = false</code> switches off is spending, not looking.</span>
+          {% endif %}
+        </dd>
+      </dl>
+    </div>
+  {% endif %}
+{% endif %}
+
+<h2>Stored keys</h2>
+<div class="panel">
+  {% if not secrets.exists %}
+    <p class="muted">
+      No secrets file at <code>{{ secrets.path }}</code>. Nothing is stored, which is
+      the normal state for an install whose connections use a subscription login or a
+      named environment variable.
+    </p>
+  {% else %}
+    <p class="small muted">
+      From <code>{{ secrets.path }}</code>. <strong>Entry names and references only</strong>
+      &mdash; no value is read into this page, and there is no button here that deletes
+      a key: an orphaned entry is recoverable and a deleted one is not.
+    </p>
+    {% if secrets.permissions %}
+      <p class="small mono">{{ secrets.permissions }}</p>
+    {% endif %}
+    {% for n in secrets.notes %}
+      <div class="notice bad small">{{ n }}</div>
+    {% endfor %}
+    {% if not secrets.entries %}
+      <p class="muted">The file exists and holds no entries.</p>
+    {% else %}
+      <dl class="fields">
+        {% for e in secrets.entries %}
+          <dt class="mono">{{ e.entry }}</dt>
+          <dd>
+            {% if e.used_by %}
+              used by <span class="mono">{{ e.used_by | join(', ') }}</span>
+            {% else %}
+              <span class="tag warn">orphan</span>
+              <span class="muted small">no connection references this, so it is inert.
+              It is listed, never collected for you.</span>
+            {% endif %}
+          </dd>
+        {% endfor %}
+      </dl>
+    {% endif %}
+  {% endif %}
+</div>
+
+<h2>Ambient environment</h2>
+<div class="panel">
+  <p>
+    These are the variables each runtime would scavenge if modelpass let it. Nothing
+    here is a connection, and nothing here is used unless a connection names it
+    &mdash; but a variable that is <em>set</em> is a variable a vendor runtime would
+    have picked up on its own, so it is worth knowing about.
+  </p>
+  <p class="small muted">
+    Names only. modelpass can see these without ever passing them on, which is the
+    whole point &mdash; no value is read into this page.
+  </p>
+
+  {% for row in audit %}
+    <dl class="fields">
+      <dt class="mono">{{ row.runtime }}</dt>
+      <dd>
+        {% if row.present %}
+          {% for name in row.present %}
+            <code>{{ name }}</code>{% if not loop.last %} {% endif %}
+          {% endfor %}
+          <div class="small" style="margin-top:6px"><strong>{{ row.sentence }}</strong></div>
+        {% else %}
+          <span class="tag ok">clean</span>
+          <span class="muted small">nothing on this runtime's scrub list is set here.</span>
+        {% endif %}
+        <div class="small muted" style="margin-top:6px">
+          watched: <span class="mono">{{ row.watched | join(', ') }}</span>
+        </div>
+      </dd>
+    </dl>
+  {% endfor %}
+
+  <p class="small muted" style="margin-top:14px; border-top:1px solid var(--line); padding-top:12px">
+    <strong>This audit reflects the environment of the process serving this page.</strong>
+    A terminal or editor started before you cleaned up your environment still carries
+    its own copy of the old variables until it is restarted, so a freshly launched
+    process can read "clean" here while a long-lived one three windows over does not.
+    That divergence is exactly why modelpass scrubs at launch rather than trusting
+    whatever environment it happens to inherit &mdash; the guarantee has to hold in the
+    stale process too.
+  </p>
+</div>
+
+<h2>Capabilities</h2>
+<div class="panel">
+  <p class="small muted">
+    What each runtime can actually do, from the capability registry.
+    <code>unverified</code> is not <code>supported</code>: it means nobody checked, and
+    modelpass treats it as unusable rather than guessing.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <tr>
+        <th>capability</th>
+        {% for r in runtimes %}<th class="mono">{{ r }}</th>{% endfor %}
+      </tr>
+      {% for row in capabilities %}
+        <tr>
+          <td class="mono">{{ row.capability }}</td>
+          {% for cell in row.cells %}
+            <td style="vertical-align:top">
+              <span class="tag {{ 'ok' if cell.support == 'supported' else ('bad' if cell.support == 'unsupported' else 'warn') }}">
+                {{ cell.support }}
+              </span>
+              {% if cell.note %}
+                {# Collapsed by default: the reasons are long because they are
+                   sourced, and a table nobody can scan is not honest either. #}
+                <details style="margin-top:4px">
+                  <summary class="small muted" style="cursor:pointer">why</summary>
+                  <div class="small muted" style="margin-top:4px; max-width:40ch">{{ cell.note }}</div>
+                </details>
+              {% endif %}
+            </td>
+          {% endfor %}
+        </tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+
+<h2>Run log</h2>
+<div class="panel small">
+  {% if run_log_enabled %}
+    Every completed run appends one line to <code>{{ run_log_path }}</code> &mdash;
+    when, which connection, which auth mode actually paid for it, tokens, outcome.
+    <a href="/runs">See the log</a>.
+  {% else %}
+    The run log is switched off for this home
+    (<code>[settings] runLog = false</code>). Completed runs are not being recorded,
+    so "which of these was billed to a key" has no durable answer here.
+  {% endif %}
+</div>
+
+{% endblock %}

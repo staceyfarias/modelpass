@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Groups &middot; modelpass bench{% endblock %}
+{% block body %}
+
+{% if note %}
+  <div class="notice {{ 'bad' if note_kind == 'error' else 'ok' }}">{{ note }}</div>
+{% endif %}
+
+<h2 style="margin-top:0">Groups</h2>
+<p class="muted small">
+  From <code>{{ store_path }}</code>. A group is not defined anywhere and needs no
+  creating &mdash; it exists while some account declares it, and it is gone when the
+  last member leaves. <code>default</code> is the name for the accounts that declare
+  no group at all; an account in <code>fast</code> is <em>not</em> also in
+  <code>default</code>.
+</p>
+<p class="muted small">
+  Passing <code>connection="group:&lt;name&gt;"</code> to any call routes through a
+  group. It resolves to the first enabled member in name order &mdash; a real rule,
+  but not one you chose, so this page shows you who was passed over rather than only
+  who won. Naming a member directly is how you get a particular one.
+</p>
+
+{% if not groups %}
+  <div class="panel">
+    <p><strong>No accounts configured, so there are no groups.</strong></p>
+    <p class="muted small">
+      Add an account first; every account is in <code>default</code> until you put it
+      somewhere else.
+    </p>
+  </div>
+{% endif %}
+
+{% for g in groups %}
+  <div class="panel {{ 'disabled-row' if not g.available }}">
+    <div class="between">
+      <h3>
+        <span class="mono">{{ g.name }}</span>
+        {% if g.is_default %}<span class="tag">the ungrouped accounts</span>{% endif %}
+        {% if not g.available %}<span class="tag bad">no enabled member</span>{% endif %}
+      </h3>
+      <div class="row">
+        <a class="btn" href="/?group={{ g.name }}">Show accounts</a>
+      </div>
+    </div>
+
+    <dl class="fields">
+      <dt>members</dt>
+      <dd>
+        {% for member in g.members %}
+          <a class="mono" href="/accounts/{{ member }}/edit">{{ member }}</a>{% if member in g.disabled %}
+            <span class="tag bad">disabled</span>{% endif %}{% if not loop.last %}<span class="muted">,</span> {% endif %}
+        {% endfor %}
+      </dd>
+      <dt>group:{{ g.name }}</dt>
+      <dd>
+        {% if g.selection %}
+          resolves to <a class="mono" href="/?check={{ g.selection.chosen }}#receipt">{{ g.selection.chosen }}</a>
+          {% if g.selection.passed_over %}
+            <div class="small muted">
+              {% for skipped in g.selection.passed_over %}
+                <div><span class="mono">{{ skipped.connection }}</span> passed over &mdash; {{ skipped.reason }}</div>
+              {% endfor %}
+            </div>
+          {% endif %}
+        {% else %}
+          {# A group with members and no runnable one reads, in a plain listing,
+             exactly like a group that works. It does not here. #}
+          <span class="tag bad">refused</span>
+          <span class="muted small">&mdash; every member is disabled. Re-enable one of
+          them, or name a different group. Nothing was spent and nothing was
+          attempted.</span>
+        {% endif %}
+      </dd>
+    </dl>
+  </div>
+{% endfor %}
+
+{% endblock %}

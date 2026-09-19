@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}Run log &middot; modelpass bench{% endblock %}
+{% block body %}
+
+<h2 style="margin-top:0">Run log</h2>
+<p>
+  One line per completed run, newest first, from <code>{{ path }}</code>.
+  This is the durable answer to <em>how do I know it was the subscription?</em> &mdash;
+  the terminal event proves it to whoever is holding the stream at the time; this file
+  is what remains afterwards.
+</p>
+<p class="small muted">
+  The last three columns are what tickets 1.5, 1.7 and 1.12 made askable of a stored
+  history: <em>were the cache breakpoints I wrote actually honoured</em>, <em>was this
+  run at the sampling its config says</em>, and <em>is this failure worth trying
+  again</em>. The retry verdict is computed from the row's own runtime and terminal
+  status by the same function the library gives your loop &mdash; modelpass never
+  retries for you.
+</p>
+<p class="small muted">
+  A ledger, not a transcript: no prompts, no responses, no credential. The full
+  argument, including the live falsification experiment behind it, is in
+  <code>docs/subscription-proof-2026-08-17.md</code> &mdash; along with the check that
+  does not depend on modelpass at all: your vendor's usage page should show no charge
+  for any run recorded here as <code>subscription</code>.
+</p>
+
+{% if not enabled %}
+  <div class="notice bad">
+    <strong>The run log is switched off for this home.</strong>
+    <code>[settings] runLog = false</code> in your connection file. Runs completed
+    while it is off are not recorded and cannot be recovered later.
+  </div>
+{% endif %}
+
+{% if not records %}
+  <div class="panel">
+    <p class="muted">
+      {% if exists %}
+        The log file exists but has no readable records yet.
+      {% else %}
+        Nothing recorded yet. The file appears after the first completed run.
+      {% endif %}
+    </p>
+  </div>
+{% else %}
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <tr>
+          <th>when (UTC)</th>
+          <th>connection</th>
+          <th>auth mode</th>
+          <th>runtime</th>
+          <th>model</th>
+          <th>tokens</th>
+          <th>status</th>
+          <th>guards</th>
+          <th>cache</th>
+          <th>sampling</th>
+          <th>retry</th>
+        </tr>
+        {% for r in records %}
+          <tr>
+            <td class="mono">{{ r.timestamp }}</td>
+            <td>
+              {{ r.connection }}
+              {% if r.failed_over_from %}
+                <div class="small muted">failed over from {{ r.failed_over_from }}</div>
+              {% endif %}
+            </td>
+            <td>
+              {% if r.auth_mode == 'subscription' %}
+                <span class="tag ok">subscription</span>
+              {% else %}
+                <span class="tag warn">{{ r.auth_mode }}</span>
+              {% endif %}
+            </td>
+            <td class="mono">{{ r.runtime }}</td>
+            <td class="mono">{{ r.model or '—' }}</td>
+            <td class="mono">
+              {{ '{:,}'.format(r.total_tokens or 0) }}
+              <div class="small muted">
+                {{ '{:,}'.format(r.input_tokens or 0) }} in /
+                {{ '{:,}'.format(r.output_tokens or 0) }} out
+              </div>
+            </td>
+            <td>
+              <span class="tag {{ 'ok' if r.status == 'ok' else 'bad' }}">{{ r.status }}</span>
+              {% if r.timed_out %}
+                <div class="small muted">the bound this call was given ran out; the
+                tokens beside it are what was spent before it did</div>
+              {% endif %}
+            </td>
+            <td>
+              {% if r.guards_configured %}
+                <span class="tag">configured</span>
+              {% else %}
+                <span class="tag warn">none</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if r.cache_breakpoints_requested or r.cache_breakpoints_honoured %}
+                <span class="tag {{ 'bad' if r.cache_breakpoints_dropped else 'ok' }}">
+                  {{ r.cache_breakpoints_honoured }}/{{ r.cache_breakpoints_requested }}
+                </span>
+                {% if r.cache_breakpoints_dropped %}
+                  <div class="small muted">breakpoints written that never reached the
+                  vendor &mdash; this run paid for a prefix it thought it had cached</div>
+                {% else %}
+                  <div class="small muted">breakpoints honoured</div>
+                {% endif %}
+              {% else %}
+                <span class="muted">&mdash;</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if r.sampling_requested or r.sampling_applied %}
+                <span class="mono small">
+                  {% for k, v in r.sampling_applied.items() %}{{ k }}={{ v }}{% if not loop.last %}, {% endif %}{% endfor %}
+                </span>
+                {% if r.sampling_moved %}
+                  <div class="small">
+                    <span class="tag warn">not as requested</span>
+                  </div>
+                  <div class="small mono muted">
+                    asked: {% for k, v in r.sampling_requested.items() %}{{ k }}={{ v }}{% if not loop.last %}, {% endif %}{% endfor %}
+                  </div>
+                {% endif %}
+                {% for n in r.sampling_notes %}
+                  <div class="small muted">{{ n }}</div>
+                {% endfor %}
+              {% else %}
+                <span class="muted">&mdash;</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if r.retry_verdict %}
+                <span class="tag {{ 'ok' if r.retry_verdict == 'yes' else ('warn' if r.retry_verdict == 'unknown' else 'bad') }}">
+                  {{ r.retry_verdict }}
+                </span>
+                {% if r.retry_note %}
+                  <div class="small muted">{{ r.retry_note }}</div>
+                {% endif %}
+              {% else %}
+                <span class="muted">&mdash;</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </table>
+    </div>
+    <p class="small muted" style="margin-top:12px">
+      Showing the most recent {{ records | length }} record(s). The file itself is
+      append-only JSON Lines &mdash; readable with <code>jq</code>, a spreadsheet, or
+      five lines of Python, which is what makes it evidence rather than decoration.
+    </p>
+  </div>
+{% endif %}
+
+{% endblock %}

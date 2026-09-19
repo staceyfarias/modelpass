@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Core has no runtime dependencies and no vendor SDKs are installed here:
+      # the suite must pass offline, without credentials (D2). Nothing is
+      # installed but the test runner, so this is also the check that modelpass
+      # still imports and runs with zero dependencies (D8).
+      #
+      # A test that cannot run without a vendor package -- one that resolves an
+      # adapter through the registry, reads runtime_available, or drives a
+      # Bridge, which refuses a runtime whose SDK does not import -- skips here
+      # with a reason naming the extra, and stays strict where the extra is
+      # installed. `pip install -e ".[dev]"` locally runs those too, and that
+      # difference is the point of running this job bare.
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install pytest ruff
+      - run: ruff check .
+      - run: python -m pytest

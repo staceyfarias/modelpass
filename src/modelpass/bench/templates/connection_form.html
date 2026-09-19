@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit' if mode == 'edit' else 'New' }} account &middot; modelpass bench{% endblock %}
+{% block body %}
+
+<h2 style="margin-top:0">{{ 'Edit account' if mode == 'edit' else 'New account' }}</h2>
+
+{% if error %}
+  <div class="notice bad">
+    <strong>Not saved.</strong>
+    <div class="small mono" style="margin-top:6px">{{ error }}</div>
+  </div>
+{% endif %}
+
+<div class="panel">
+  <p class="small muted">
+    Four ways to pay for a connection, and three of them are <strong>pointers</strong>:
+    the runtime's own login, the <em>name</em> of an environment variable, or no
+    credential at all. The fourth writes a key you paste to
+    <code>~/.modelpass/secrets.toml</code> and stores only a pointer to it in the
+    connection file &mdash; the same thing <code>modelpass connect --api-key-stdin</code>
+    does. A key is never written into the connection file, never echoed back into this
+    page, and never rendered anywhere on the bench.
+  </p>
+
+  <form method="post" action="/accounts/save">
+    <input type="hidden" name="original_name" value="{{ form.original_name }}">
+
+    <div class="grid2">
+      <div class="field">
+        <label for="name">Stable account ID</label>
+        <input type="text" id="name" name="name" value="{{ form.name }}" required
+               placeholder="claude-sub" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="runtime">Runtime</label>
+        <select id="runtime" name="runtime" required>
+          <option value="">choose a runtime</option>
+          {% for r in runtimes %}
+            <option value="{{ r }}" {{ 'selected' if form.runtime == r }}>{{ r }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="field">
+        <label for="credential">How this connection is paid for</label>
+        <select id="credential" name="credential">
+          <option value="native-login" {{ 'selected' if form.credential == 'native-login' }}>
+            subscription &mdash; the runtime's own login
+          </option>
+          <option value="env" {{ 'selected' if form.credential == 'env' }}>
+            metered, key read from an environment variable
+          </option>
+          <option value="secret" {{ 'selected' if form.credential == 'secret' }}>
+            metered, key pasted once and stored in secrets.toml
+          </option>
+          <option value="none" {{ 'selected' if form.credential == 'none' }}>
+            no credential &mdash; openai-compatible endpoints that check nothing
+          </option>
+          {% if form.secret_entry %}
+            <option value="keep" {{ 'selected' if form.credential == 'keep' }}>
+              keep the stored key ({{ form.secret_entry }})
+            </option>
+          {% endif %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="api_key_env">Key environment variable (for the env form)</label>
+        <input type="text" id="api_key_env" name="api_key_env" value="{{ form.api_key_env }}"
+               placeholder="ANTHROPIC_API_KEY" autocomplete="off" spellcheck="false">
+        <div class="small muted" style="margin-top:4px">
+          A variable <em>name</em>, e.g. <code>OPENAI_API_KEY</code>. Not the key.
+        </div>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="field">
+        <label for="api_key">API key (for the pasted form only)</label>
+        {# Deliberately never given a value: this field is write-only. A failed
+           save re-renders the form and the key is not in it, so there is no path
+           by which a key typed here comes back down the wire. #}
+        <input type="password" id="api_key" name="api_key" value=""
+               placeholder="paste once; stored in secrets.toml, never here"
+               autocomplete="off" spellcheck="false">
+        <div class="small muted" style="margin-top:4px">
+          Written to <code>secrets.toml</code> under this connection's own name, which
+          is what lets a rename move it and a delete take it with the connection.
+          Leave it empty for every other credential form.
+        </div>
+      </div>
+      <div class="field">
+        <label for="base_url">Base URL (openai-compatible only)</label>
+        <input type="text" id="base_url" name="base_url" value="{{ form.base_url }}"
+               placeholder="http://localhost:11434/v1" autocomplete="off" spellcheck="false">
+        <div class="small muted" style="margin-top:4px">
+          That runtime names an API shape rather than a vendor, so it has no default
+          endpoint and requires this.
+        </div>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="field">
+        <label for="model">Model (optional)</label>
+        <input type="text" id="model" name="model" value="{{ form.model }}"
+               placeholder="leave empty for the runtime's default" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="description">Note to yourself (optional)</label>
+        <input type="text" id="description" name="description" value="{{ form.description }}"
+               autocomplete="off">
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="nickname">Nickname</label>
+      <input type="text" id="nickname" name="nickname" value="{{ form.nickname }}"
+             placeholder="Anthropic Home" autocomplete="off">
+      <div class="small muted" style="margin-top:4px">
+        Human-facing and safe to rename. Clients and run logs use the stable ID above.
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="groups">Groups (optional)</label>
+      <input type="text" id="groups" name="groups" value="{{ form.groups }}"
+             placeholder="fast cheap" autocomplete="off" spellcheck="false">
+      <div class="small muted" style="margin-top:4px">
+        Names separated by spaces or commas. A group needs no creating &mdash; it
+        exists while some account is in it. Leave this empty and the account is in
+        <code>default</code>, which is simply the name for the accounts that name no
+        group; an account listed here is <em>not</em> also in <code>default</code>
+        unless you say so. A call may then address the group rather than the account,
+        as <code>connection="group:fast"</code>.
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="config_dir">Isolated vendor config directory (optional)</label>
+      <input type="text" id="config_dir" name="config_dir" value="{{ form.config_dir }}"
+             placeholder="C:\\Users\\you\\.claude-work" autocomplete="off" spellcheck="false">
+      <div class="small muted" style="margin-top:4px">
+        An absolute account root: <code>CLAUDE_CONFIG_DIR</code> for Anthropic or
+        <code>CODEX_HOME</code> for OpenAI. Empty means the vendor's default storage.
+        The one-time setup is just a login with that variable set. Either Codex
+        credential store works &mdash; Codex keys its keyring entry to
+        <code>CODEX_HOME</code>, so a different directory is a different entry.
+      </div>
+    </div>
+
+    <h3 style="margin-top:18px">Spend guards</h3>
+    <p class="small muted">
+      Both optional, both in tokens, both per run. Leaving them empty is a real and
+      common answer &mdash; modelpass will not invent a number, because it does not know
+      your plan, your month, or what you are about to ask for. See
+      <code>docs/guards.md</code> for a method rather than a number.
+    </p>
+    <div class="grid2">
+      <div class="field">
+        <label for="warn_at_tokens">warnAtTokens</label>
+        <input type="number" id="warn_at_tokens" name="warn_at_tokens" min="0"
+               value="{{ form.warn_at_tokens }}" placeholder="none">
+      </div>
+      <div class="field">
+        <label for="stop_at_tokens">stopAtTokens</label>
+        <input type="number" id="stop_at_tokens" name="stop_at_tokens" min="0"
+               value="{{ form.stop_at_tokens }}" placeholder="none">
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="field">
+        <label for="quota_action">When the allowance runs out</label>
+        <select id="quota_action" name="quota_action">
+          <option value="stop" {{ 'selected' if form.quota_action == 'stop' }}>
+            stop cleanly
+          </option>
+          <option value="failover" {{ 'selected' if form.quota_action == 'failover' }}>
+            fail over to another connection
+          </option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="failover">Failover target (failover only)</label>
+        <input type="text" id="failover" name="failover" value="{{ form.failover }}"
+               placeholder="claude-api" autocomplete="off">
+        <div class="small muted" style="margin-top:4px">
+          Naming a connection here <em>is</em> the consent to run on it &mdash;
+          including when it is metered.
+        </div>
+      </div>
+    </div>
+
+    {% set options = allow_env_options.get(form.runtime, []) %}
+    {% if options %}
+      <div class="field">
+        <label>allowEnv &mdash; non-credential variables this connection may see</label>
+        {% for name in options %}
+          <label class="row" style="margin-bottom:2px">
+            <input type="checkbox" name="allow_env" value="{{ name }}"
+                   style="width:auto" {{ 'checked' if name in form.allow_env }}>
+            <code>{{ name }}</code>
+          </label>
+        {% endfor %}
+        <div class="small muted">
+          Scrubbed by default because it changes where a run goes. A closed set: a
+          credential can never be added here.
+        </div>
+      </div>
+    {% endif %}
+
+    <div class="field">
+      {# The hidden 'false' before the checkbox is what makes an unchecked box
+         submit anything at all; the server reads the whole list, so this works
+         with no JavaScript involved. #}
+      <input type="hidden" name="enabled" value="false">
+      <label class="row">
+        <input type="checkbox" name="enabled" value="true" style="width:auto"
+               {{ 'checked' if form.enabled }}>
+        Enabled &mdash; a disabled connection is still listed and still preflights,
+        but refuses runs
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:18px">
+      <button type="submit" class="primary">
+        {{ 'Save changes' if mode == 'edit' else 'Create account' }}
+      </button>
+      <a class="btn" href="/">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<p class="small muted">
+  Saving writes to the connection file directly. The command line's
+  <code>modelpass connect</code> shows you a preflight receipt <em>before</em> writing;
+  here, use the <strong>Check</strong> button on the accounts page afterwards to see
+  the same receipt.
+</p>
+
+{% endblock %}

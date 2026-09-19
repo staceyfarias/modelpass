@@ -1,0 +1,139 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modelpass"
+version = "0.2.1"
+description = "One interface to the models you are entitled to: subscription runtimes and API keys, with receipts."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Stacey Farias" }]
+keywords = ["agent", "subscription", "api-key", "claude", "codex", "gemini", "llm", "model", "modelpass", "ollama"]
+# There is deliberately no ``License ::`` classifier. ``license`` above is a
+# PEP 639 SPDX expression, and a classifier beside it is a second, weaker claim
+# about the same thing that the tooling now rejects outright. ``License-Expression``
+# plus ``License-File`` in the built metadata is the whole statement.
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# Core has zero runtime dependencies on purpose (D8). Vendor runtimes are extras.
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["claude-agent-sdk"]
+openai = ["openai-codex"]
+# The Messages API client for the `anthropic-api` runtime (ticket 1.6). Pinned
+# below 1.0 because the adapter was written and verified against 0.97.0 and the
+# 1.x line is a major with its own breaking changes; the floor is the release
+# that first carried the surface this adapter needs.
+anthropic-api = ["anthropic>=0.40,<1"]
+# The Responses API client for the `openai-api` runtime (ticket 1.9). Pinned to
+# the 2.x major because that is the line the adapter was written and verified
+# against (2.32.0), and because `responses` did not exist in 0.x. Deliberately a
+# separate extra from `openai`, which installs `openai-codex`: two OpenAI
+# runtimes, two packages, and one name for each.
+openai-api = ["openai>=2,<3"]
+# The Gemini API client for the `google-api` runtime (ticket 1.11). Pinned to the
+# 1.x major because that is the line the adapter was written and verified against
+# (1.73.1). Note that this extra installs `google-genai`, the current SDK, and
+# never the retired `google-generativeai`. There is no `google` extra beside it:
+# the two Google subscription runtimes have no adapter, and `google-api` is the
+# ungated one (the D5 amendment in docs/legal/google.md).
+google-api = ["google-genai>=1,<2"]
+# The bench (`modelpass bench`) is the one part of modelpass with a non-vendor
+# dependency. It stays an extra so core keeps its zero-dependency promise (D8).
+bench = ["flask>=3"]
+# The LangChain chat-model adapter (`modelpass.langchain_adapter`). Same posture as
+# the bench: an optional leaf over the public bridge, never imported by core (D8).
+langchain = ["langchain-core>=1,<2"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "flask>=3",
+    "langchain-core>=1,<2",
+    "anthropic>=0.40,<1",
+    "openai>=2,<3",
+    "google-genai>=1,<2",
+]
+
+[project.scripts]
+modelpass = "modelpass.cli:main"
+# The pre-rename name stays an alias for the shim's lifetime (removed in 0.3.0).
+subpass = "modelpass.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/staceyfarias/modelpass"
+Source = "https://github.com/staceyfarias/modelpass"
+Issues = "https://github.com/staceyfarias/modelpass/issues"
+Changelog = "https://github.com/staceyfarias/modelpass/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/staceyfarias/modelpass/blob/main/docs/api-and-runtimes.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/modelpass", "src/subpass"]
+
+# An sdist is a SOURCE distribution. Someone packaging modelpass for a distro,
+# auditing it, or building it from source should be able to run the suite and
+# read the rules the code is held to -- so the tests, their fixtures, the
+# examples and AGENTS.md all travel. (The suite is offline by construction: no
+# test opens a socket, imports a vendor package or reads a credential, and the
+# live drives are marked, deselected by default, and separately gated behind
+# their own environment variables.) The wheel carries none of it: tests are not
+# importable package data and have no business in site-packages.
+#
+# This list is spelled out rather than left to "whatever git does not ignore",
+# because the default silently ships any new untracked file that nobody thought
+# to ignore, and the last thing this project wants in a published tarball is a
+# file nobody decided about. The project's own working notes are not tracked at
+# all and are not listed here either.
+#
+# Deliberately absent: `.github/` (CI config for this repo, not for a consumer
+# of it). `CLAUDE.md`, a pointer file for one editor, is not in the repository at
+# all any more -- AGENTS.md is the document, and a second file saying so was
+# development tooling rather than anything a user or contributor needed.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/examples",
+    "/docs",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/AGENTS.md",
+    "/LICENSE",
+    "/start.bat",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Live tests are deselected by default. They drive a real vendor runtime and
+# spend real subscription allowance, so running them is always an explicit act:
+#   SUBPASS_LIVE_TESTS=1 pytest -m live
+addopts = "-q -m 'not live'"
+markers = [
+    "live: drives a real vendor runtime and spends subscription allowance or a metered key. Deselected by default; requires SUBPASS_LIVE_TESTS=1 and never runs in CI. The metered files need their own key variable as well -- tests/live/test_anthropic_api_live.py wants MODELPASS_LIVE_ANTHROPIC_API_KEY and tests/live/test_openai_api_live.py wants MODELPASS_LIVE_OPENAI_API_KEY and tests/live/test_google_api_live.py wants MODELPASS_LIVE_GOOGLE_API_KEY, so having a vendor key on the machine is never on its own enough to start spending. tests/live/test_openai_compatible_live.py spends nothing but needs a local model server, so it wants MODELPASS_LIVE_COMPATIBLE_BASE_URL and MODELPASS_LIVE_COMPATIBLE_MODEL: naming the endpoint is the consent there, because having Ollama installed must never be enough on its own for a test run to start talking to it.",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["modelpass", "subpass"]

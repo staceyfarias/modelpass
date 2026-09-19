@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# Build artifacts: `python -m build` writes the wheel and the sdist here.
+# They are released, not committed.
+dist/
+build/
+
+# Node
+node_modules/
+*.tsbuildinfo
+
+# Credentials — never commit vendor auth material
+.env
+.env.*
+auth.json
+.credentials.json
+
+# The connection store and the run log. They normally live under the home
+# directory, but `MODELPASS_HOME`, `SUBPASS_HOME` and `CODEX_HOME` all let a
+# user point the store at the working tree -- and a store holds account
+# identities and a run log holds what was sent.
+connections.toml
+secrets.toml
+runs.jsonl
+.modelpass/
+.subpass/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.claude/
+
+# Working notes. They sit beside the code so they are one open away, but they
+# are not part of what modelpass publishes: the repository carries the contract
+# (README, docs/api-and-runtimes.md, docs/guards.md, docs/legal/) and the dated
+# evidence behind it. Not tracked at all rather than merely excluded from the
+# sdist -- in a public repository a tracked file is a published file.
+docs_internal/
