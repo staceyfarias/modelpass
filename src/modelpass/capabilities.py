@@ -173,6 +173,12 @@ class Capability(StrEnum):
     #: in a recorded drive -- including runtimes whose vendors are widely
     #: believed to cache, because a cell is not the place for a belief.
     CACHE_AUTOMATIC = "cache_automatic"
+    # THINKING says the runtime *emits* thoughts; this says a caller can ask for
+    # how hard it thinks. Separate for the reason MCP/TOOLS are separate from
+    # MCP_SERVERS/TOOLS_IN_PROCESS above: one is "does this exist here", the
+    # other is the question a caller can act on. A runtime can stream thinking
+    # blocks and offer no dial, which is most of them.
+    REASONING_EFFORT = "reasoning_effort"
 
 
 class Support(StrEnum):
@@ -218,6 +224,7 @@ STATIC_TABLE: dict[Runtime, dict[Capability, Support]] = {
         Capability.MAX_OUTPUT_TOKENS: _U,
         Capability.CACHE_BREAKPOINTS: _N,
         Capability.CACHE_AUTOMATIC: _S,
+        Capability.REASONING_EFFORT: _S,
     },
     # Re-verified 2026-08-31 by S7, the commit that flipped this runtime's
     # default transport from ``codex exec`` to ``codex app-server``. A row
@@ -257,6 +264,7 @@ STATIC_TABLE: dict[Runtime, dict[Capability, Support]] = {
         Capability.MAX_OUTPUT_TOKENS: _U,
         Capability.CACHE_BREAKPOINTS: _N,
         Capability.CACHE_AUTOMATIC: _S,
+        Capability.REASONING_EFFORT: _S,
     },
     Runtime.GOOGLE_CLI: {
         Capability.CHAT: _S,
@@ -286,6 +294,7 @@ STATIC_TABLE: dict[Runtime, dict[Capability, Support]] = {
         Capability.MAX_OUTPUT_TOKENS: _U,
         Capability.CACHE_BREAKPOINTS: _U,
         Capability.CACHE_AUTOMATIC: _U,
+        Capability.REASONING_EFFORT: _U,
     },
     Runtime.GOOGLE_SDK: {
         Capability.CHAT: _S,
@@ -315,6 +324,7 @@ STATIC_TABLE: dict[Runtime, dict[Capability, Support]] = {
         Capability.MAX_OUTPUT_TOKENS: _U,
         Capability.CACHE_BREAKPOINTS: _U,
         Capability.CACHE_AUTOMATIC: _U,
+        Capability.REASONING_EFFORT: _U,
     },
 }
 
@@ -475,6 +485,23 @@ for _capability in _OPENAI_API_SUPPORTED:
 #: cache the caller did not ask for. Held by
 #: tests/test_prompt_cache.py::test_openai_api_caches_without_being_asked.
 STATIC_TABLE[Runtime.OPENAI_API][Capability.CACHE_AUTOMATIC] = Support.SUPPORTED
+
+# Reasoning effort, read off the installed SDKs on 2026-09-21. The two API
+# runtimes that take a named level get the cell here rather than inline,
+# because their rows are seeded by the loop above.
+#
+# openai 2.32.0, openai/types/shared/reasoning_effort.py: ``ReasoningEffort:
+# TypeAlias = Optional[Literal["none", "minimal", "low", "medium", "high",
+# "xhigh"]]``, carried on ``Reasoning.effort``.
+STATIC_TABLE[Runtime.OPENAI_API][Capability.REASONING_EFFORT] = Support.SUPPORTED
+# google-genai 1.73.1, ``types.ThinkingLevel``: MINIMAL/LOW/MEDIUM/HIGH on
+# ``ThinkingConfig.thinking_level``. Stops at HIGH, which is a fact about the
+# ladder rather than about the cell -- modelpass.reasoning reports the move.
+STATIC_TABLE[Runtime.GOOGLE_API][Capability.REASONING_EFFORT] = Support.SUPPORTED
+# anthropic 0.97.0 takes ``thinking.budget_tokens``, an integer, not a level.
+# Left unverified deliberately: a level-to-budget mapping is modelpass choosing
+# a token count per model, which is the table maxInputTokens refuses to ship.
+STATIC_TABLE[Runtime.ANTHROPIC_API][Capability.REASONING_EFFORT] = Support.UNVERIFIED
 
 #: The ``google-api`` cells the adapter of ticket 1.11 moved (2026-09-13).
 #:

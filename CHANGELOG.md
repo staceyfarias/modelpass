@@ -5,6 +5,48 @@ work landed.
 
 ## Unreleased
 
+### Added
+
+- **Reasoning effort as one vocabulary, with the runtime's own word reported
+  back** (2026-09-21). `modelpass.reasoning` carries an ordered ladder —
+  `none`, `minimal`, `low`, `medium`, `high`, `xhigh` — and `plan_reasoning()`
+  resolves it against a runtime into a `ReasoningPlan` holding what was asked,
+  what was applied, and **what actually goes on the wire in that vendor's
+  spelling** (`'MEDIUM'` on Gemini, `'medium'` elsewhere). New capability cell
+  `reasoning_effort`, distinct from the existing `thinking`: one says the
+  runtime *emits* thoughts, the other says a caller can ask how hard it thinks.
+  Every vocabulary was read off the SDK installed here on 2026-09-21 and the
+  read is named beside it.
+
+  **`ultra` is refused, and that is the design rather than a gap.** It is not a
+  depth on the model you chose: `openai-codex` 0.154.0 declares
+  `multiAgentVersion` on the model catalog entry and `multiAgentMode` per turn,
+  *beside* `reasoningEffort`; `claude-agent-sdk` 0.2.148 gives each
+  `AgentDefinition` its own `effort`. Agentic execution is a second axis, so a
+  caller asking to think harder must not be handed subagents — a different cost
+  shape, latency profile and tool surface, and on one runtime a capability the
+  model itself has to declare. The refusal says which axis the word belongs to.
+  `max` is refused too, for a weaker and stated reason: one vendor types it as
+  a plain level and another beside `ultra`, and a name two vendors disagree
+  about cannot be portable.
+
+  **A rung a runtime lacks moves, and the move is reported.** `none` on
+  `anthropic-sdk` (whose floor is `low`) and `xhigh` on `google-api` (whose
+  ladder stops at `HIGH`) resolve to the nearest rung with
+  `disposition=ADJUSTED` and a sentence naming the direction and that runtime's
+  real ladder. The vendors already do the silent version — `claude-agent-sdk`
+  documents `xhigh` as "Opus 4.7 only; falls back to `high` on other models" —
+  and a substitution a caller cannot see is one they cannot cost.
+
+  `anthropic-api` is refused: it takes `thinking.budget_tokens`, an integer, and
+  mapping a rung onto a token count means modelpass choosing a number per model
+  — the table `maxInputTokens` deliberately does not ship.
+
+  **Not yet wired to the wire.** This is the vocabulary, the planner and the
+  cells; no connection key is exposed yet, because a key that validates and
+  never reaches the runtime is the setting-that-does-nothing this library
+  refuses. The adapter and receipt wiring is the next change.
+
 ### Fixed
 
 - **A fake bridge no longer quietly becomes a real one** (2026-09-21).
