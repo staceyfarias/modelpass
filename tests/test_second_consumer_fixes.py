@@ -316,3 +316,58 @@ def test_fake_bridge_keeps_the_run_log_off_the_real_home(tmp_path):
     )
     list(bridge.chat(connection="claude-sub", message="x"))
     assert (home / "runs.jsonl").is_file()
+
+
+# --- a fake bridge does not quietly become a real one (2026-09-21) ---------------
+
+
+def _api_connection(name: str = "stray") -> Connection:
+    return Connection(
+        name=name,
+        runtime=Runtime.ANTHROPIC_API,
+        auth_mode=AuthMode.API_KEY,
+        credential_ref=CredentialRef.parse("env:NOT_A_REAL_KEY"),
+        model="x",
+    )
+
+
+def test_a_connection_the_fake_does_not_serve_is_refused(tmp_path):
+    """Otherwise the bridge lazily loads the *real* adapter for that runtime.
+
+    Whether the test then reaches the network depends on whether that vendor's
+    extra happens to be installed -- so it passes on a bare CI runner and opens
+    a socket on a developer machine. Same class of hazard as the ``env={}``
+    default two fixes up: there the machine's credentials decide the answer,
+    here its installed packages do.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        fake_bridge(connections=[_api_connection()], home=tmp_path / "home")
+
+    message = str(excinfo.value)
+    assert "anthropic-sdk" in message  # what it does serve
+    assert "anthropic-api" in message  # what was asked for
+    assert "stray" in message  # which connection, by name
+
+
+def test_serving_that_runtime_instead_is_accepted(tmp_path):
+    _, _, adapter = fake_bridge(
+        connections=[_api_connection()],
+        home=tmp_path / "home",
+        runtime=Runtime.ANTHROPIC_API,
+    )
+    assert adapter.runtime is Runtime.ANTHROPIC_API
+
+
+def test_a_test_that_means_it_can_opt_out(tmp_path):
+    """The failover case: the real adapter's own refusal is what is under test."""
+    bridge, _, _ = fake_bridge(
+        connections=[_api_connection()],
+        home=tmp_path / "home",
+        allow_real_adapters=True,
+    )
+    assert bridge is not None
+
+
+def test_a_connection_on_the_served_runtime_is_untouched(tmp_path):
+    _, store, _ = fake_bridge(connections=[anthropic()], home=tmp_path / "home")
+    assert store.get("claude-sub").runtime is Runtime.ANTHROPIC_SDK

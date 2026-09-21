@@ -191,6 +191,43 @@ def structured(
     )
 
 
+def _refuse_unserved_runtimes(
+    connections: list[Connection], served: Runtime, allowed: bool
+) -> None:
+    """Refuse a connection this fake does not serve, instead of dialing out.
+
+    A fake bridge injects its adapter for **one** runtime. A connection naming
+    any other runtime is not unserved -- :meth:`Bridge.adapter_for` lazily loads
+    the *real* adapter for it, and if that vendor's extra happens to be
+    installed the "offline" test reaches the network. It does so quietly: on a
+    bare CI runner the real adapter refuses at SDK import and the test passes,
+    while on a developer machine with the extras installed the same test opens a
+    socket. The failure is invisible exactly where it matters.
+
+    That is the hazard ``env={}`` already exists to close, one layer along:
+    there the machine's credentials leak in, here the machine's *installed
+    packages* decide whether a test is offline.
+
+    ``allow_real_adapters=True`` is the opt-out, for the tests that mean it --
+    a failover whose target leg must be refused by the real adapter's own
+    capability gate has to reach that adapter to be refused by it.
+    """
+    if allowed:
+        return
+    stray = {c.name: c.runtime for c in connections if c.runtime is not served}
+    if not stray:
+        return
+    listed = ", ".join(f"{n!r} ({r.value})" for n, r in sorted(stray.items()))
+    raise ValueError(
+        f"fake_bridge serves {served.value!r} only, but these connections name "
+        f"another runtime: {listed}. Left alone, each would resolve the real "
+        "adapter for its runtime and reach the vendor if that extra is "
+        "installed. Pass runtime= (or an adapter= built for it) to serve that "
+        "runtime instead, or allow_real_adapters=True if a real adapter is the "
+        "point of the test"
+    )
+
+
 def fake_bridge(
     *,
     connections: Iterable[Connection] = (),
@@ -200,6 +237,7 @@ def fake_bridge(
     runtime: Runtime = Runtime.ANTHROPIC_SDK,
     env: Mapping[str, str] | None = None,
     registry: CapabilityRegistry | None = None,
+    allow_real_adapters: bool = False,
 ) -> tuple[Any, ConnectionStore, FakeAdapter]:
     """A bridge, its store and its scripted adapter -- the six lines everyone writes.
 
@@ -226,9 +264,11 @@ def fake_bridge(
     from .bridge import Bridge  # local: bridge imports this module's siblings
 
     store = ConnectionStore(home) if home is not None else ConnectionStore()
+    connections = list(connections)
     for connection in connections:
         store.add(connection, overwrite=True)
     fake = adapter if adapter is not None else FakeAdapter(script, runtime=runtime)
+    _refuse_unserved_runtimes(connections, fake.runtime, allow_real_adapters)
     bridge = Bridge(
         store=store,
         registry=registry or CapabilityRegistry(),
@@ -247,6 +287,7 @@ def fake_session_bridge(
     runtime: Runtime = Runtime.ANTHROPIC_SDK,
     env: Mapping[str, str] | None = None,
     registry: CapabilityRegistry | None = None,
+    allow_real_adapters: bool = False,
 ) -> tuple[Any, ConnectionStore, FakeSessionAdapter]:
     """:func:`fake_bridge`, but the adapter can open sessions as well as run.
 
@@ -290,6 +331,7 @@ def fake_session_bridge(
         adapter=fake,
         env=env,
         registry=registry,
+        allow_real_adapters=allow_real_adapters,
     )
     return bridge, store, fake
 

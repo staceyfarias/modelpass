@@ -605,6 +605,12 @@ def test_a_schema_bearing_failover_needs_the_target_to_support_it(tmp_path):
         home=tmp_path / "home",
         registry=registry,
         adapter=FakeAdapter([quota_exhausted()], structured_output={"answer": "4"}),
+        # The failover target is deliberately served by the *real* openai-sdk
+        # adapter: what is under test is that adapter's own capability gate
+        # refusing a schema-bearing leg, which a fake standing in for it could
+        # not demonstrate. Nothing reaches the network -- the refusal lands
+        # before any call.
+        allow_real_adapters=True,
     )
     events = list(
         bridge.chat(

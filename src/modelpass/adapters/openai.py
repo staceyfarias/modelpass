@@ -3057,7 +3057,20 @@ class OpenAIAdapter(Adapter):
             ok, problem = True, None
         elif "not logged in" in lower:
             detected, source = None, ""
-            ok, problem = False, "codex is not logged in; run 'codex login' first"
+            # Name the directory when the connection chose one. `codex login`
+            # with no CODEX_HOME logs in the *default* account, so a user who
+            # follows the bare advice against a profile connection authenticates
+            # the wrong account and the connection fails exactly as before --
+            # having spent a browser round trip to change nothing.
+            if request.connection.config_dir:
+                problem = (
+                    f"codex is not logged in for {home}; run 'codex login' with "
+                    "CODEX_HOME set to that directory before using this "
+                    "subscription connection"
+                )
+            else:
+                problem = "codex is not logged in; run 'codex login' first"
+            ok = False
         else:
             detected, source = None, ""
             ok = False

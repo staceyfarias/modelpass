@@ -2095,16 +2095,25 @@ class AnthropicAdapter(Adapter):
             # found" against a file that plainly holds a plan reads as modelpass
             # looking in the wrong place, and sends the reader hunting for an
             # external credential store instead of logging in.
+            # A connection that named a directory gets told which one, and that
+            # the login has to be run with the variable set. `claude /login`
+            # with no CLAUDE_CONFIG_DIR authenticates the *default* account, so
+            # the bare instruction against a profile connection logs in the
+            # wrong account and leaves this one failing. A connection on the
+            # default directory keeps the wording it has always had.
+            profile = request.connection.config_dir
+            at = f" for {profile}" if profile else ""
+            how = " with CLAUDE_CONFIG_DIR set to that directory" if profile else ""
             if status.logged_out:
                 problem = (
-                    "the Claude Code credential file holds no access token -- "
+                    f"the Claude Code credential file{at} holds no access token -- "
                     "the CLI is logged out (the plan metadata it keeps is not a "
-                    "login); run 'claude /login' (or 'claude setup-token' for "
-                    "headless use) before using a subscription connection"
+                    f"login); run 'claude /login'{how} before using a "
+                    "subscription connection"
                 )
             else:
                 problem = (
-                    "no Claude Code login found; run 'claude /login' (or "
+                    f"no Claude Code login found{at}; run 'claude /login'{how} (or "
                     "'claude setup-token' for headless use) before using a "
                     "subscription connection"
                 )

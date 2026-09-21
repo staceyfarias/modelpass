@@ -7,6 +7,26 @@ work landed.
 
 ### Fixed
 
+- **A fake bridge no longer quietly becomes a real one** (2026-09-21).
+  `modelpass.testing.fake_bridge` injects its scripted adapter for **one**
+  runtime. A connection naming any other runtime was not unserved: the bridge
+  lazily loaded the *real* adapter for it, so an "offline" test reached the
+  vendor whenever that extra happened to be installed. It failed invisibly in
+  the worst direction — on a bare CI runner the real adapter refuses at SDK
+  import and the test passes, while on a developer machine with the extras
+  installed the same test opens a socket. Found by making exactly that mistake:
+  a demo pointed a connection at `anthropic-api` while the fake served
+  `anthropic-sdk`, and the call went to Anthropic and came back 401.
+
+  It is the hazard the `env={}` default already closes, one layer along: there
+  the machine's *credentials* decide what a test proves, here its *installed
+  packages* do. `fake_bridge` and `fake_session_bridge` now refuse such a
+  connection by name, saying which runtime they serve and which was asked for.
+  `allow_real_adapters=True` is the opt-out, for the one case that means it —
+  a failover whose target leg must be refused by the real adapter's own
+  capability gate has to reach that adapter to be refused by it.
+
+
 - **A blanked credential file is no longer reported as a login that expired in
   1970** (2026-09-21). When the Claude Code CLI is logged out it does not delete
   `.credentials.json`; it empties `accessToken` and `refreshToken`, sets
