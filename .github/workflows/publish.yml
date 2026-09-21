@@ -1,0 +1,96 @@
+name: publish
+
+# Releases go out by pushing a tag, and only by pushing a tag: `git tag v0.3.0
+# && git push origin v0.3.0`. A tag push does not match ci.yml's `branches:
+# [main]`, so the suite is re-run here rather than assumed -- a release is the
+# one build nobody gets to re-do, and "main was green last week" is not the
+# same claim as "this tag is green".
+#
+# There is no API token anywhere in this repository or its secrets. Publishing
+# uses PyPI Trusted Publishing: the `pypi` environment mints a short-lived
+# OIDC token for this workflow file, at this path, in this repository, and PyPI
+# accepts nothing else. That is why `id-token: write` appears on the publish
+# job alone, and why renaming this file breaks publishing until the publisher
+# is updated on PyPI to match.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  # Same bare environment as ci.yml, for the same reason (D2/D8): nothing is
+  # installed but the runner, so this also re-checks that modelpass imports and
+  # runs with zero dependencies. A test needing an extra skips with a reason.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install pytest ruff
+      - run: ruff check .
+      - run: python -m pytest
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # The tag is what a user will later `pip install`, and the version in
+      # pyproject.toml is what actually lands on PyPI. When they disagree the
+      # wrong number ships under the right name and cannot be unshipped -- PyPI
+      # does not allow re-uploading a version. Fail here instead.
+      - name: The tag and the packaged version say the same thing
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          packaged="$(python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [ "$tag" != "$packaged" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is version '${tag}', but pyproject.toml says '${packaged}'"
+            exit 1
+          fi
+          echo "publishing version ${packaged}"
+
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build
+
+      # twine's own check, before anything is uploaded: valid metadata and a
+      # README that PyPI can actually render. A README that fails to render is
+      # accepted by the upload and then shown as raw text forever.
+      - run: python -m pip install twine
+      - run: python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Named on the PyPI publisher. The environment is the gate: it is what
+    # stops any other workflow in this repository from being able to publish.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/modelpass
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
