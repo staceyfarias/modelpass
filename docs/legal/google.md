@@ -5,7 +5,9 @@
 > legal advice**, it is not authoritative, and it may be wrong or stale by the time
 > you read it. **Google's own terms are the only authority, and Google may change
 > them at any time, without notice.** Verify the primary sources yourself before
-> relying on anything here. Your account is your responsibility.
+> relying on anything here. Your account is your responsibility; modelpass is
+> MIT-licensed software provided AS IS, and its authors accept no liability for how
+> you use it or for what a vendor does to your account.
 >
 > The library was called `subpass` until **2026-09-13**; only the name changed, and
 > no reading on this page was re-verified when it did.

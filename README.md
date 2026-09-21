@@ -98,7 +98,7 @@ Until the first release reaches PyPI, install from source instead:
 
 Core has **zero runtime dependencies**, on purpose. Every runtime, the bench and the
 LangChain leaf arrive as extras, and modelpass never redistributes a vendor binary —
-those come through the vendor's own distribution channel under the vendor's own licence.
+those come through the vendor's own distribution channel under the vendor's own license.
 
 | Extra | Install | What it brings | Runtime it turns on |
 | --- | --- | --- | --- |
@@ -1861,4 +1861,4 @@ each release actually changed.
 ## License
 
 [MIT](LICENSE). The runtimes modelpass drives are the vendors' own packages under their own
-licences and terms; modelpass never redistributes them.
+licenses and terms; modelpass never redistributes them.

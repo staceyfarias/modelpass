@@ -746,7 +746,7 @@ class Adapter(abc.ABC):
         the same statement -- *this request is not the default* -- and an adapter
         implementing this method should expect to say it in either direction.
 
-        **This is not a licence to contradict the registry casually.** An adapter
+        **This is not a license to contradict the registry casually.** An adapter
         may answer only for a capability whose truth *genuinely* depends on the
         request -- where the option in question changes which vendor surface is
         driven, and the difference has been verified on both settings. Everything
