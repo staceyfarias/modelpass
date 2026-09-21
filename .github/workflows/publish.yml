@@ -12,6 +12,12 @@ name: publish
 # accepts nothing else. That is why `id-token: write` appears on the publish
 # job alone, and why renaming this file breaks publishing until the publisher
 # is updated on PyPI to match.
+#
+# `permissions: {}` here drops every default grant, so each job asks for what
+# it needs and nothing else. `contents: read` is not optional while this
+# repository is private: without it the checkout token cannot see the
+# repository at all, and git reports that as "Repository not found" rather
+# than as a permission error.
 on:
   push:
     tags: ["v*"]
@@ -25,6 +31,8 @@ jobs:
   # runs with zero dependencies. A test needing an extra skips with a reason.
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +50,8 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -87,6 +97,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/modelpass
     permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
