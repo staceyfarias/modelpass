@@ -69,14 +69,30 @@ _SEPARATORS = ("-", "@", ":", ".", "_")
 
 
 def _matches(model: str, families: tuple[str, ...]) -> str:
-    """The family token ``model`` belongs to, or ``""``. Anchored, never ``in``."""
+    """The family token ``model`` belongs to, or ``""``. Anchored, never ``in``.
+
+    **The longest match wins, not the first.** Family tokens nest -- ``gpt-5``
+    against ``gpt-5-pro``, ``claude-sonnet-4`` against ``claude-sonnet-4-6`` --
+    and first-match made the answer depend on declaration order, so a more
+    specific family silently inherited a more general one's rules unless
+    somebody remembered to declare it first. That is the wrong rules applied to
+    a real model with nothing said about it, and the table is the last place
+    that should rely on being read in the right order.
+
+    Verified 2026-09-21: every family token in the table already resolves to
+    itself under this rule, so the tables were correct by ordering discipline
+    and nothing moves. What changes is that the discipline is no longer load
+    bearing.
+    """
     name = str(model or "").strip().lower()
+    best = ""
     for token in families:
         if name == token:
             return token
         if name.startswith(token) and name[len(token) : len(token) + 1] in _SEPARATORS:
-            return token
-    return ""
+            if len(token) > len(best):
+                best = token
+    return best
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +126,21 @@ class SamplingRules:
         Fields a *thinking* request takes off the call. Anthropic's adaptive
         families reject sampling parameters outright when thinking is on, which
         is why this is a per-family fact and not a runtime one.
+    ``efforts``
+        Which reasoning rungs **this model** has, where that is known. Empty
+        means not known at this granularity, and the runtime's own ladder
+        (:data:`~modelpass.reasoning.RUNTIME_EFFORTS`) stands -- which is the
+        honest default, because a model nobody has recorded is not a model
+        with no rungs.
+
+        A static floor on purpose, and replaceable on purpose. Two vendors
+        publish this per model -- ``anthropic``'s ``EffortCapability`` and
+        Codex's ``supportedReasoningEfforts`` -- so the better answer is to
+        *ask*, and the point of putting the question behind
+        :func:`model_efforts` is that swapping the source does not move any
+        caller. Until then this is a lookup somebody updates when a model
+        lands, and an unrecorded model degrades to the runtime ladder with a
+        note rather than to a guess.
     """
 
     runtime: Runtime
@@ -125,6 +156,7 @@ class SamplingRules:
     defaults: Mapping[str, Any] = field(default_factory=dict)
     reasoning_parameter: str | None = None
     reasoning_removes: frozenset[str] = frozenset()
+    efforts: frozenset[str] = frozenset()
     verified: bool = False
     source: str = ""
 
@@ -340,6 +372,23 @@ _TABLE: dict[Runtime, tuple[SamplingRules, tuple[tuple[str, dict[str, Any]], ...
                     "reasoning_parameter": "reasoning.effort",
                 },
             ),
+            # gpt-5-pro "defaults to (and only supports) high reasoning effort"
+            # -- openai 2.32.0, the docstring on Reasoning.effort, read
+            # 2026-09-21. The one model-specific rung set the installed SDKs
+            # state outright, and the reason `efforts` exists: without it a
+            # caller asking this model for 'low' is refused by the vendor after
+            # a round trip instead of being moved and told here.
+            (
+                "gpt-5-pro",
+                {
+                    "accepted": frozenset(
+                        {"temperature", "max_output_tokens", "reasoning_effort"}
+                    ),
+                    "forced": {"temperature": 1.0},
+                    "reasoning_parameter": "reasoning.effort",
+                    "efforts": frozenset({"high"}),
+                },
+            ),
             # The ordinary chat models: sampling yes, effort no. Named as
             # families rather than inferred, so an unlisted model gets the
             # runtime defaults and a note instead of a guessed capability.
@@ -450,6 +499,44 @@ def rules_for(runtime: Runtime | str, model: str | None = None) -> SamplingRules
         family=overrides.pop("family", family),
         **overrides,
     )
+
+
+def model_efforts(runtime: Runtime | str, model: str | None = None) -> tuple[str, ...]:
+    """Which reasoning rungs this model has, ascending.
+
+    **The interface, so that the source can change without a caller moving.**
+    Today it answers from a static lookup: the per-model ``efforts`` set where
+    one has been recorded, otherwise the runtime's ladder. Tomorrow it can
+    answer from the vendor -- ``anthropic``'s ``EffortCapability`` and Codex's
+    ``supportedReasoningEfforts`` both publish it per model -- and nothing that
+    calls this has to know which happened.
+
+    That is the whole reason the question is a function rather than a dict
+    lookup at each call site. A table that reads as authoritative and goes stale
+    silently is the thing ``maxInputTokens`` ships none of; a table behind a
+    resolver is a *floor* that something better can replace, and an unrecorded
+    model degrades to the runtime ladder rather than to a guess about a model
+    nobody has looked at.
+
+    Returns ``()`` for a runtime with no established effort control at all,
+    which is a different answer from "this model has no rungs" and is why the
+    empty tuple is not a refusal here -- the refusal already happened when the
+    connection was built.
+    """
+    from .reasoning import EFFORT_LADDER, RUNTIME_EFFORTS
+
+    runtime = Runtime(runtime)
+    ladder = RUNTIME_EFFORTS.get(runtime)
+    if not ladder:
+        return ()
+    recorded = rules_for(runtime, model).efforts
+    order = {e.value: e.rank for e in EFFORT_LADDER}
+    available = {e.value for e in ladder}
+    if recorded:
+        # A recorded model narrows the runtime's ladder; it never widens it,
+        # because a rung the runtime has no spelling for cannot be sent.
+        available &= set(recorded)
+    return tuple(sorted(available, key=lambda v: order[v]))
 
 
 # --- the plan --------------------------------------------------------------------
@@ -563,6 +650,27 @@ def plan_sampling(
             f"{listed} were both requested; {who} accepts one of them, kept "
             f"{kept} and dropped {', '.join(dropped)}"
         )
+
+    if "reasoning_effort" in applied:
+        rungs = model_efforts(resolved.runtime, resolved.model)
+        asked = str(applied["reasoning_effort"])
+        if rungs and asked not in rungs:
+            from .reasoning import EFFORT_LADDER
+
+            order = {e.value: e.rank for e in EFFORT_LADDER}
+            nearest = min(
+                rungs, key=lambda r: (abs(order[r] - order[asked]), order[r])
+            )
+            applied["reasoning_effort"] = nearest
+            way = "up" if order[nearest] > order[asked] else "down"
+            notes.append(
+                f"reasoning_effort {asked!r} is not one this model takes "
+                f"({who} accepts {', '.join(repr(r) for r in rungs)}); moved "
+                f"{way} to {nearest!r}. Reported rather than sent, because a "
+                "rung the vendor refuses costs a round trip to discover and a "
+                "rung it silently downgrades costs nothing to discover and is "
+                "worse"
+            )
 
     if "reasoning_effort" in applied and resolved.reasoning_removes:
         removed = [

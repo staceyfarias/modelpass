@@ -246,3 +246,54 @@ def test_a_runtime_without_the_control_refuses_the_key_at_build():
             base_url="http://localhost:1234/v1",
             reasoning="high",
         )
+
+
+# --- 7. which rungs a *model* has, behind an interface ---------------------------
+
+
+def test_an_unrecorded_model_degrades_to_the_runtime_ladder():
+    """Not to a guess, and not to nothing: a model nobody has recorded is not a
+    model with no rungs."""
+    from modelpass.sampling_rules import model_efforts
+
+    assert model_efforts(Runtime.OPENAI_API, "gpt-6-unheard-of") == tuple(
+        e.value for e in EFFORT_LADDER
+    )
+
+
+def test_a_runtime_with_no_effort_control_answers_empty():
+    from modelpass.sampling_rules import model_efforts
+
+    assert model_efforts(Runtime.OPENAI_COMPATIBLE, "anything") == ()
+
+
+def test_a_recorded_model_narrows_the_ladder():
+    """openai 2.32.0's Reasoning.effort docstring: gpt-5-pro "defaults to (and
+    only supports) high reasoning effort"."""
+    from modelpass.sampling_rules import model_efforts
+
+    assert model_efforts(Runtime.OPENAI_API, "gpt-5-pro") == ("high",)
+    # and the general family is untouched
+    assert len(model_efforts(Runtime.OPENAI_API, "gpt-5")) > 1
+
+
+def test_a_rung_the_model_lacks_is_moved_and_reported():
+    from modelpass.sampling_rules import plan_sampling
+    from modelpass.types import Sampling
+
+    plan = plan_sampling(
+        Sampling(reasoning_effort="low"), Runtime.OPENAI_API, "gpt-5-pro"
+    )
+    assert plan.applied["reasoning_effort"] == "high"
+    assert any("not one this model takes" in n for n in plan.notes)
+
+
+def test_a_model_family_resolves_to_its_own_rules_not_a_shorter_prefix():
+    """Family tokens nest. First-match made the answer depend on declaration
+    order, so a specific family silently inherited a general one's rules."""
+    from modelpass.sampling_rules import _TABLE, _matches
+
+    for _runtime, (_base, refinements) in _TABLE.items():
+        tokens = tuple(token for token, _ in refinements)
+        for token in tokens:
+            assert _matches(token, tokens) == token, token

@@ -56,6 +56,27 @@ work landed.
   previously valid value still is. It is the single vocabulary; `EFFORT_LADDER`
   derives from it.
 
+  **Which rungs a *model* has, behind an interface** (`sampling_rules.
+  model_efforts`). A static lookup today: a per-model `efforts` set where one
+  has been recorded, otherwise the runtime's ladder. The point of the function
+  is that the *source* can change without a caller moving — `anthropic`'s
+  `EffortCapability` and Codex's `supportedReasoningEfforts` both publish this
+  per model, so asking is the better answer and this is the floor until then.
+  An unrecorded model degrades to the runtime ladder with a note, never to a
+  guess about a model nobody has looked at. First recorded narrowing:
+  `gpt-5-pro`, which openai 2.32.0's own docstring says "defaults to (and only
+  supports) high reasoning effort" — so asking it for `low` is now moved and
+  reported here rather than refused by the vendor a round trip later.
+
+  **Model families now match longest-first, not first-declared.** Family tokens
+  nest — `gpt-5` against `gpt-5-pro`, `claude-sonnet-4` against
+  `claude-sonnet-4-6` — and first-match made the answer depend on declaration
+  order, so a more specific family silently inherited a more general one's
+  rules unless somebody remembered to declare it first. Every existing token
+  already resolved to itself, so the tables were right by ordering discipline
+  and nothing moves; what changes is that the discipline is no longer load
+  bearing. Found by adding `gpt-5-pro` and watching it inherit `gpt-5`'s rules.
+
   **Correction made while wiring:** `anthropic-api` was first recorded as having
   no level control, on the strength of finding only `thinking.budget_tokens`.
   It has both — `OutputConfigParam.effort` is
