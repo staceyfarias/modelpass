@@ -42,10 +42,29 @@ work landed.
   mapping a rung onto a token count means modelpass choosing a number per model
   — the table `maxInputTokens` deliberately does not ship.
 
-  **Not yet wired to the wire.** This is the vocabulary, the planner and the
-  cells; no connection key is exposed yet, because a key that validates and
-  never reaches the runtime is the setting-that-does-nothing this library
-  refuses. The adapter and receipt wiring is the next change.
+  **Connection key `reasoning`, and it is a default for the dial that already
+  existed.** `Sampling.reasoning_effort` has carried this vocabulary since
+  ticket 1.7, so the connection's level is merged into it at the one place every
+  entry point assembles a request — the existing per-model routing, drop
+  reporting and thinking-exclusivity rules then apply to it unchanged, rather
+  than a parallel path that would have to learn them again. A call naming its
+  own effort wins, the precedence `model=` already has. `anthropic-sdk` is wired
+  directly instead, because its `sampling_controls` cell reads `unsupported`, so
+  the sampling pipeline reaches no wire there.
+
+  **`REASONING_EFFORTS` widened from three rungs to six**, additively — every
+  previously valid value still is. It is the single vocabulary; `EFFORT_LADDER`
+  derives from it.
+
+  **Correction made while wiring:** `anthropic-api` was first recorded as having
+  no level control, on the strength of finding only `thinking.budget_tokens`.
+  It has both — `OutputConfigParam.effort` is
+  `Literal["low","medium","high","xhigh","max"]` in anthropic 0.97.0, and
+  `sampling_rules` had been routing to it since ticket 1.7. The cell is now
+  `supported` and the runtime has a ladder. Also found while checking: two
+  vendors publish which rungs each *model* has — `anthropic`'s
+  `EffortCapability` and Codex's `supportedReasoningEfforts` — so that is a
+  thing to ask rather than a table to maintain, and a later refinement.
 
 ### Fixed
 

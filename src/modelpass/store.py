@@ -192,6 +192,7 @@ _CONNECTION_KEYS = frozenset(
         "timeoutSeconds",
         "maxInputTokens",
         "promptCache",
+        "reasoning",
     }
 )
 _IDENTITY_KEYS = frozenset({"email", "organizationId"})
@@ -449,6 +450,8 @@ def connection_to_dict(connection: Connection) -> dict[str, Any]:
     # was not given, so a key in the file is always somebody's request.
     if connection.prompt_cache is not None:
         data["promptCache"] = connection.prompt_cache
+    if connection.reasoning is not None:
+        data["reasoning"] = connection.reasoning
 
     # Guards are written only when the user configured something. There are no
     # default thresholds (D4 amendment, 2026-08-17), so a connection with no
@@ -506,6 +509,7 @@ def connection_from_dict(name: str, data: Mapping[str, Any]) -> Connection:
         timeout_seconds=data.get("timeoutSeconds"),
         max_input_tokens=data.get("maxInputTokens"),
         prompt_cache=data.get("promptCache"),
+        reasoning=data.get("reasoning"),
     )
 
 

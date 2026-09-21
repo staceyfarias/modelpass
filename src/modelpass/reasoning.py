@@ -10,10 +10,17 @@ is the convenience; the report is what keeps the convenience honest.
 vocabulary, because ``'5m'``/``'1h'`` and ``'in-memory'``/``'24h'`` are disjoint
 and any translation between them is an equivalence nobody published. A house
 *effort* ladder is the same shape of move, so it needs its own justification
-rather than inheriting that one's. It has one: three of the runtimes below
-already take an ordered ladder and share most of their members, and a fourth
-takes a number along the same axis. These are the same quantity measured in
-different units, which TTLs were not.
+rather than inheriting that one's. It has one: **five of the six runtimes below
+take an ordered ladder**, and they share most of their members. These are the
+same quantity in the same units, which the two cache lifetimes were not.
+
+Two vendors go further and publish, per model, which rungs that model actually
+has -- ``anthropic`` 0.97.0 ``EffortCapability`` (a ``CapabilitySupport`` for
+each of low/medium/high/xhigh/max) and ``openai-codex`` 0.154.0
+``supportedReasoningEfforts`` on the model catalog entry. Which rungs exist is
+therefore a thing to *ask* on those runtimes rather than a table to maintain and
+watch go stale. :data:`RUNTIME_EFFORTS` is the static floor; asking is a later
+refinement and the better answer.
 
 **Two axes, not one ladder.** The ask arrived as a single scale ending in
 ``ultra``. It cannot be, and the vendors say so themselves:
@@ -50,6 +57,7 @@ from enum import StrEnum
 from .capabilities import DEFAULT_REGISTRY, Capability, CapabilityRegistry, Support
 from .errors import InvalidConnection
 from .runtimes import Runtime
+from .types import REASONING_EFFORTS
 
 __all__ = [
     "EFFORT_LADDER",
@@ -58,6 +66,7 @@ __all__ = [
     "ReasoningDisposition",
     "ReasoningPlan",
     "plan_reasoning",
+    "stated_reasoning",
 ]
 
 
@@ -86,14 +95,7 @@ class Effort(StrEnum):
 
 #: The house ladder, ascending. Every member names a depth of thinking and
 #: nothing else.
-EFFORT_LADDER: tuple[Effort, ...] = (
-    Effort.NONE,
-    Effort.MINIMAL,
-    Effort.LOW,
-    Effort.MEDIUM,
-    Effort.HIGH,
-    Effort.XHIGH,
-)
+EFFORT_LADDER: tuple[Effort, ...] = tuple(Effort(e) for e in REASONING_EFFORTS)
 
 #: Members a caller may ask for that are **not** depth, mapped to the sentence
 #: that says so. Refused rather than silently accepted, because the failure this
@@ -159,11 +161,22 @@ RUNTIME_EFFORTS: dict[Runtime, dict[Effort, str]] = {
         Effort.MEDIUM: "MEDIUM",
         Effort.HIGH: "HIGH",
     },
-    # anthropic 0.97.0 takes ``thinking.budget_tokens``, an *integer*, not a
-    # level -- so ``anthropic-api`` is deliberately absent. Mapping a rung onto
-    # a token budget means modelpass choosing a number per model, which is the
-    # table ``maxInputTokens`` refuses to ship. It wants its own decision and a
-    # named consumer, not a guess made here.
+    # anthropic 0.97.0, ``anthropic/types/output_config_param.py``:
+    # ``OutputConfigParam.effort: Optional[Literal["low", "medium", "high",
+    # "xhigh", "max"]]``, read 2026-09-21. The same five as the agent SDK's
+    # ``EffortLevel``, which is not a coincidence -- one vendor, one ladder.
+    #
+    # This runtime also takes ``thinking.budget_tokens``, an integer, and the
+    # two are different questions: a level says how hard, a budget says how
+    # many tokens. modelpass carries the level, because that is the portable
+    # one; a rung-to-budget mapping would be modelpass choosing a token count
+    # per model, which is the table ``maxInputTokens`` refuses to ship.
+    Runtime.ANTHROPIC_API: {
+        Effort.LOW: "low",
+        Effort.MEDIUM: "medium",
+        Effort.HIGH: "high",
+        Effort.XHIGH: "xhigh",
+    },
 }
 
 
@@ -306,3 +319,31 @@ def _coerce(value: str | Effort, *, name: str) -> Effort:
 
 def _ladder_text() -> str:
     return ", ".join(repr(e.value) for e in EFFORT_LADDER)
+
+
+def stated_reasoning(connection: object) -> ReasoningPlan | None:
+    """The connection's standing effort, resolved, or ``None`` if it stated none.
+
+    The lookup the agent adapters need, in one place. Duck-typed on purpose:
+    :mod:`modelpass.connections` imports this module, so importing
+    :class:`~modelpass.connections.Connection` back would be a cycle.
+
+    Only the runtimes ``sampling_rules`` cannot reach use this. Everywhere else
+    the connection's level is merged into ``Sampling.reasoning_effort`` before
+    the request is built, and the existing per-model routing carries it.
+
+    Never raises. Anything invalid was refused when the connection was built, so
+    a failure here would mean a connection that should not exist -- and an
+    adapter mid-run is the worst place to discover that.
+    """
+    stated = getattr(connection, "reasoning", None)
+    if stated is None:
+        return None
+    try:
+        return plan_reasoning(
+            stated,
+            connection.runtime,
+            name=str(getattr(connection, "name", "?")),
+        )
+    except Exception:  # pragma: no cover - defensive: refused at build
+        return None

@@ -1581,13 +1581,27 @@ def test_the_fake_matches_the_installed_sdk_shapes():
 
 
 def test_the_sdk_carries_a_thinking_level_matching_modelpasss_own_dial():
-    """The evidence behind the effort mapping, kept as an assertion: three words,
-    three of the vendor's own named values, nothing invented in between."""
+    """The evidence behind the effort mapping, kept as an assertion: every word
+    modelpass sends this runtime is one of the vendor's own named values,
+    nothing invented in between.
+
+    It asserts the *mapping*, not the house ladder. Until 2026-09-21 the ladder
+    was ``low|medium|high`` and happened to be a subset of ``ThinkingLevel``, so
+    the two were indistinguishable. The ladder is now six rungs and Gemini still
+    has four -- it has no ``none`` and stops at ``HIGH`` -- which is a fact about
+    this runtime that ``modelpass.reasoning`` reports as an adjustment rather
+    than a reason to keep the ladder small.
+    """
     genai_types = pytest.importorskip("google.genai.types")
-    from modelpass.types import REASONING_EFFORTS
+    from modelpass.reasoning import RUNTIME_EFFORTS
+    from modelpass.runtimes import Runtime
 
     levels = {member.value for member in genai_types.ThinkingLevel}
-    assert {effort.upper() for effort in REASONING_EFFORTS} <= levels
+    sent = set(RUNTIME_EFFORTS[Runtime.GOOGLE_API].values())
+    assert sent <= levels, sent - levels
+    # And the rungs this runtime genuinely lacks are absent from the mapping
+    # rather than silently aimed at a level that does not exist.
+    assert "NONE" not in sent and "XHIGH" not in sent
     # And the field modelpass refuses to fill in, with the reason in its own docs.
     budget = genai_types.ThinkingConfig.model_fields["thinking_budget"]
     assert "model dependent" in (budget.description or "")

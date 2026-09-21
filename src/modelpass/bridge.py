@@ -422,6 +422,34 @@ class _Prepared:
 _GROUP_PREFIX = "group:"
 
 
+
+def _with_standing_reasoning(
+    connection: Connection, sampling: Sampling | None
+) -> Sampling | None:
+    """Fill the per-call reasoning dial from the connection, when a call said nothing.
+
+    The connection's ``reasoning`` is a **default for**
+    :attr:`~modelpass.types.Sampling.reasoning_effort`, not a second dial
+    pointing at the same wire field. Merging here -- at the one place every
+    entry point assembles a request -- means the existing per-runtime routing,
+    the drop reporting and the thinking-exclusivity rules in
+    :mod:`modelpass.sampling_rules` all apply to it unchanged, instead of a
+    parallel path that would have to learn them again and would disagree the
+    first time one of them moved.
+
+    **A call that names its own effort wins**, the same precedence ``model=``
+    has over the connection's: the narrower statement is the later one, and a
+    standing default that overrode a call would be a default nobody could turn
+    off for one request.
+    """
+    stated = connection.reasoning
+    if stated is None:
+        return sampling
+    if sampling is not None and sampling.reasoning_effort is not None:
+        return sampling
+    base = sampling or Sampling()
+    return replace(base, reasoning_effort=stated)
+
 class Bridge:
     """Entry point. Owns a connection store, a capability registry and adapters.
 
@@ -2538,6 +2566,7 @@ class Bridge:
             # point of putting a model on the receipt is that a rejected model is
             # diagnosable from what was printed before the run.
             plan = replace(plan, model=model, model_source="requested for this call")
+        sampling = _with_standing_reasoning(connection, sampling)
         return RunRequest(
             connection=connection,
             messages=messages,

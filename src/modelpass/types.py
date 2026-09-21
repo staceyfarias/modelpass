@@ -573,7 +573,30 @@ def normalize_messages(
 #: 2.32.0 takes ``none|minimal|low|medium|high|xhigh`` -- and a caller who needs
 #: one of those is asking for a per-vendor passthrough, which is the thing one
 #: abstract dial exists instead of.
-REASONING_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+#: The one reasoning vocabulary in this library, ascending. Widened from
+#: ``("low", "medium", "high")`` on 2026-09-21, additively -- every value that
+#: was valid still is.
+#:
+#: The rungs are the union of what the installed SDKs accept, read that day:
+#: ``openai`` 2.32.0 ``ReasoningEffort`` is ``none|minimal|low|medium|high|
+#: xhigh``; ``anthropic`` 0.97.0 ``OutputConfigParam.effort`` is
+#: ``low|medium|high|xhigh|max``; ``claude-agent-sdk`` 0.2.148 ``EffortLevel``
+#: is the same five; ``google-genai`` 1.73.1 ``ThinkingLevel`` is
+#: ``MINIMAL|LOW|MEDIUM|HIGH``.
+#:
+#: ``max`` and ``ultra`` are deliberately **not** here even though two vendors
+#: type them. :mod:`modelpass.reasoning` holds the reasons: ``ultra`` also turns
+#: on agentic execution and is therefore a second axis, and ``max`` is a name
+#: two vendors disagree about. A rung that means different things per vendor is
+#: not a portable rung.
+REASONING_EFFORTS: tuple[str, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
 
 #: The widest range any supported vendor accepts for ``temperature``. Validated
 #: here so a typo'd 20 is a constructor error rather than a 400 one HTTP round

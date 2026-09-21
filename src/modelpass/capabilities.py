@@ -498,10 +498,14 @@ STATIC_TABLE[Runtime.OPENAI_API][Capability.REASONING_EFFORT] = Support.SUPPORTE
 # ``ThinkingConfig.thinking_level``. Stops at HIGH, which is a fact about the
 # ladder rather than about the cell -- modelpass.reasoning reports the move.
 STATIC_TABLE[Runtime.GOOGLE_API][Capability.REASONING_EFFORT] = Support.SUPPORTED
-# anthropic 0.97.0 takes ``thinking.budget_tokens``, an integer, not a level.
-# Left unverified deliberately: a level-to-budget mapping is modelpass choosing
-# a token count per model, which is the table maxInputTokens refuses to ship.
-STATIC_TABLE[Runtime.ANTHROPIC_API][Capability.REASONING_EFFORT] = Support.UNVERIFIED
+# anthropic 0.97.0, output_config_param.py: ``OutputConfigParam.effort`` is
+# ``Optional[Literal["low","medium","high","xhigh","max"]]``. The runtime also
+# takes ``thinking.budget_tokens``, an integer -- two different questions, and
+# modelpass carries the level because that is the portable one. (Corrected
+# 2026-09-21: first recorded as unverified on the strength of finding only the
+# budget. sampling_rules has routed reasoning_effort to output_config.effort on
+# this runtime since ticket 1.7.)
+STATIC_TABLE[Runtime.ANTHROPIC_API][Capability.REASONING_EFFORT] = Support.SUPPORTED
 
 #: The ``google-api`` cells the adapter of ticket 1.11 moved (2026-09-13).
 #:

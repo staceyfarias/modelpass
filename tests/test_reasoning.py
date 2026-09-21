@@ -106,9 +106,10 @@ def test_the_note_lists_the_ladder_that_runtime_actually_has():
 
 
 def test_a_runtime_with_no_established_control_is_refused():
-    """anthropic-api takes an integer budget, so no level is carried to it."""
+    """openai-compatible names an API *shape*, so its cells are unverified by
+    construction -- including this one."""
     with pytest.raises(InvalidConnection) as excinfo:
-        plan_reasoning("high", Runtime.ANTHROPIC_API, name="metered")
+        plan_reasoning("high", Runtime.OPENAI_COMPATIBLE, name="metered")
     message = str(excinfo.value)
     assert "metered" in message  # the connection, by name
     assert "setting that does nothing" in message
@@ -145,3 +146,103 @@ def test_every_runtime_with_a_supported_cell_has_a_vocabulary():
     for runtime in Runtime:
         if registry.support(runtime, "reasoning_effort") is Support.SUPPORTED:
             assert RUNTIME_EFFORTS.get(runtime), runtime
+
+
+def test_anthropic_api_takes_a_level_as_well_as_a_budget():
+    """Recorded because it was got wrong once (2026-09-21).
+
+    ``anthropic`` 0.97.0 has both ``thinking.budget_tokens`` (an integer) and
+    ``OutputConfigParam.effort`` (a level). Finding only the first led to this
+    runtime being marked unverified; the level is what modelpass carries, and
+    sampling_rules had been routing to it since ticket 1.7.
+    """
+    plan = plan_reasoning("xhigh", Runtime.ANTHROPIC_API, name="c")
+    assert plan.disposition is ReasoningDisposition.EXACT
+    assert plan.runtime_value == "xhigh"
+
+
+# --- 6. the connection key is a default for the per-call dial, not a second one --
+
+
+def _api(runtime=Runtime.OPENAI_API, **kw):
+    from modelpass.connections import Connection, CredentialRef
+    from modelpass.types import AuthMode
+
+    return Connection(
+        name="c",
+        runtime=runtime,
+        auth_mode=AuthMode.API_KEY,
+        credential_ref=CredentialRef.parse("env:K"),
+        model="gpt-5",
+        **kw,
+    )
+
+
+def test_a_stated_level_fills_the_per_call_dial():
+    from modelpass.bridge import _with_standing_reasoning
+
+    merged = _with_standing_reasoning(_api(reasoning="xhigh"), None)
+    assert merged.reasoning_effort == "xhigh"
+
+
+def test_a_call_that_names_its_own_effort_wins():
+    """Same precedence ``model=`` has: the narrower statement is the later one,
+    and a standing default that overrode a call could not be turned off for one
+    request."""
+    from modelpass.bridge import _with_standing_reasoning
+    from modelpass.types import Sampling
+
+    merged = _with_standing_reasoning(
+        _api(reasoning="xhigh"), Sampling(reasoning_effort="low")
+    )
+    assert merged.reasoning_effort == "low"
+
+
+def test_a_connection_that_states_nothing_changes_nothing():
+    from modelpass.bridge import _with_standing_reasoning
+
+    assert _with_standing_reasoning(_api(), None) is None
+
+
+def test_the_standing_default_reaches_the_existing_per_model_routing():
+    """The point of merging into Sampling rather than running beside it: the
+    per-runtime routing, the drop reporting and the thinking-exclusivity rules
+    all apply without being taught again."""
+    from modelpass.bridge import _with_standing_reasoning
+    from modelpass.sampling_rules import plan_sampling
+
+    merged = _with_standing_reasoning(_api(reasoning="xhigh"), None)
+    plan = plan_sampling(merged, Runtime.OPENAI_API, "gpt-5")
+    assert plan.applied["reasoning_effort"] == "xhigh"
+
+
+def test_there_is_one_vocabulary_not_two():
+    from modelpass.types import REASONING_EFFORTS
+
+    assert tuple(e.value for e in EFFORT_LADDER) == tuple(REASONING_EFFORTS)
+
+
+def test_the_connection_key_refuses_what_the_ladder_refuses():
+    from modelpass.errors import InvalidConnection as IC
+
+    with pytest.raises(IC):
+        _api(reasoning="ultra")
+    with pytest.raises(IC):
+        _api(reasoning="max")
+
+
+def test_a_runtime_without_the_control_refuses_the_key_at_build():
+    from modelpass.connections import Connection, CredentialRef
+    from modelpass.errors import InvalidConnection as IC
+    from modelpass.types import AuthMode
+
+    with pytest.raises(IC):
+        Connection(
+            name="c",
+            runtime=Runtime.OPENAI_COMPATIBLE,
+            auth_mode=AuthMode.API_KEY,
+            credential_ref=CredentialRef.parse("env:K"),
+            model="m",
+            base_url="http://localhost:1234/v1",
+            reasoning="high",
+        )

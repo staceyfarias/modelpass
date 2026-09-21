@@ -145,6 +145,7 @@ from ..preflight import (
     check_launch_args,
     env_names_to_scrub,
 )
+from ..reasoning import stated_reasoning
 from ..runtimes import Runtime
 from ..schema import build_structured_event
 from ..tools import ToolDef
@@ -1472,6 +1473,15 @@ def session_options(
         # One turn is one chat response, exactly as in the stateless path.
         options_kwargs["max_turns"] = 1
     options_kwargs.update(_tool_options(sdk, request))
+    # The stated effort, in this runtime's own spelling (2026-09-21).
+    # claude-agent-sdk 0.2.148 types ClaudeAgentOptions.effort as
+    # Literal["low","medium","high","xhigh","max"]. This runtime is wired
+    # directly rather than through sampling_rules because its
+    # sampling_controls cell reads unsupported -- the sampling pipeline
+    # carries nothing here, so the standing default would reach no wire.
+    _effort = stated_reasoning(request.connection)
+    if _effort is not None:
+        options_kwargs["effort"] = _effort.runtime_value
 
     for key, value in request.options.items():
         reason = _SESSION_RESERVED_OPTIONS.get(key)
@@ -2340,6 +2350,15 @@ class AnthropicAdapter(Adapter):
             "permission_mode": "default",
         }
         options_kwargs.update(_tool_options(sdk, request))
+        # The stated effort, in this runtime's own spelling (2026-09-21).
+        # claude-agent-sdk 0.2.148 types ClaudeAgentOptions.effort as
+        # Literal["low","medium","high","xhigh","max"]. This runtime is wired
+        # directly rather than through sampling_rules because its
+        # sampling_controls cell reads unsupported -- the sampling pipeline
+        # carries nothing here, so the standing default would reach no wire.
+        _effort = stated_reasoning(request.connection)
+        if _effort is not None:
+            options_kwargs["effort"] = _effort.runtime_value
         if request.schema is not None:
             # The runtime's own mechanism (D13). ``output_format`` becomes
             # ``--json-schema <json>`` in the transport and the answer comes back

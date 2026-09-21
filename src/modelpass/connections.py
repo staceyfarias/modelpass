@@ -28,6 +28,7 @@ from .errors import (
     RuntimeGated,
 )
 from .prompt_cache import plan_prompt_cache
+from .reasoning import plan_reasoning
 from .runtimes import API_RUNTIMES, EXPERIMENTAL_RUNTIMES, VENDOR_OF, Runtime, parse_runtime
 from .types import AuthMode, parse_auth_mode
 
@@ -755,6 +756,26 @@ class Connection:
     #: An additive key under the store's 0.1 compatibility policy. Last in the
     #: field order, so no older field's positional shape moves.
     prompt_cache: str | None = None
+    #: The standing reasoning effort for this connection (config key
+    #: ``reasoning``, 2026-09-21). ``None`` states nothing.
+    #:
+    #: One of :data:`~modelpass.types.REASONING_EFFORTS`. **This is a default
+    #: for the per-call dial, not a second one**: ``Sampling.reasoning_effort``
+    #: has carried this exact vocabulary since ticket 1.7, and a connection that
+    #: states a level fills it in when a call does not. A call that names its
+    #: own wins, the way a caller's ``model=`` wins over the connection's.
+    #:
+    #: The relationship is ``promptCache``'s to
+    #: :class:`~modelpass.types.CacheControl`: a standing policy beside a
+    #: per-call statement, one vocabulary between them.
+    #:
+    #: ``'ultra'`` and ``'max'`` are refused with a message saying why --
+    #: the first is a second axis (agentic execution), the second a name two
+    #: vendors disagree about. See :mod:`modelpass.reasoning`.
+    #:
+    #: An additive key under the store's 0.1 compatibility policy. Last in the
+    #: field order, so no older field's positional shape moves.
+    reasoning: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -864,6 +885,12 @@ class Connection:
             plan_prompt_cache(
                 self.prompt_cache, self.runtime, name=str(self.name)
             )
+
+        if self.reasoning is not None:
+            # Resolved as well as validated, exactly as promptCache is: the
+            # runtime must have an effort control and the rung must be one this
+            # vocabulary knows, or the connection does not exist.
+            plan_reasoning(self.reasoning, self.runtime, name=str(self.name))
 
         allowed = runtime_auth_modes(self.runtime)
         if self.auth_mode not in allowed:
