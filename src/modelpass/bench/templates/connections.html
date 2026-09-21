@@ -118,6 +118,19 @@
           so a call runs until it finishes or the caller passes a bound.</span>
         {% endif %}
       </dd>
+      <dt>input window</dt>
+      <dd>
+        {% if c.max_input_tokens is not none %}
+          {{ "{:,}".format(c.max_input_tokens) }} tokens
+          <span class="muted small">&mdash; what this account was told the model's
+          usable input window is. modelpass does not check a payload against it;
+          it is here for the tools that do.</span>
+        {% else %}
+          <span class="muted">unknown &mdash; no <code>maxInputTokens</code> is set.
+          modelpass has no table of model window sizes and will not guess one, so
+          nothing here can tell you whether a payload fits.</span>
+        {% endif %}
+      </dd>
       <dt>retry</dt>
       <dd>
         {% if c.retry == 'never' %}

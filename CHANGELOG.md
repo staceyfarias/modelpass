@@ -7,6 +7,28 @@ work landed.
 
 ### Added
 
+- **A connection can state its input window, and modelpass will never guess one**
+  (2026-09-21). The optional config key `maxInputTokens` records the model's usable
+  input window in tokens, read back as `Connection.max_input_tokens` (`int | None`).
+  It exists because a consumer needs to decide whether a payload will fit *before*
+  spending a call finding out, and the per-connection half was the part it could not
+  express anywhere.
+
+  **Nothing in modelpass reads it** — it bounds no call, truncates no message and
+  refuses no run, in the same way `retry = "never"` is a stance rather than a retry
+  loop. **And there is no default**: no table of model names to window sizes, now or
+  later, because a vendor moves a window without moving the model string and a stale
+  number that reads as authoritative is worse than no number. Omitted means
+  *unknown*, which is what every existing connection means; unknown and zero are
+  different facts, so `maxInputTokens = 0` is refused at construction rather than
+  stored, as is any negative, fractional, boolean or non-numeric value.
+
+  `modelpass list --verbose` prints the window and prints `unknown` when there is
+  none, and the bench's accounts page says the same; the bench's edit form does not
+  offer the field and now carries it through a save rather than dropping it. An
+  additive config key: the file stays at version 1, and a connection written before
+  the key existed loads unchanged and is not given one when the file is rewritten.
+
 - **Connection groups, and a group is something a run can be addressed to**
   (2026-09-17). A connection may declare `groups = ["fast", "cheap"]`, and any entry
   point that takes a connection name takes `"group:<name>"` in its place —

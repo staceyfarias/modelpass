@@ -250,6 +250,9 @@ def _connection_view(bridge: Bridge, connection: Connection) -> dict[str, Any]:
         "base_url": connection.base_url,
         "timeout_seconds": connection.timeout_seconds,
         "retry": connection.retry,
+        # `None` reaches the template as the unknown it is; the template says so
+        # in words rather than leaving the row blank.
+        "max_input_tokens": connection.max_input_tokens,
         "is_compatible": connection.runtime is Runtime.OPENAI_COMPATIBLE,
         "verified": {
             "supported": list(connection.verified_capabilities.supported),
@@ -613,14 +616,16 @@ def create_app(
                 plan = _unpreflighted_plan(active, fields, exc)
             connection = plan.connection
             if previous is not None:
-                # Carried rather than re-derived: `retry`, `timeoutSeconds` and
-                # the verified cells are connection state this form does not
-                # edit, and an edit that dropped them would silently un-bound a
-                # call or throw away a drive's evidence.
+                # Carried rather than re-derived: `retry`, `timeoutSeconds`,
+                # `maxInputTokens` and the verified cells are connection state
+                # this form does not edit, and an edit that dropped them would
+                # silently un-bound a call, throw away a drive's evidence, or
+                # turn a stated input window back into an unknown one.
                 connection = replace(
                     connection,
                     retry=previous.retry,
                     timeout_seconds=previous.timeout_seconds,
+                    max_input_tokens=previous.max_input_tokens,
                     verified_capabilities=previous.verified_capabilities,
                 )
                 if (

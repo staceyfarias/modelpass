@@ -190,6 +190,7 @@ _CONNECTION_KEYS = frozenset(
         "enabled",
         "retry",
         "timeoutSeconds",
+        "maxInputTokens",
     }
 )
 _IDENTITY_KEYS = frozenset({"email", "organizationId"})
@@ -436,6 +437,12 @@ def connection_to_dict(connection: Connection) -> dict[str, Any]:
         data["retry"] = connection.retry
     if connection.timeout_seconds is not None:
         data["timeoutSeconds"] = connection.timeout_seconds
+    # Written only when the user gave one, for the reason the guards table is
+    # written only when it is configured: modelpass has no default input window
+    # and an absent key is the honest way to say "nobody has said". A written
+    # number here is always somebody's statement, never this build's guess.
+    if connection.max_input_tokens is not None:
+        data["maxInputTokens"] = connection.max_input_tokens
 
     # Guards are written only when the user configured something. There are no
     # default thresholds (D4 amendment, 2026-08-17), so a connection with no
@@ -491,6 +498,7 @@ def connection_from_dict(name: str, data: Mapping[str, Any]) -> Connection:
         enabled=_enabled_from_dict(name, data.get("enabled", True)),
         retry=_retry_from_dict(name, data.get("retry", "default")),
         timeout_seconds=data.get("timeoutSeconds"),
+        max_input_tokens=data.get("maxInputTokens"),
     )
 
 

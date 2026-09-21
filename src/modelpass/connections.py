@@ -697,6 +697,32 @@ class Connection:
     #: usable by a build that has never heard of groups -- it just sees every
     #: connection by name, which is what it saw before.
     groups: tuple[str, ...] = ()
+    #: The model's usable input window for this connection, in tokens (config
+    #: key ``maxInputTokens``, 2026-09-21).
+    #:
+    #: **Supplied by the user, never discovered and never guessed.** There is no
+    #: table of model names to window sizes here and there will not be one: a
+    #: vendor changes a window without changing a model string, so a table is a
+    #: number that goes stale silently and reads as authoritative. ``None`` means
+    #: *unknown*, which is what every connection written before this key existed
+    #: means and what the great majority will keep meaning. Unknown and zero are
+    #: different facts, so zero is refused at construction rather than stored --
+    #: a window of nothing is not a window somebody measured.
+    #:
+    #: **Nothing in modelpass reads it.** It bounds no call, truncates no
+    #: message and refuses no run -- for the reason :attr:`retry` does not make
+    #: modelpass retry: this is a declaration a consumer acts on, not a
+    #: mechanism. A retrieval evaluation harness asked for it so it can decide
+    #: whether a payload will fit *before* spending a call finding out, and the
+    #: part it could not express anywhere was "how big is the window on **this**
+    #: connection". Should modelpass ever enforce it, that is a separate change
+    #: with its own refusal and its own wording.
+    #:
+    #: An additive key under the store's 0.1 compatibility policy: an older
+    #: build carries it through verbatim and reports it. Last in the field
+    #: order, like every field above it, so no older field's positional shape
+    #: moves.
+    max_input_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -779,6 +805,24 @@ class Connection:
                     f"zero, got {self.timeout_seconds!r}"
                 )
             object.__setattr__(self, "timeout_seconds", float(self.timeout_seconds))
+
+        if self.max_input_tokens is not None:
+            # `bool` first: `True` is an `int` in Python, and a connection whose
+            # window is `true` would otherwise be stored as a window of one.
+            if isinstance(self.max_input_tokens, bool) or not isinstance(
+                self.max_input_tokens, int
+            ):
+                raise InvalidConnection(
+                    f"connection {self.name!r}: maxInputTokens must be a whole "
+                    f"number of tokens, got {type(self.max_input_tokens).__name__}"
+                )
+            if self.max_input_tokens <= 0:
+                raise InvalidConnection(
+                    f"connection {self.name!r}: maxInputTokens must be greater than "
+                    f"zero, got {self.max_input_tokens!r}. Omit the key to say the "
+                    "window is unknown -- modelpass has no default for it and will "
+                    "not guess one"
+                )
 
         allowed = runtime_auth_modes(self.runtime)
         if self.auth_mode not in allowed:

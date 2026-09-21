@@ -1029,6 +1029,16 @@ def _list(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:
                 else f"{connection.timeout_seconds:g}s"
             )
             print(f"      timeout   {bound} (default for calls on this connection)", file=out)
+            # Printed even when unset, and "unknown" is the honest word for it:
+            # modelpass has no default input window and does not look one up, so
+            # a blank line here would read as "small" or "fine" to a reader
+            # sizing a payload.
+            window = (
+                "unknown -- nothing here guesses one"
+                if connection.max_input_tokens is None
+                else f"{connection.max_input_tokens:,} input tokens (as configured)"
+            )
+            print(f"      window    {window}", file=out)
             if connection.retry == "never":
                 print(
                     '      retry     never -- every retryable verdict here reads "no"',

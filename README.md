@@ -666,6 +666,11 @@ enabled       = true                 # optional, default true (see below)
 groups        = ["fast"]             # optional; omit and it is in "default"
 timeoutSeconds = 120                 # optional; default wall-clock bound per call
 retry         = "default"            # optional; "default" | "never" (see below)
+maxInputTokens = 200000              # optional; the model's usable input window, in
+                                     # tokens, as YOU state it. Omit it and the window
+                                     # is unknown -- there is no table of model sizes
+                                     # here and nothing guesses one. Nothing in
+                                     # modelpass reads it; it is for the tools that do.
 
   # Spend guards. NO DEFAULTS -- see "Guards" below. A connection with no
   # [guards] table genuinely has nothing bounding one run's spend, and the file
@@ -1395,6 +1400,30 @@ Every verdict on that connection reads `no`, with a note saying the policy is wh
 The receipt reports the stance before the run rather than leaving you to infer it
 afterwards. It does not make modelpass retry the other connections — nothing makes
 modelpass retry — it is how you tell *your* loop that this one is off limits.
+
+### A connection can say how big its input window is
+
+```toml
+[connections.production-judge]
+maxInputTokens = 200000
+```
+
+Read back as `connection.max_input_tokens`. It is **your** statement of the
+model's usable input window, in tokens, for the tool that needs to decide whether
+a payload will fit before it spends a call finding out.
+
+**Nothing in modelpass reads it.** It bounds nothing, truncates nothing and
+refuses nothing — it is a stance, like `retry = "never"`, not a mechanism.
+
+**Omitting it means *unknown*, and unknown is the normal case.** There is no
+table of model names to window sizes in this library: a vendor changes a window
+without changing the model string, so a built-in number would go stale silently
+while reading as authoritative, and a wrong window is worse than none. Unknown
+and zero are different facts, so `maxInputTokens = 0` is refused rather than
+stored, and anything that is not a positive whole number is refused with it.
+Read it as `is None`, never as falsy.
+
+`modelpass list --verbose` prints it, and prints `unknown` when nothing is set.
 
 ### What is safe to share between threads
 

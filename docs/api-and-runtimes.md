@@ -702,6 +702,55 @@ surprise D4 exists to prevent. Name the connection you mean.
 that has never heard of groups preserves it verbatim and reports it, and sees
 every connection by name exactly as it did before.
 
+### 1.8 `maxInputTokens` — a fact the connection carries, and nothing more (2026-09-21)
+
+A connection may record the model's usable input window, in tokens:
+
+```toml
+[connections.claude-api]
+runtime        = "anthropic-api"
+authMode       = "api_key"
+credentialRef  = "env:ANTHROPIC_API_KEY"
+maxInputTokens = 200000    # optional; omit it and the window is unknown
+```
+
+It is read back as `Connection.max_input_tokens`, an `int | None`.
+
+**Nothing in modelpass reads it.** It bounds no call, truncates no message,
+refuses no run, and appears in no receipt or terminal event. It is a declaration
+a *consumer* acts on, in the same way `retry = "never"` is a stance rather than a
+retry loop. A retrieval evaluation harness asked for it so it can decide whether
+a payload will fit before spending a call finding out; the part it could not
+express anywhere was "how big is the window on **this** connection". If modelpass
+ever enforces it, that is a separate contract with its own refusal, and this
+paragraph is what it would have to change.
+
+**It is supplied, never discovered.** There is no table of model names to window
+sizes in this library and there is not going to be one. A vendor moves a window
+without moving the model string, so a table is a stale number that reads as
+authoritative — and a wrong window is worse than no window, because a consumer
+that trusts it will split a payload that did not need splitting or send one that
+does not fit.
+
+| the file says | `max_input_tokens` | means |
+| --- | --- | --- |
+| nothing | `None` | **unknown** — nobody has told modelpass, and modelpass will not guess |
+| `maxInputTokens = 200000` | `200000` | somebody stated this window |
+| `maxInputTokens = 0` | — | refused at construction: `InvalidConnection` |
+
+Unset and zero are different facts, which is why zero is refused rather than
+stored. A consumer must read `is None`, not falsiness: a `None` collapsed to `0`
+turns "unrecorded" into "the window is nothing", and every unconfigured
+connection on the machine then looks too small for every payload. Anything that
+is not a positive whole number — a negative, a float, a string, `true` — is an
+`InvalidConnection` naming the connection.
+
+`modelpass list --verbose` prints the window, and prints `unknown` when there is
+none rather than leaving the row out; the bench's accounts page does the same.
+An additive key under the store's 0.1 compatibility policy: a connection written
+before it existed loads unchanged and is not given one when the file is
+rewritten.
+
 ---
 
 ## 2. The three vendors, and the matrix
