@@ -336,6 +336,8 @@ is the honest phrasing and "Codex has no execution tool left" is not. A
 
 from __future__ import annotations
 
+import base64
+import binascii
 import importlib.util
 import json
 import os
@@ -345,6 +347,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Container, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, ClassVar
 
@@ -1430,6 +1433,100 @@ def _remove_schema_file(path: str | None) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialStatus:
+    """What the Codex ChatGPT login store looks like -- metadata only.
+
+    Mirrors ``modelpass.adapters.anthropic.CredentialStatus``: reads
+    ``auth.json`` for the stored access token's expiry and whether a
+    refresh_token is present, never the token values themselves. The access
+    token is a JWT (codex-rs's own ``token_data.rs`` parses the same ``exp``
+    claim client-side), so the expiry comes from decoding that claim rather
+    than from a plain field the way Claude Code's credential file has one.
+    """
+
+    source: str
+    present: bool = False
+    expires_at: float | None = None
+    expired: bool = False
+    refreshable: bool = True
+    detail: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        """Whether this credential can plausibly authenticate a child process."""
+        if not self.present:
+            return False
+        return not (self.expired and not self.refreshable)
+
+
+def _jwt_exp(token: str) -> float | None:
+    """Decode a JWT's ``exp`` claim without verifying the signature.
+
+    modelpass never checks a token's signature or treats it as anything but an
+    opaque string beyond this one claim -- the same "metadata only" boundary
+    :class:`CredentialStatus` documents.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1]
+    padded = payload + "=" * (-len(payload) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return None
+    exp = data.get("exp") if isinstance(data, Mapping) else None
+    return float(exp) if isinstance(exp, (int, float)) else None
+
+
+def read_credential_status(home: Path) -> CredentialStatus:
+    """Detect the Codex ChatGPT login without reading any secret value.
+
+    ``auth.json`` also carries an ``openai_api_key`` for API-key logins; that
+    shape has no ``tokens`` entry and is reported as absent here rather than
+    unusable, because it is simply not a subscription login to begin with.
+    """
+    path = home / "auth.json"
+    source = f"Codex login ({path})"
+    if not path.is_file():
+        return CredentialStatus(source=source, present=False, detail="no credential file")
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return CredentialStatus(
+            source=source, present=True, detail=f"credential file unreadable ({type(exc).__name__})"
+        )
+
+    tokens = raw.get("tokens") if isinstance(raw, Mapping) else None
+    if not isinstance(tokens, Mapping):
+        return CredentialStatus(
+            source=source, present=False, detail="no tokens entry in credential file"
+        )
+
+    access_token = str(tokens.get("access_token") or "")
+    refreshable = bool(str(tokens.get("refresh_token") or ""))
+    expires_at = _jwt_exp(access_token) if access_token else None
+    expired = expires_at is not None and expires_at <= time.time()
+
+    return CredentialStatus(
+        source=source,
+        present=bool(access_token),
+        expires_at=expires_at,
+        expired=expired,
+        refreshable=refreshable,
+    )
+
+
+def _format_expiry(expires_at: float | None) -> str:
+    if expires_at is None:
+        return "at an unknown time"
+    import datetime as _dt
+
+    return _dt.datetime.fromtimestamp(expires_at, _dt.UTC).strftime("on %Y-%m-%d")
 
 
 def _credential_store_notes(request: RunRequest, home: Path) -> tuple[str, ...]:
@@ -2847,6 +2944,62 @@ class OpenAIAdapter(Adapter):
             "than scrubbed",
         )
 
+    def _verify_subscription_token(
+        self,
+        binary: str,
+        env: dict[str, str],
+        home: Path,
+        notes: tuple[str, ...],
+    ) -> tuple[bool, str | None, tuple[str, ...]]:
+        """Confirm the ChatGPT login's access token is actually usable now.
+
+        ``codex login status`` reporting "logged in" is not the same claim as
+        "the stored access token still works": Codex records a *permanent*
+        refresh failure (dead refresh_token, revoked grant) without logging
+        the account out, so a stale-but-optimistic status line is exactly the
+        shape of failure a preflight is supposed to catch before a run spends
+        anything. ``auth.json``'s token expiry is the fact ``login status``
+        does not expose, so this reads it directly (metadata only -- see
+        :class:`CredentialStatus`).
+
+        An expired-but-refreshable token gets one extra chance: Codex
+        refreshes lazily on any command that needs a valid token, and
+        ``codex login status`` is exactly such a command, so re-running it
+        once and re-reading ``auth.json`` afterwards is the cheapest way to
+        turn "the runtime will probably refresh it" into "it just did, or it
+        didn't." No model tokens are spent either way.
+        """
+        status = read_credential_status(home)
+        if not status.present:
+            return True, None, notes
+        if status.usable and not status.expired:
+            return True, None, notes
+
+        if not status.usable:
+            when = _format_expiry(status.expires_at)
+            return (
+                False,
+                f"the Codex ChatGPT login's access token expired {when} and carries "
+                "no refresh token, so a modelpass-spawned runtime cannot authenticate. "
+                "Re-run 'codex login' to log in again",
+                notes,
+            )
+
+        # status.expired and status.refreshable: give the CLI one chance to
+        # refresh it, then trust only what auth.json shows afterwards.
+        self._login_status(binary, env)
+        refreshed = read_credential_status(home)
+        if refreshed.expired:
+            when = _format_expiry(refreshed.expires_at)
+            return (
+                False,
+                f"the Codex ChatGPT login's access token expired {when} and could not "
+                "be refreshed (re-checked via 'codex login status'); the stored refresh "
+                "token may be revoked or invalid. Re-run 'codex login' to log in again",
+                notes,
+            )
+        return True, None, (*notes, "access token had expired and was refreshed during preflight")
+
     def preflight(self, request: RunRequest) -> Receipt:
         plan = request.plan
         home = self._codex_home_for(request)
@@ -2909,6 +3062,11 @@ class OpenAIAdapter(Adapter):
             detected, source = None, ""
             ok = False
             problem = f"unrecognized 'codex login status' output: {output.strip()[:200]!r}"
+
+        if detected is AuthMode.SUBSCRIPTION and ok:
+            ok, problem, notes = self._verify_subscription_token(
+                binary, dict(plan.env), home, notes
+            )
 
         account_profile = None
         if detected is not None:

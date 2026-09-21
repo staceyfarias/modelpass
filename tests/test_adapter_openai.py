@@ -9,7 +9,9 @@ reads a credential; the transport is a scripted fake.
 
 from __future__ import annotations
 
+import base64
 import json
+import time
 import tomllib
 from pathlib import Path
 
@@ -30,6 +32,7 @@ from modelpass.adapters.openai import (
     map_codex_event,
     mcp_config_args,
     read_configured_cli_path,
+    read_credential_status,
     render_prompt,
     render_session_prompt,
 )
@@ -1007,6 +1010,65 @@ def _isolated_openai(home) -> Connection:
     )
 
 
+# --- credential detection (auth.json expiry) -------------------------------------
+
+
+def _codex_jwt(exp: float) -> str:
+    """A JWT with only an 'exp' claim -- codex-rs's token_data.rs parses the
+    same claim client-side, so this is the minimum shape read_credential_status
+    needs, never a real signature."""
+    raw = base64.urlsafe_b64encode(json.dumps({"exp": int(exp)}).encode())
+    payload = raw.rstrip(b"=").decode("ascii")
+    return f"header.{payload}.sig"
+
+
+def _write_auth_json(home: Path, *, access_exp: float, refresh: str) -> None:
+    home.mkdir(exist_ok=True)
+    (home / "auth.json").write_text(
+        json.dumps(
+            {"tokens": {"access_token": _codex_jwt(access_exp), "refresh_token": refresh}}
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_a_live_codex_login_is_reported_usable(tmp_path):
+    home = tmp_path / "codex-work"
+    _write_auth_json(home, access_exp=time.time() + 3600, refresh="r")
+    status = read_credential_status(home)
+    assert status.present and status.usable and not status.expired
+
+
+def test_an_expired_codex_login_without_refresh_is_not_usable(tmp_path):
+    home = tmp_path / "codex-work"
+    _write_auth_json(home, access_exp=time.time() - 3600, refresh="")
+    status = read_credential_status(home)
+    assert status.present and status.expired and not status.refreshable
+    assert not status.usable
+
+
+def test_an_expired_but_refreshable_codex_login_stays_usable(tmp_path):
+    home = tmp_path / "codex-work"
+    _write_auth_json(home, access_exp=time.time() - 3600, refresh="r")
+    assert read_credential_status(home).usable
+
+
+def test_a_missing_codex_login_is_reported_absent(tmp_path):
+    status = read_credential_status(tmp_path / "codex-work")
+    assert not status.present and not status.usable
+
+
+def test_an_api_key_only_auth_json_is_reported_absent_not_unusable(tmp_path):
+    """{'openai_api_key': ...} with no 'tokens' entry is not a subscription
+    login at all -- reported absent so preflight trusts 'codex login status'
+    instead of failing a run that was never a ChatGPT login to begin with."""
+    home = tmp_path / "codex-work"
+    home.mkdir()
+    (home / "auth.json").write_text(json.dumps({"openai_api_key": "sk-x"}), encoding="utf-8")
+    status = read_credential_status(home)
+    assert not status.present
+
+
 def test_isolated_openai_account_accepts_keyring_storage(tmp_path):
     """CODEX_HOME isolates keyring credentials too, so nothing is refused.
 
@@ -1113,6 +1175,70 @@ def test_preflight_flags_api_key_login_as_a_mismatch():
     assert receipt.detected_auth_mode is AuthMode.API_KEY
     with pytest.raises(AuthModeMismatch):
         receipt.require_auth_mode()
+
+
+def test_an_expired_but_refreshable_codex_login_is_verified_and_refreshed(tmp_path):
+    """Parity with the Anthropic adapter's fix for the real-world failure: a
+    receipt saying ok=True on a login whose refresh silently failed lets a run
+    start and then die on the first token, because 'codex login status' can
+    keep saying 'logged in' after a permanently-failed refresh without ever
+    clearing the stored tokens. Preflight now re-checks auth.json after one
+    forced CLI probe instead of trusting the text answer alone.
+    """
+    home = tmp_path / "codex-work"
+    _write_auth_json(home, access_exp=time.time() - 10, refresh="r")
+    calls = {"n": 0}
+
+    def login_status(binary, env):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            _write_auth_json(home, access_exp=time.time() + 3600, refresh="r")
+        return "Logged in using ChatGPT\n"
+
+    adapter = OpenAIAdapter(
+        codex_bin="codex",
+        login_status=login_status,
+        codex_version=lambda b, e: "codex-cli 0.117.0",
+    )
+    receipt = adapter.preflight(request_for(_isolated_openai(home)))
+
+    assert receipt.ok
+    assert calls["n"] == 2
+    assert "was refreshed during preflight" in " ".join(receipt.notes)
+
+
+def test_a_permanently_failed_codex_refresh_fails_closed_and_says_to_log_in_again(tmp_path):
+    """auth.json still expired after the forced re-probe is exactly the
+    permanent-refresh-failure shape (dead refresh_token, revoked grant) that
+    'codex login status' alone does not surface -- the run must not proceed."""
+    home = tmp_path / "codex-work"
+    _write_auth_json(home, access_exp=time.time() - 10, refresh="r")
+
+    adapter = OpenAIAdapter(
+        codex_bin="codex",
+        login_status=lambda b, e: "Logged in using ChatGPT\n",
+        codex_version=lambda b, e: "codex-cli 0.117.0",
+    )
+    receipt = adapter.preflight(request_for(_isolated_openai(home)))
+
+    assert not receipt.ok
+    assert "could not be refreshed" in receipt.problem
+    assert "codex login" in receipt.problem
+
+
+def test_an_expired_codex_login_without_refresh_token_fails_closed(tmp_path):
+    home = tmp_path / "codex-work"
+    _write_auth_json(home, access_exp=time.time() - 10, refresh="")
+
+    adapter = OpenAIAdapter(
+        codex_bin="codex",
+        login_status=lambda b, e: "Logged in using ChatGPT\n",
+        codex_version=lambda b, e: "codex-cli 0.117.0",
+    )
+    receipt = adapter.preflight(request_for(_isolated_openai(home)))
+
+    assert not receipt.ok
+    assert "carries no refresh token" in receipt.problem
 
 
 def test_preflight_fails_closed_when_not_logged_in():

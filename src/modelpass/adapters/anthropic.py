@@ -1926,6 +1926,22 @@ class AnthropicAdapter(Adapter):
         super().invalidate_identity_cache()
         self._identity_cache.clear()
 
+    def _force_auth_status(
+        self, binary: str, env: Mapping[str, str]
+    ) -> Mapping[str, Any] | None:
+        """Bypass the identity cache for a fresh ``claude auth status`` answer.
+
+        Used only once a stored login's access token is found expired: the
+        answer already cached for this preflight predates that discovery, and
+        a ``claude`` invocation is Claude Code's own trigger for the proactive
+        refresh it performs lazily on any command that needs a valid token. A
+        cached "yes, logged in" from up to a minute ago says nothing about
+        whether that refresh just succeeded or failed.
+        """
+        key = (binary, env.get("CLAUDE_CONFIG_DIR"))
+        self._identity_cache.pop(key, None)
+        return self._cached_auth_status(binary, env)
+
     def _ttl_env(self, sdk: Any, plan: PreflightPlan) -> dict[str, str]:
         """Pin the session prefix's cache TTL, but only where the CLI reads it.
 
@@ -1989,7 +2005,9 @@ class AnthropicAdapter(Adapter):
         profile = _account_profile_from_auth_status(
             self._cached_auth_status(cli_path, plan.env)
         )
-        return self._subscription_receipt(request, notes, account_profile=profile)
+        return self._subscription_receipt(
+            request, notes, account_profile=profile, cli_path=cli_path
+        )
 
     def _api_key_receipt(self, request: RunRequest, notes: list[str]) -> Receipt:
         plan = request.plan
@@ -2017,6 +2035,7 @@ class AnthropicAdapter(Adapter):
         notes: list[str],
         *,
         account_profile: AccountProfile | None = None,
+        cli_path: str | None = None,
     ) -> Receipt:
         """Confirm a usable subscription login, or fail closed.
 
@@ -2091,7 +2110,49 @@ class AnthropicAdapter(Adapter):
             )
 
         if status.expired:
-            notes.append("access token is past its expiry; the runtime will refresh it on use")
+            # usable is True here, so a refresh token is present. Rather than
+            # trusting "the runtime will refresh it on use", spend one cheap
+            # CLI probe to find out whether it already did: a ``claude``
+            # invocation is Claude Code's own trigger for the proactive
+            # refresh it performs lazily, and a permanently-failed refresh
+            # (dead refresh_token, revoked grant) leaves the account looking
+            # "logged in" without ever clearing the stored tokens -- exactly
+            # the failure a passive note would miss.
+            if cli_path is not None:
+                fresh_profile = _account_profile_from_auth_status(
+                    self._force_auth_status(cli_path, plan.env)
+                )
+                if fresh_profile is not None:
+                    account_profile = fresh_profile
+                status = read_credential_status(plan.env)
+                if status.expired:
+                    when = _format_expiry(status.expires_at)
+                    return Receipt.from_plan(
+                        plan,
+                        detected_auth_mode=None,
+                        credential_source=status.source,
+                        account=account_profile.email if account_profile else None,
+                        plan_name=(
+                            account_profile.subscription_type
+                            if account_profile and account_profile.subscription_type
+                            else status.subscription_type
+                        ),
+                        account_profile=account_profile,
+                        ok=False,
+                        problem=(
+                            f"the Claude Code login's access token expired {when} and "
+                            "could not be refreshed (re-checked via 'claude auth "
+                            "status'); the stored refresh token may be revoked or "
+                            "invalid. Re-run 'claude /login' (or 'claude setup-token') "
+                            "to log in again"
+                        ),
+                        notes=tuple(notes),
+                    )
+                notes.append("access token had expired and was refreshed during preflight")
+            else:
+                notes.append(
+                    "access token is past its expiry; the runtime will refresh it on use"
+                )
         if status.detail:
             notes.append(status.detail)
         if status.rate_limit_tier:
