@@ -3,7 +3,7 @@
 Notable changes to modelpass (called `subpass` through 0.1.1). Dates are the day the
 work landed.
 
-## Unreleased
+## 0.2.2 — 2026-09-21
 
 ### Added
 
