@@ -128,7 +128,8 @@ def cli(store):
 @pytest.fixture
 def bench(store):
     def make(connections=()):
-        flask_app = pytest.importorskip("modelpass.bench.app")
+        pytest.importorskip("flask")
+        from modelpass.bench import app as flask_app
         for connection in connections:
             store.add(connection, overwrite=True)
         bridge = _bridge(store)

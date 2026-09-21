@@ -572,6 +572,13 @@ def test_a_schema_name_without_a_schema_is_a_mistake_worth_hearing_about(tmp_pat
         )
 
 
+# This one drives a :class:`Bridge` whose failover target is ``openai-sdk``, and a
+# Bridge refuses a runtime whose SDK does not import -- which would refuse the leg
+# for the wrong reason and never reach the capability gate under test.
+@pytest.mark.skipif(
+    not OpenAIAdapter.is_available(),
+    reason="needs the modelpass[openai] extra: openai-codex is not installed",
+)
 def test_a_schema_bearing_failover_needs_the_target_to_support_it(tmp_path):
     """A failover must be able to answer the same question the first leg was asked."""
     from modelpass.testing import quota_exhausted

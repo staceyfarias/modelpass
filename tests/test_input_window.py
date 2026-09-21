@@ -79,7 +79,8 @@ def bench(store):
     """The bench app over a temp store. Skips where flask is not installed."""
 
     def make(connections=()):
-        flask_app = pytest.importorskip("modelpass.bench.app")
+        pytest.importorskip("flask")
+        from modelpass.bench import app as flask_app
         for connection in connections:
             store.add(connection, overwrite=True)
         bridge = _bridge(store)
