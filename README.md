@@ -249,10 +249,12 @@ directory reads a different entry either way. modelpass reports which store is i
 a receipt note rather than requiring one. The default account continues to use Codex's
 normal default storage.
 
-> macOS behaviour here is implemented from Claude Code's documentation and Codex's
-> published source, and has **not yet been exercised on a Mac**. It is covered by unit
-> tests that simulate the platform; if something reads wrong on a real Mac, that is a
-> bug worth reporting rather than a documented limitation.
+> **No part of modelpass has been run on a Mac.** The macOS behaviour described here and
+> above — the account profiles, the Keychain reading, the fallback to `.credentials.json` —
+> is implemented from Claude Code's documentation and Codex's published source, and is
+> covered by unit tests that simulate the platform. Nobody has yet driven `modelpass
+> connect`, a preflight or a chat on real hardware. If something reads wrong on a real
+> Mac, that is a bug worth reporting rather than a documented limitation.
 
 Prefer a UI? Install `modelpass[bench]`, run `modelpass bench`, and open the loopback URL it
 prints. The Flask account manager can add, edit, disable, delete, inspect, and preflight
