@@ -3,6 +3,34 @@
 Notable changes to modelpass (called `subpass` through 0.1.1). Dates are the day the
 work landed.
 
+## Unreleased
+
+### Fixed
+
+- **A blanked credential file is no longer reported as a login that expired in
+  1970** (2026-09-21). When the Claude Code CLI is logged out it does not delete
+  `.credentials.json`; it empties `accessToken` and `refreshToken`, sets
+  `expiresAt` to `0`, and leaves the plan metadata — `subscriptionType`,
+  `rateLimitTier`, `scopes`, the organization — exactly where it was. Read as a
+  timestamp, `0` is the epoch and therefore always in the past, so
+  `CredentialStatus.expired` came back `True` about a token that had never
+  existed. A non-positive expiry is now **no expiry recorded** (`expires_at`
+  is `None`, `expired` is `False`); a genuinely lapsed token is unaffected.
+
+- **The receipt tells a logged-out CLI apart from a missing credential file.**
+  Both are `present=False` and both want `claude /login`, so they had the same
+  message — but that message is "no Claude Code login found", and a reader
+  looking at a file that plainly describes a Max plan concludes modelpass is
+  reading the wrong place and goes hunting for a Keychain, Credential Manager
+  or DPAPI store holding the real token. On Windows and Linux there is no such
+  store; the CLI is simply logged out. New `CredentialStatus.logged_out` marks
+  the case and the problem string says the file was found and holds no token.
+  The wording for a genuinely absent file is unchanged.
+
+  Reported against 0.2.2 by a consumer whose preflight refused on a machine
+  where `claude auth status` also answered `loggedIn: false` — the refusal was
+  right and the explanation was not.
+
 ## 0.2.2 — 2026-09-21
 
 ### Added

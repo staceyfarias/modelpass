@@ -1157,6 +1157,113 @@ def test_a_missing_login_is_reported_absent(tmp_path):
     assert not status.present and not status.usable
 
 
+def _write_logged_out_credentials(tmp_path) -> dict[str, str]:
+    """The shape Claude Code leaves on Windows when the CLI is logged out.
+
+    Observed on a real machine (2026-09-21): the secrets are blanked in place
+    and everything else stays, so the file still describes a plan in detail
+    while holding nothing that can authenticate.
+    """
+    (tmp_path / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "",
+                    "refreshToken": "",
+                    "expiresAt": 0,
+                    "subscriptionType": "max",
+                    "rateLimitTier": "default_claude_max_20x",
+                    "scopes": ["user:inference", "user:profile"],
+                },
+                "organizationUuid": "not-a-real-uuid",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {"CLAUDE_CONFIG_DIR": str(tmp_path)}
+
+
+@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
+def test_a_blanked_expiry_is_no_expiry_rather_than_the_epoch(tmp_path):
+    """``expiresAt: 0`` is a cleared field, not a token that lapsed in 1970.
+
+    Read as a timestamp it is always in the past, so `expired` came back True
+    for a login that never existed -- a fact stated about nothing.
+    """
+    status = read_credential_status(_write_logged_out_credentials(tmp_path))
+    assert status.expires_at is None
+    assert not status.expired
+
+
+@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
+def test_a_logged_out_file_is_told_apart_from_a_missing_one(tmp_path, tmp_path_factory):
+    """Both are `present=False` and both want `claude /login`; only one of them
+    also explains why a populated plan is sitting in the file."""
+    logged_out = read_credential_status(_write_logged_out_credentials(tmp_path))
+    missing = read_credential_status(
+        {"CLAUDE_CONFIG_DIR": str(tmp_path_factory.mktemp("empty"))}
+    )
+
+    assert not logged_out.present and not logged_out.usable
+    assert not missing.present and not missing.usable
+    assert logged_out.logged_out and not missing.logged_out
+    # The plan metadata is still readable, which is exactly what makes the
+    # "no login found" wording misleading without the flag.
+    assert logged_out.subscription_type == "max"
+
+
+def test_a_logged_out_cli_is_not_reported_as_no_login_at_all(
+    monkeypatch, subscription_connection
+):
+    """The receipt has to say the file was found and is empty.
+
+    Told only "no Claude Code login found" against a file that plainly holds a
+    plan, a reader concludes modelpass looked in the wrong place and goes
+    hunting for an external credential store. There is none on this platform:
+    the CLI is simply logged out.
+    """
+    adapter, module = _preflight_adapter(
+        monkeypatch, auth_status=lambda binary, env: {"loggedIn": False}
+    )
+    monkeypatch.setattr(
+        module,
+        "read_credential_status",
+        lambda env=None: module.CredentialStatus(
+            source="test", present=False, logged_out=True, subscription_type="max"
+        ),
+    )
+
+    plan = plan_launch(subscription_connection, {})
+    receipt = adapter.preflight(
+        RunRequest(connection=subscription_connection, messages=(), plan=plan)
+    )
+
+    assert not receipt.ok
+    assert "logged out" in receipt.problem
+    assert "claude /login" in receipt.problem
+
+
+def test_a_genuinely_missing_file_keeps_the_wording_it_always_had(
+    monkeypatch, subscription_connection
+):
+    adapter, module = _preflight_adapter(
+        monkeypatch, auth_status=lambda binary, env: {"loggedIn": False}
+    )
+    monkeypatch.setattr(
+        module,
+        "read_credential_status",
+        lambda env=None: module.CredentialStatus(source="test", present=False),
+    )
+
+    plan = plan_launch(subscription_connection, {})
+    receipt = adapter.preflight(
+        RunRequest(connection=subscription_connection, messages=(), plan=plan)
+    )
+
+    assert not receipt.ok
+    assert "no Claude Code login found" in receipt.problem
+
+
 # --- expired-but-refreshable: verified, not assumed -----------------------------
 
 

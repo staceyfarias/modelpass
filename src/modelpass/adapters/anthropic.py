@@ -239,6 +239,15 @@ class CredentialStatus:
     #: subscription receipt reads this to decide whether ``claude auth status``
     #: is the only evidence it has about which account a config directory holds.
     keychain_only: bool = False
+    #: True when the credential file exists and parses but its token fields are
+    #: blank -- what Claude Code leaves behind when the CLI is logged out: the
+    #: plan metadata (``subscriptionType``, ``rateLimitTier``, ``scopes``) stays
+    #: and the secrets are emptied. Indistinguishable from a missing file by
+    #: :attr:`present` alone, and the two want the same instruction but not the
+    #: same diagnosis -- a reader who sees a populated plan in the file and is
+    #: told "no login found" reasonably concludes the token must live somewhere
+    #: else, which on this platform it does not.
+    logged_out: bool = False
 
     @property
     def usable(self) -> bool:
@@ -305,22 +314,30 @@ def read_credential_status(env: Mapping[str, str] | None = None) -> CredentialSt
 
     expires_raw = oauth.get("expiresAt")
     expires_at: float | None = None
-    if isinstance(expires_raw, (int, float)):
+    # A zero or negative expiry is not a date. Claude Code writes ``0`` into
+    # this field when it blanks the tokens, so reading it as a timestamp puts
+    # the expiry at the epoch and every check downstream reports a login that
+    # "expired in 1970" -- an artefact of the field being cleared, stated as a
+    # fact about a token that was never there. No expiry recorded is `None`.
+    if isinstance(expires_raw, (int, float)) and expires_raw > 0:
         # The file stores milliseconds; tolerate seconds from an older layout.
         expires_at = float(expires_raw) / 1000.0 if expires_raw > 1e11 else float(expires_raw)
 
     # Presence/length only -- the value itself is never read out of this scope.
     refreshable = bool(str(oauth.get("refreshToken") or ""))
     expired = expires_at is not None and expires_at <= time.time()
+    present = bool(str(oauth.get("accessToken") or ""))
 
     return CredentialStatus(
         source=source,
-        present=bool(str(oauth.get("accessToken") or "")),
+        present=present,
         expires_at=expires_at,
         expired=expired,
         refreshable=refreshable,
         subscription_type=_as_str(oauth.get("subscriptionType")),
         rate_limit_tier=_as_str(oauth.get("rateLimitTier")),
+        detail=None if present else "credential file holds no access token",
+        logged_out=not present,
     )
 
 
@@ -2074,16 +2091,29 @@ class AnthropicAdapter(Adapter):
                 )
 
         if not status.present:
+            # Same instruction either way, different diagnosis. "No login
+            # found" against a file that plainly holds a plan reads as modelpass
+            # looking in the wrong place, and sends the reader hunting for an
+            # external credential store instead of logging in.
+            if status.logged_out:
+                problem = (
+                    "the Claude Code credential file holds no access token -- "
+                    "the CLI is logged out (the plan metadata it keeps is not a "
+                    "login); run 'claude /login' (or 'claude setup-token' for "
+                    "headless use) before using a subscription connection"
+                )
+            else:
+                problem = (
+                    "no Claude Code login found; run 'claude /login' (or "
+                    "'claude setup-token' for headless use) before using a "
+                    "subscription connection"
+                )
             return Receipt.from_plan(
                 plan,
                 detected_auth_mode=None,
                 credential_source=status.source,
                 ok=False,
-                problem=(
-                    "no Claude Code login found; run 'claude /login' (or "
-                    "'claude setup-token' for headless use) before using a "
-                    "subscription connection"
-                ),
+                problem=problem,
                 notes=tuple(notes),
             )
 
