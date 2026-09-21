@@ -93,7 +93,7 @@ one thing this library is for adds nothing there; embeddings stayed app-owned.
 pip install modelpass
 ```
 
-Until the first release reaches PyPI, install from source instead:
+To run against unreleased work, install from source instead:
 `pip install "modelpass @ git+https://github.com/staceyfarias/modelpass.git"`.
 
 Core has **zero runtime dependencies**, on purpose. Every runtime, the bench and the
