@@ -122,6 +122,13 @@ from .preflight import (
     plan_launch,
     scrub_env,
 )
+from .prompt_cache import (
+    PROMPT_CACHE_TTLS,
+    VENDOR_DEFAULT,
+    PromptCacheDisposition,
+    PromptCachePlan,
+    plan_prompt_cache,
+)
 from .retry import RetryVerdict, classify_error, classify_terminal
 from .runlog import RunLog, RunRecord, run_log_for
 from .runtimes import Runtime
@@ -175,8 +182,10 @@ __all__ = [
     "DEFAULT_GROUP",
     "DEFAULT_REGISTRY",
     "FORBIDDEN_LAUNCH_ARGS",
+    "PROMPT_CACHE_TTLS",
     "SCRUB_RULES",
     "STATIC_TABLE",
+    "VENDOR_DEFAULT",
     "VERIFY_CELLS",
     "Account",
     "AccountBinding",
@@ -232,6 +241,8 @@ __all__ = [
     "NoSuchSecret",
     "PreflightFailed",
     "PreflightPlan",
+    "PromptCacheDisposition",
+    "PromptCachePlan",
     "QuotaAction",
     "QuotaExhausted",
     "QuotaPolicy",
@@ -300,6 +311,7 @@ __all__ = [
     "openai_strict_issues",
     "passthrough_env_names",
     "plan_launch",
+    "plan_prompt_cache",
     "plan_sampling",
     "rules_for",
     "run_log_for",

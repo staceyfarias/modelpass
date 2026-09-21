@@ -1079,6 +1079,21 @@ class Receipt:
     #: every plain-string call, which is every call written before this existed.
     cache_breakpoints_requested: int = 0
     cache_breakpoints_honoured: int = 0
+    #: What the connection's ``promptCache`` asked for, and how this runtime
+    #: meets it (2026-09-21). Both ``None`` on every connection that stated
+    #: nothing, which is every connection written before the key existed.
+    #:
+    #: Two fields rather than one, because the interesting thing is not that
+    #: caching was requested but **which of two very different things that
+    #: bought**: ``"explicit"`` means the runtime takes an instruction and a
+    #: caller's ``cache_control`` breakpoints reach it, ``"automatic"`` means
+    #: the runtime was caching anyway and the request was already met before it
+    #: was made. A caller that cannot tell those apart cannot tell whether its
+    #: breakpoints are doing anything. The third outcome -- the runtime can
+    #: neither be instructed nor shown to cache -- never reaches a receipt: it
+    #: is an ``InvalidConnection`` raised when the connection is built.
+    prompt_cache_requested: str | None = None
+    prompt_cache_disposition: str | None = None
     #: What this run asked the model to do about word choice, and what will
     #: actually be sent (R5, ticket 1.7). Two dicts rather than one flag,
     #: because the interesting case is exactly where they disagree and a
@@ -1307,6 +1322,8 @@ class Receipt:
             "cache": self.cache.to_dict() if self.cache is not None else None,
             "cache_breakpoints_requested": self.cache_breakpoints_requested,
             "cache_breakpoints_honoured": self.cache_breakpoints_honoured,
+            "prompt_cache_requested": self.prompt_cache_requested,
+            "prompt_cache_disposition": self.prompt_cache_disposition,
             "sampling_requested": dict(self.sampling_requested),
             "sampling_applied": dict(self.sampling_applied),
             "sampling_notes": list(self.sampling_notes),

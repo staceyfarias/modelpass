@@ -109,6 +109,7 @@ from .errors import (
     VendorRunFailed,
 )
 from .preflight import PreflightPlan, Receipt, plan_launch
+from .prompt_cache import plan_prompt_cache
 from .runlog import RunLog, RunRecord, run_log_for
 from .runtimes import API_RUNTIMES, Runtime
 from .sampling_rules import plan_sampling
@@ -745,6 +746,7 @@ class Bridge:
         )
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
+        receipt = self._with_prompt_cache(request, receipt)
         return self._with_sampling_disclosure(request, receipt)
 
     def refresh_identity(self, connection: Connection | str) -> None:
@@ -1021,6 +1023,43 @@ class Bridge:
             cache=cache,
             cache_breakpoints_requested=requested,
             cache_breakpoints_honoured=requested if honours else 0,
+        )
+
+    @staticmethod
+    def _with_prompt_cache(
+        request: RunRequest | SessionRequest, receipt: Receipt
+    ) -> Receipt:
+        """Say what the connection asked about caching, and what it bought (2026-09-21).
+
+        A fourth disclosure step beside :meth:`_with_cache_disclosure`,
+        :meth:`_with_cache_breakpoints` and :meth:`_with_sampling_disclosure`,
+        and here rather than in an adapter for the reason the middle two are:
+        the answer comes from the *table*, so an adapter that has never heard of
+        the key still produces a receipt that reports it.
+
+        Silent on every connection that stated nothing, which is the difference
+        from the sampling step: a required field nobody set is a fact about a
+        run, but a caching request nobody made is not -- and a line reading
+        "prompt caching: not requested" on every receipt ever printed would be
+        noise standing where a disclosure should be.
+
+        Cannot refuse. The refusal happened when the connection was built; by
+        the time a request exists, the plan is known to be meetable.
+        """
+        stated = request.connection.prompt_cache
+        if stated is None:
+            return receipt
+        try:
+            plan = plan_prompt_cache(
+                stated, request.connection.runtime, name=request.connection.name
+            )
+        except SubpassError:  # pragma: no cover - defensive: refused at build
+            return receipt
+        return replace(
+            receipt,
+            notes=(*receipt.notes, plan.note),
+            prompt_cache_requested=plan.requested,
+            prompt_cache_disposition=plan.disposition.value,
         )
 
     @staticmethod
@@ -2100,6 +2139,7 @@ class Bridge:
         receipt = self._with_identity_verification(resolved, receipt)
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
+        receipt = self._with_prompt_cache(request, receipt)
         receipt.require_ok()
         receipt.require_auth_mode(
             AuthMode(expect_auth_mode) if expect_auth_mode is not None else None
@@ -2758,6 +2798,7 @@ class Bridge:
             receipt = replace(receipt, notes=(*receipt.notes, _note))
         receipt = self._with_cache_disclosure(plan.adapter, plan.request, receipt)
         receipt = self._with_cache_breakpoints(plan.request, receipt)
+        receipt = self._with_prompt_cache(plan.request, receipt)
         receipt = self._with_sampling_disclosure(plan.request, receipt)
         receipt.require_ok()
         receipt.require_auth_mode(

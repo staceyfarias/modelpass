@@ -751,6 +751,118 @@ An additive key under the store's 0.1 compatibility policy: a connection written
 before it existed loads unchanged and is not given one when the file is
 rewritten.
 
+### 1.9 `promptCache` — asking for prompt caching, and being told what that bought (2026-09-21)
+
+A connection may state that it wants prompt caching:
+
+```toml
+[connections.claude-api]
+runtime       = "anthropic-api"
+authMode      = "api_key"
+credentialRef = "env:ANTHROPIC_API_KEY"
+promptCache   = "default"   # optional; "default" = the vendor's own lifetime
+```
+
+Read back as `Connection.prompt_cache`, a `str | None`.
+
+**This is the standing half of prompt caching. The per-call half already
+exists** and is not replaced: `CacheControl` on a `TextBlock` (§1.5) is how a
+caller says *where* the cacheable prefix ends, which is inherently per call
+because it is a statement about one payload's shape. `promptCache` is the other
+question — *do I want caching on this connection at all, and for how long* —
+which is a standing policy and sits beside `retry` and `timeoutSeconds`. Both
+are needed: a breakpoint with no policy was all the library had before, and on
+every runtime but one a caller **cannot place a breakpoint** and the cache
+happens anyway.
+
+#### The three outcomes
+
+Asking for caching has three possible answers, and conflating any two of them is
+the way to misread this feature.
+
+| outcome | when | what a caller sees |
+| --- | --- | --- |
+| **explicit** | the runtime takes an instruction (`cache_breakpoints` is `supported`) | the request is honoured in the strong sense: put `cache_control` on your content and it reaches the vendor. `Receipt.prompt_cache_disposition == "explicit"` |
+| **automatic** | the runtime caches unasked and cannot be stopped (`cache_automatic` is `supported`) | **the request was already satisfied.** Not an error. Nothing is sent for it and nothing needs to be. `Receipt.prompt_cache_disposition == "automatic"` |
+| **refused** | neither cell is `supported` | `InvalidConnection` when the connection is built |
+
+`automatic` is the answer most connections get, and reporting it as a failure
+would be wrong: most vendors cache prompts without markers, and on a
+subscription runtime there is no way to turn it off. Reporting it as `explicit`
+would be worse — a caller reading a single "caching: yes" could not tell whether
+its breakpoints were doing anything.
+
+The refusal is the case where there is nothing to honour *and* nothing already
+happening, so the alternative is a setting that silently does nothing. It says
+the narrow thing and not the broad one: *modelpass has not established that this
+runtime caches prompts*, naming both cells and what each reads. It is **not** a
+claim that the vendor does no caching.
+
+#### Refused at construction
+
+Everything needed to decide — the runtime, the value — is on the connection, so
+the refusal happens in `Connection.__post_init__`, like an `authMode` a runtime
+does not allow and like `CacheControl`'s own `ttl`. By the time a run exists,
+the request is known to be meetable. The error class is the existing
+`InvalidConnection`; no new error class and no new user-facing vocabulary were
+introduced.
+
+#### The lifetime, and what "unspecified" means
+
+Three states, and they are all distinguishable:
+
+| the file says | `prompt_cache` | `plan.ttl` | means |
+| --- | --- | --- | --- |
+| nothing | `None` | — | **nothing stated.** Nothing about the connection's behaviour changes. This is not "caching off" |
+| `promptCache = "default"` | `"default"` | `None` | caching asked for, **lifetime unspecified** — the vendor's own applies |
+| `promptCache = "1h"` | `"1h"` | `"1h"` | caching asked for at a named lifetime |
+
+A consumer must read `is None`, not falsiness, for the same reason
+`maxInputTokens` requires it.
+
+**There is no modelpass TTL vocabulary, and that is a finding rather than a
+taste.** The two runtimes that take a lifetime spell it in disjoint words —
+`anthropic` 0.97.0 types it `Literal['5m', '1h']` and `openai` 2.32.0 types it
+`Literal['in-memory', '24h']`. A single house vocabulary would have had to
+invent an equivalence nobody published, or pick one vendor's words and
+mis-describe the other. So `modelpass.prompt_cache.PROMPT_CACHE_TTLS` is per
+runtime, every value in it was read off the SDK installed in this repository on
+2026-09-21, and a test re-reads both literals so an SDK upgrade that moves one
+fails rather than drifts. A runtime absent from that table accepts `"default"`
+and nothing else, and its refusal says the checkable thing — *modelpass carries
+no cache lifetime to this runtime from this key* — rather than the broader claim
+that the vendor has no lever.
+
+#### What reaches a wire
+
+One thing: on `openai-api`, a named lifetime is sent as
+`prompt_cache_retention`, which is a typed field of that SDK's Responses
+request. `"default"` sends nothing, because the wire has no way to say "cache at
+whatever you normally do" other than by not saying anything.
+
+Everywhere else `promptCache` is a **declaration**, in the same way `retry =
+"never"` is a stance rather than a retry loop. In particular, on `anthropic-api`
+modelpass does not write the connection's lifetime onto the caller's
+breakpoints: §1.5 promises that modelpass never invents a breakpoint and never
+moves one, and filling in a `ttl` the caller left off would be editing their
+content. Place it on the `CacheControl` where it belongs; what the connection
+buys you is that an impossible lifetime is refused before a run rather than
+after a 400.
+
+No `prompt_cache_key` is sent either. Grouping requests so they land on the same
+cache is a caching *strategy* — it depends on what a caller considers one
+workload — and deriving a key from a connection name would be modelpass deciding
+that for everybody.
+
+#### Where it is reported
+
+`Receipt.prompt_cache_requested` and `Receipt.prompt_cache_disposition`, both
+`None` on every connection that stated nothing, plus one sentence in
+`Receipt.notes`. `modelpass list --verbose` prints the request and its
+disposition; the bench's accounts page prints the sentence, and says *nothing
+stated* rather than *off* for a connection that asked for nothing. An additive
+config key under the store's 0.1 compatibility policy.
+
 ---
 
 ## 2. The three vendors, and the matrix
@@ -1318,6 +1430,7 @@ any cell is `bridge.registry.note(runtime, capability)`.
 | `midconversation_system` | unsupported | unsupported |
 | `sessions_list` | supported | **supported** |
 | `ttl_control` | supported | unsupported |
+| `cache_automatic` | **supported** | **supported** |
 | `resume_carries_system_prompt` | unsupported | **supported** |
 | `graceful_cancel` | supported | **unverified** |
 | `subscription_auth` | supported | supported |
@@ -1337,7 +1450,8 @@ registry — `bridge.registry.row(runtime)` and `bridge.registry.note(runtime,
 capability)` — rather than this page.
 
 `sampling_controls` and `max_output_tokens` are the R5 cells, added 2026-09-13
-and filled by ticket 1.7 — see §2.3.
+and filled by ticket 1.7 — see §2.3. `cache_automatic` is the 2026-09-21 cell —
+see §1.9 for what it means and §2.4 for what moved it.
 
 On the two agent runtimes they are **`unsupported`, as a checked absence**: no
 `temperature`, `top_p`, `top_k` or output-length parameter appears anywhere in
@@ -1418,6 +1532,7 @@ travels with the install.
 | 2026-08-30 | `command_execution` captured live | `codex exec --json` | The item's real field names, the fourth `status`, and one bug |
 | 2026-08-31 | App-server transport, driven live | `codex` 0.151.0-alpha.7.1 | `system_prompt_replace`, the tool-belt switch, and the six cells the default flip moved (§3.2) |
 | 2026-09-13 | The four API runtimes | `anthropic` 0.97.0, `openai` 2.32.0, `google-genai` 1.73.1, typed surfaces | §2.0a–§2.0d, including every cell those sections leave open |
+| 2026-09-21 | `cache_automatic` | `openai` 2.32.0 typed surface; two recorded captures already in the tree | The one new cell, on three rows; five rows left `unverified` (§2.4) |
 
 #### The auth-mode findings, which are the reason this library exists
 
@@ -1692,6 +1807,40 @@ the parameter could only ever be a field that is always dropped. If a future
 runtime holds a history *and* takes sampling, it belongs at the session
 constructor beside `system_prompt` — fixed for the conversation, for the
 prefix-stability reason §1.4 gives — and not on `send`.
+
+---
+
+### 2.4 `cache_automatic` — does this runtime cache prompts unasked? (2026-09-21)
+
+The third cache cell, added with `promptCache` (§1.9). `cache_breakpoints` asks
+whether a caller may say *where* the prefix ends; `ttl_control` asks how *long*
+one lives; neither of them answers *does it happen at all*. Before this cell the
+table could not tell "this runtime ignores your caching request" from "this
+runtime was already doing it", which are the two most different answers a caller
+can get.
+
+`supported` here is never "you can control this" — it is the opposite. It marks
+the runtimes where a request to cache is already satisfied and there is nothing
+to send.
+
+| Runtime | Cell | What moved it |
+| --- | --- | --- |
+| `anthropic-sdk` | **supported** | `tests/fixtures/structured_output/anthropic-structured-output-2026-08-17.json`, a live capture whose four runs each report `cache_creation_input_tokens: 605` — modelpass sent no caching instruction and on this row cannot, since `cache_breakpoints` is `unsupported` and there is no field to send one in. SDK half: `claude_agent_sdk` 0.2.148 declares `cacheReadInputTokens` / `cacheCreationInputTokens` on the usage shape |
+| `openai-sdk` | **supported** | `tests/fixtures/appserver/live-capture-2026-08-31.jsonl`: one thread whose first turn reports `cachedInputTokens: 0` and whose later turns report 12,032 and 24,064, with `cacheWriteInputTokens: 0` throughout and no cache field anywhere on the transport |
+| `openai-api` | **supported** | `openai` 2.32.0 makes `ResponseUsage.input_tokens_details.cached_tokens` a **required** int on every response, and types `prompt_cache_retention` as `Optional[Literal['in-memory', '24h']]` with a docstring offering to *extend* a cache the request has no way to start |
+| `anthropic-api` | unverified | Never consulted: `cache_breakpoints` is `supported`, so a request resolves to `explicit` before this cell is read. Left open rather than marked `unsupported`, because "this endpoint does no caching you did not ask for" is a claim about vendor behaviour that nobody has driven |
+| `google-api` | unverified | **Deliberately not moved on this document's own prose.** The `cache_breakpoints` note says Gemini's implicit caching is "automatic and unaddressable", and that sentence was written to explain why a breakpoint has nowhere to go, not from a read of anything. What `google-genai` 1.73.1 actually shows is the *explicit* mechanism: `GenerateContentConfig.cached_content` names a resource the caller created, and `cached_content_token_count` is the read side of that resource. Moving the cell needs two live calls with an identical prefix and no `cached_content` |
+| `openai-compatible` | unverified | By construction, like every cell on that row |
+| `google-cli`, `google-sdk` | unverified | Experimental runtimes; nothing driven |
+
+The consequence a caller feels: `promptCache` is **refused** on `google-api`,
+`openai-compatible` and the two Google experimental runtimes. That is the
+designed behaviour of an unverified cell rather than a gap — `supports()` has
+treated `unverified` as unusable since the table was written, and honouring a
+caching request on a cell nobody has checked would be the guess this table
+exists to refuse.
+
+---
 
 ## 3. The two implemented vendors, in depth
 

@@ -157,6 +157,22 @@ class Capability(StrEnum):
     #: silent strip, where a consumer builds a four-breakpoint prompt, pays full
     #: price on every call and is told nothing.
     CACHE_BREAKPOINTS = "cache_breakpoints"
+    #: Does this runtime cache prompts **without being asked**, with no way for
+    #: the caller to turn it off (2026-09-21)? The third cache cell, and the
+    #: reason there are three: :attr:`CACHE_BREAKPOINTS` asks whether the caller
+    #: may say *where* the prefix ends, :attr:`TTL_CONTROL` asks how *long* it
+    #: lives, and neither of them answers *does it happen at all*. Before this
+    #: cell existed the table could not distinguish "this runtime ignores your
+    #: caching request" from "this runtime was already doing it", which are the
+    #: two most different answers a caller can get.
+    #:
+    #: ``supported`` here is never "you can control this". It is the opposite:
+    #: it is the runtimes where a request to cache is **already satisfied** and
+    #: there is nothing to send. ``unverified`` is the honest state for a
+    #: runtime whose caching modelpass has not read off an SDK surface or seen
+    #: in a recorded drive -- including runtimes whose vendors are widely
+    #: believed to cache, because a cell is not the place for a belief.
+    CACHE_AUTOMATIC = "cache_automatic"
 
 
 class Support(StrEnum):
@@ -201,6 +217,7 @@ STATIC_TABLE: dict[Runtime, dict[Capability, Support]] = {
         Capability.SAMPLING_CONTROLS: _U,
         Capability.MAX_OUTPUT_TOKENS: _U,
         Capability.CACHE_BREAKPOINTS: _N,
+        Capability.CACHE_AUTOMATIC: _S,
     },
     # Re-verified 2026-08-31 by S7, the commit that flipped this runtime's
     # default transport from ``codex exec`` to ``codex app-server``. A row
@@ -239,6 +256,7 @@ STATIC_TABLE: dict[Runtime, dict[Capability, Support]] = {
         Capability.SAMPLING_CONTROLS: _U,
         Capability.MAX_OUTPUT_TOKENS: _U,
         Capability.CACHE_BREAKPOINTS: _N,
+        Capability.CACHE_AUTOMATIC: _S,
     },
     Runtime.GOOGLE_CLI: {
         Capability.CHAT: _S,
@@ -267,6 +285,7 @@ STATIC_TABLE: dict[Runtime, dict[Capability, Support]] = {
         Capability.SAMPLING_CONTROLS: _U,
         Capability.MAX_OUTPUT_TOKENS: _U,
         Capability.CACHE_BREAKPOINTS: _U,
+        Capability.CACHE_AUTOMATIC: _U,
     },
     Runtime.GOOGLE_SDK: {
         Capability.CHAT: _S,
@@ -295,6 +314,7 @@ STATIC_TABLE: dict[Runtime, dict[Capability, Support]] = {
         Capability.SAMPLING_CONTROLS: _U,
         Capability.MAX_OUTPUT_TOKENS: _U,
         Capability.CACHE_BREAKPOINTS: _U,
+        Capability.CACHE_AUTOMATIC: _U,
     },
 }
 
@@ -439,6 +459,23 @@ _OPENAI_API_SUPPORTED: tuple[Capability, ...] = (
 for _capability in _OPENAI_API_SUPPORTED:
     STATIC_TABLE[Runtime.OPENAI_API][_capability] = Support.SUPPORTED
 
+#: The one ``cache_automatic`` cell that moved on 2026-09-21, and it is in its
+#: own block rather than in the tuple above because it is not one of the cells
+#: ticket 1.9 drove -- putting it there would backdate it.
+#:
+#: **Read off the installed SDK, and the evidence is two typed fields that only
+#: make sense together.** ``openai`` 2.32.0 declares
+#: ``ResponseUsage.input_tokens_details.cached_tokens`` as a **required** int on
+#: every response ("The number of tokens that were retrieved from the cache"),
+#: and ``ResponseCreateParamsBase`` declares
+#: ``prompt_cache_retention: Optional[Literal["in-memory", "24h"]]`` whose own
+#: docstring reads "Set to ``24h`` to enable **extended** prompt caching". A
+#: retention policy that *extends* something, on a request that has no way to
+#: *start* it, and a cache-read counter on every single response: that is a
+#: cache the caller did not ask for. Held by
+#: tests/test_prompt_cache.py::test_openai_api_caches_without_being_asked.
+STATIC_TABLE[Runtime.OPENAI_API][Capability.CACHE_AUTOMATIC] = Support.SUPPORTED
+
 #: The ``google-api`` cells the adapter of ticket 1.11 moved (2026-09-13).
 #:
 #: **Same standard of evidence as the two rows above, deliberately.** Each cell
@@ -568,6 +605,39 @@ NOTES: dict[tuple[Runtime, Capability], str] = {
         "row is 'supported' because the lifetime is settable (D17). What is absent "
         "is the caller's say in where the prefix ends. Moving this cell is a "
         "one-line re-read of the SDK's options"
+    ),
+    (Runtime.ANTHROPIC_SDK, Capability.CACHE_AUTOMATIC): (
+        "**supported, 2026-09-21**, and the evidence is a recorded drive rather "
+        "than a vendor's word. tests/fixtures/structured_output/"
+        "anthropic-structured-output-2026-08-17.json is a live capture of four "
+        "runs through this adapter, and every one of them reports "
+        "cache_creation_input_tokens 605 with cache_read_input_tokens 0 -- the "
+        "CLI wrote 605 tokens into a prompt cache on a run where modelpass sent "
+        "no caching instruction of any kind, because on this row it cannot: "
+        "CACHE_BREAKPOINTS is 'unsupported' and there is no field to send one "
+        "in. A cache that fills itself on a request that never mentioned it is "
+        "what this cell names. The SDK half, read the same day: claude_agent_sdk "
+        "0.2.148 types.py declares cacheReadInputTokens and "
+        "cacheCreationInputTokens on the usage shape, so the two counters are "
+        "part of the published surface and not an artefact of one build. Note "
+        "how this row differs from every other 'supported' cell here: it is not "
+        "something a caller can switch on, it is something a caller cannot "
+        "switch off, which is why TTL_CONTROL sits beside it as the only lever "
+        "there is (D17)"
+    ),
+    (Runtime.OPENAI_SDK, Capability.CACHE_AUTOMATIC): (
+        "**supported, 2026-09-21**, on the live app-server capture of 2026-08-31. "
+        "tests/fixtures/appserver/live-capture-2026-08-31.jsonl records one "
+        "thread's thread/tokenUsage/updated notifications turn by turn: the first "
+        "turn reports cachedInputTokens 0, the second reports 12032 and the third "
+        "24064, with cacheWriteInputTokens 0 throughout. modelpass sends no "
+        "caching instruction on this transport and has no way to -- "
+        "CACHE_BREAKPOINTS is 'unsupported' for two independently checked "
+        "reasons, and TTL_CONTROL is 'unsupported' too -- so a prefix that starts "
+        "cold and is being read back by the next turn is the vendor caching "
+        "unasked. This is the cell that makes 'unsupported' on the other two "
+        "cache rows readable: nothing about this runtime's caching is addressable, "
+        "and all of it is already happening"
     ),
     (Runtime.OPENAI_SDK, Capability.CACHE_BREAKPOINTS): (
         "unsupported, 2026-09-13 (R3), for two independent reasons either of which "
@@ -1160,6 +1230,51 @@ _GOOGLE_API_LIVE_HALF = (
 
 #: Where a runtime's own reason differs from the shared one.
 _API_RUNTIME_NOTES: dict[tuple[Runtime, Capability], str] = {
+    (Runtime.ANTHROPIC_API, Capability.CACHE_AUTOMATIC): (
+        "**unverified, and never consulted, 2026-09-21.** CACHE_BREAKPOINTS is "
+        "'supported' on this row -- ticket 1.6 moved it on 2026-09-13 with the "
+        "SDK read and the fake-transport test its note names -- so a promptCache "
+        "request here resolves to 'explicit' before this cell is read: a runtime "
+        "that takes an "
+        "instruction is answered by the instruction. Left unverified rather than "
+        "moved to 'unsupported' on purpose: 'this endpoint does no caching you "
+        "did not ask for' is a claim about vendor behaviour, nobody has driven "
+        "it, and the absence of a request field is not evidence of the absence "
+        "of a behaviour. Nothing in modelpass depends on the answer"
+    ),
+    (Runtime.GOOGLE_API, Capability.CACHE_AUTOMATIC): (
+        "**unverified, 2026-09-21, and deliberately not moved on what is already "
+        "written elsewhere in this file.** The CACHE_BREAKPOINTS note on this row, "
+        "recorded by ticket 1.11 on 2026-09-13, says in prose that 'Gemini's "
+        "implicit caching is automatic and unaddressable', and that sentence is "
+        "not evidence: it was written to "
+        "explain why a breakpoint has nowhere to go, not from a read of anything. "
+        "What google-genai 1.73.1 actually shows is the *explicit* mechanism -- "
+        "GenerateContentConfig.cached_content names a cached-content resource the "
+        "caller created beforehand, and "
+        "GenerateContentResponseUsageMetadata.cached_content_token_count is "
+        "Optional and documents itself as 'the number of tokens in the cached "
+        "content that was used', which is the read side of *that* resource. A "
+        "non-zero count there is consistent with a cache somebody asked for. "
+        "Moving this cell needs two live calls with an identical prefix and no "
+        "cached_content, showing the second one read tokens back; until then a "
+        "promptCache request on this runtime is refused rather than reported as "
+        "already met"
+    ),
+    (Runtime.OPENAI_API, Capability.CACHE_AUTOMATIC): (
+        "**supported, read off the installed SDK on 2026-09-21** -- see the block "
+        "beside _OPENAI_API_SUPPORTED for the two typed fields it rests on. In "
+        "short: openai 2.32.0 makes "
+        "ResponseUsage.input_tokens_details.cached_tokens a required int on every "
+        "response, and types prompt_cache_retention as "
+        "Optional[Literal['in-memory', '24h']] with a docstring that offers to "
+        "*extend* a cache the request never asked to create. That retention field "
+        "is also the one cache lifetime modelpass carries to any runtime from the "
+        "connection's promptCache key (modelpass.prompt_cache.PROMPT_CACHE_TTLS); "
+        "what stays absent, and what CACHE_BREAKPOINTS has said 'unsupported' to "
+        "since ticket 1.9 recorded it on 2026-09-13, is any say in where the "
+        "prefix ends"
+    ),
     (Runtime.ANTHROPIC_API, Capability.CHAT): (
         f"**supported**. {_API_DRIVEN}"
         "test_a_plain_call_streams_text_then_usage_then_a_terminal drives one "

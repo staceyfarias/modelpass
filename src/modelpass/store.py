@@ -191,6 +191,7 @@ _CONNECTION_KEYS = frozenset(
         "retry",
         "timeoutSeconds",
         "maxInputTokens",
+        "promptCache",
     }
 )
 _IDENTITY_KEYS = frozenset({"email", "organizationId"})
@@ -443,6 +444,11 @@ def connection_to_dict(connection: Connection) -> dict[str, Any]:
     # number here is always somebody's statement, never this build's guess.
     if connection.max_input_tokens is not None:
         data["maxInputTokens"] = connection.max_input_tokens
+    # Same rule, same reason: an absent key is "nothing stated", and nothing
+    # stated is not the same as caching off. modelpass writes no promptCache it
+    # was not given, so a key in the file is always somebody's request.
+    if connection.prompt_cache is not None:
+        data["promptCache"] = connection.prompt_cache
 
     # Guards are written only when the user configured something. There are no
     # default thresholds (D4 amendment, 2026-08-17), so a connection with no
@@ -499,6 +505,7 @@ def connection_from_dict(name: str, data: Mapping[str, Any]) -> Connection:
         retry=_retry_from_dict(name, data.get("retry", "default")),
         timeout_seconds=data.get("timeoutSeconds"),
         max_input_tokens=data.get("maxInputTokens"),
+        prompt_cache=data.get("promptCache"),
     )
 
 

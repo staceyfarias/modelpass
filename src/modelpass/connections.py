@@ -27,6 +27,7 @@ from .errors import (
     InvalidGuards,
     RuntimeGated,
 )
+from .prompt_cache import plan_prompt_cache
 from .runtimes import API_RUNTIMES, EXPERIMENTAL_RUNTIMES, VENDOR_OF, Runtime, parse_runtime
 from .types import AuthMode, parse_auth_mode
 
@@ -723,6 +724,37 @@ class Connection:
     #: order, like every field above it, so no older field's positional shape
     #: moves.
     max_input_tokens: int | None = None
+    #: Whether this connection asks for prompt caching, and at what lifetime
+    #: (config key ``promptCache``, 2026-09-21). ``None`` -- the key absent --
+    #: means **nothing is stated**, which is what every connection written
+    #: before this key existed means and what nearly all of them will keep
+    #: meaning. Nothing about such a connection's behaviour moves.
+    #:
+    #: ``"default"`` asks for caching at whatever lifetime the vendor uses.
+    #: Anything else names a lifetime, **in the vendor's own spelling**, and is
+    #: checked against what the connection's runtime accepts
+    #: (:data:`~modelpass.prompt_cache.PROMPT_CACHE_TTLS`). There is no house
+    #: vocabulary because the two runtimes that take a lifetime do not share
+    #: one -- ``'5m'``/``'1h'`` against ``'in-memory'``/``'24h'`` -- and a
+    #: translation between them is an equivalence no vendor published.
+    #:
+    #: **The request is a stated intent and its outcome is reported, not
+    #: assumed.** Three things can happen, and
+    #: :func:`~modelpass.prompt_cache.plan_prompt_cache` is where they are told
+    #: apart: the runtime takes an instruction and the caller's breakpoints
+    #: reach it (``explicit``); the runtime caches unasked and cannot be stopped,
+    #: so the request was *already met* and that is **not** an error
+    #: (``automatic``); or neither is established, and the key is refused here
+    #: rather than being a setting that silently does nothing.
+    #:
+    #: **Refused at construction**, like ``authMode`` against its runtime and
+    #: like :class:`~modelpass.types.CacheControl`'s own ``ttl``, and for the
+    #: reason that type's docstring gives: everything needed to decide is on the
+    #: connection, so learning about it from a 400 later is strictly worse.
+    #:
+    #: An additive key under the store's 0.1 compatibility policy. Last in the
+    #: field order, so no older field's positional shape moves.
+    prompt_cache: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -823,6 +855,15 @@ class Connection:
                     "window is unknown -- modelpass has no default for it and will "
                     "not guess one"
                 )
+
+        if self.prompt_cache is not None:
+            # Resolved as well as validated: plan_prompt_cache raises for a
+            # runtime that cannot meet the ask and for a lifetime it does not
+            # take, so a Connection that exists carries a promptCache somebody
+            # can act on.
+            plan_prompt_cache(
+                self.prompt_cache, self.runtime, name=str(self.name)
+            )
 
         allowed = runtime_auth_modes(self.runtime)
         if self.auth_mode not in allowed:

@@ -131,6 +131,18 @@
           nothing here can tell you whether a payload fits.</span>
         {% endif %}
       </dd>
+      <dt>prompt cache</dt>
+      <dd>
+        {% if c.prompt_cache %}
+          requested: <code>{{ c.prompt_cache }}</code>
+          <span class="muted small">&mdash; {{ c.prompt_cache_note }}</span>
+        {% else %}
+          <span class="muted">nothing stated &mdash; no <code>promptCache</code> is
+          set. That is not &ldquo;caching off&rdquo;: most runtimes here cache
+          prompts whether or not anyone asks, and this connection has simply not
+          said anything about it.</span>
+        {% endif %}
+      </dd>
       <dt>retry</dt>
       <dd>
         {% if c.retry == 'never' %}

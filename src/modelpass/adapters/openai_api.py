@@ -120,6 +120,7 @@ from ..preflight import (
     api_preflight,
     resolve_credential,
 )
+from ..prompt_cache import plan_prompt_cache
 from ..retry import vendor_error_facts
 from ..runtimes import Runtime
 from ..sampling_rules import plan_sampling
@@ -555,6 +556,39 @@ def terminal_status(response: Any, *, unanswered_call: bool) -> tuple[TerminalSt
     return TerminalStatus.OK, str(status)
 
 
+def prompt_cache_retention(request: RunRequest) -> str | None:
+    """The connection's stated cache lifetime, in this runtime's spelling (2026-09-21).
+
+    The one place in modelpass where a connection's ``promptCache`` reaches a
+    wire, and it reaches this one because ``openai`` 2.32.0 has a field for it:
+    ``ResponseCreateParamsBase.prompt_cache_retention``, typed
+    ``Optional[Literal["in-memory", "24h"]]`` and read on 2026-09-21. The
+    connection's value is validated against exactly those two strings when the
+    connection is built, so anything arriving here is a value the SDK types.
+
+    ``None`` -- nothing sent, the endpoint's own retention stands -- for a
+    connection that stated nothing *and* for one that asked for
+    ``promptCache = "default"``. Those are different statements and this
+    function deliberately collapses them, because the wire has no way to say
+    "cache at whatever you normally do" other than by not saying anything. The
+    distinction survives where it is readable: on the receipt.
+
+    Note what this does **not** do. It sets no ``prompt_cache_key``: grouping
+    requests so they land on the same cache is a caching *strategy*, it depends
+    on what a caller considers one workload, and inventing a key from a
+    connection name would be modelpass deciding that for everybody.
+    """
+    stated = request.connection.prompt_cache
+    if stated is None:
+        return None
+    try:
+        return plan_prompt_cache(
+            stated, request.connection.runtime, name=request.connection.name
+        ).ttl
+    except SubpassError:  # pragma: no cover - defensive: refused at build
+        return None
+
+
 def _bare_terminal(
     status: TerminalStatus,
     reason: str | None,
@@ -917,6 +951,9 @@ class OpenAIAPIAdapter(Adapter):
         text = text_param(request)
         if text is not None:
             params["text"] = text
+        retention = prompt_cache_retention(request)
+        if retention is not None:
+            params["prompt_cache_retention"] = retention
         return params
 
     def run(self, request: RunRequest) -> Iterator[AgentEvent]:

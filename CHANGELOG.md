@@ -7,6 +7,46 @@ work landed.
 
 ### Added
 
+- **A connection can ask for prompt caching, and is told which of three things
+  that bought** (2026-09-21). The optional config key `promptCache` states an
+  intent — `"default"` for the vendor's own cache lifetime, or a lifetime that
+  runtime accepts — read back as `Connection.prompt_cache` (`str | None`). It is
+  the standing half of prompt caching; the per-call half, `CacheControl` on a
+  `TextBlock`, is unchanged and is still how a caller says *where* the cacheable
+  prefix ends.
+
+  **The three outcomes are kept apart, because conflating them is the whole
+  hazard.** Where the runtime takes an instruction the request is honoured and
+  the caller's breakpoints reach the vendor (`anthropic-api`). Where the runtime
+  caches unasked and cannot be stopped — most of them — the request was
+  **already satisfied**, which is reported and is *not* an error. Where neither
+  is established, the key is refused with the existing `InvalidConnection` when
+  the connection is built, rather than being a setting that silently does
+  nothing; the refusal says modelpass has not established that the runtime
+  caches, never that the vendor does no caching. A caller reads the first two
+  apart on the new `Receipt.prompt_cache_requested` /
+  `Receipt.prompt_cache_disposition`, plus one sentence in `Receipt.notes`.
+
+  **Omitting the key states nothing, and nothing about such a connection moves** —
+  which is every connection written before today. In particular it does not mean
+  caching off: most of these runtimes cache whether or not anyone asks.
+
+  **No modelpass TTL vocabulary**, because the vendors do not share one:
+  `anthropic` 0.97.0 types a lifetime `Literal['5m','1h']` and `openai` 2.32.0
+  types one `Literal['in-memory','24h']`. The accepted values are per runtime,
+  each read off the SDK installed here on 2026-09-21, and a test re-reads both
+  literals so an SDK upgrade fails rather than drifts. One thing reaches a wire:
+  on `openai-api` a named lifetime is sent as `prompt_cache_retention`.
+  Elsewhere the key is a declaration, in the way `retry = "never"` is.
+
+  New capability cell `cache_automatic` — *does this runtime cache prompts
+  without being asked* — `supported` on `anthropic-sdk`, `openai-sdk` and
+  `openai-api`, each with the dated evidence named in its note, and `unverified`
+  on the other five. `promptCache` is therefore refused on `google-api`,
+  `openai-compatible` and the two Google experimental runtimes. `modelpass list
+  --verbose` and the bench's accounts page report the request. An additive
+  config key: the file stays at version 1.
+
 - **A connection can state its input window, and modelpass will never guess one**
   (2026-09-21). The optional config key `maxInputTokens` records the model's usable
   input window in tokens, read back as `Connection.max_input_tokens` (`int | None`).

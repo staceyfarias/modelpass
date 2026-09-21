@@ -44,6 +44,7 @@ from ..errors import PreflightFailed, SubpassError
 from ..manage import ConnectionPlan, Credential
 from ..models import ModelChoice, models_for
 from ..preflight import SCRUB_RULES, Receipt, env_names_to_scrub
+from ..prompt_cache import plan_prompt_cache
 from ..retry import classify_terminal
 from ..runlog import run_log_for
 from ..runtimes import Runtime
@@ -156,6 +157,23 @@ def hello_world_tool() -> ToolDef:
 # --- view models ------------------------------------------------------------------
 
 
+def _prompt_cache_note(connection: Connection) -> str | None:
+    """The prompt-caching sentence for the accounts page, or ``None``.
+
+    Never raises: a stored ``promptCache`` has already been through
+    ``Connection.__post_init__``, but the page's job is to show a connection
+    rather than to be the second place that refuses one.
+    """
+    if connection.prompt_cache is None:
+        return None
+    try:
+        return plan_prompt_cache(
+            connection.prompt_cache, connection.runtime, name=connection.name
+        ).note
+    except SubpassError as exc:  # pragma: no cover - defensive
+        return str(exc)
+
+
 def _connection_view(bridge: Bridge, connection: Connection) -> dict[str, Any]:
     """Everything the connections page shows about one connection.
 
@@ -253,6 +271,12 @@ def _connection_view(bridge: Bridge, connection: Connection) -> dict[str, Any]:
         # `None` reaches the template as the unknown it is; the template says so
         # in words rather than leaving the row blank.
         "max_input_tokens": connection.max_input_tokens,
+        # The stated request, verbatim, plus the sentence that says what this
+        # runtime does about it. The note is computed here rather than in the
+        # template because it is the same answer the CLI and the receipt give,
+        # and three renderings of one fact is how they drift apart.
+        "prompt_cache": connection.prompt_cache,
+        "prompt_cache_note": _prompt_cache_note(connection),
         "is_compatible": connection.runtime is Runtime.OPENAI_COMPATIBLE,
         "verified": {
             "supported": list(connection.verified_capabilities.supported),
@@ -617,15 +641,17 @@ def create_app(
             connection = plan.connection
             if previous is not None:
                 # Carried rather than re-derived: `retry`, `timeoutSeconds`,
-                # `maxInputTokens` and the verified cells are connection state
-                # this form does not edit, and an edit that dropped them would
-                # silently un-bound a call, throw away a drive's evidence, or
-                # turn a stated input window back into an unknown one.
+                # `maxInputTokens`, `promptCache` and the verified cells are
+                # connection state this form does not edit, and an edit that
+                # dropped them would silently un-bound a call, throw away a
+                # drive's evidence, turn a stated input window back into an
+                # unknown one, or withdraw a caching request nobody withdrew.
                 connection = replace(
                     connection,
                     retry=previous.retry,
                     timeout_seconds=previous.timeout_seconds,
                     max_input_tokens=previous.max_input_tokens,
+                    prompt_cache=previous.prompt_cache,
                     verified_capabilities=previous.verified_capabilities,
                 )
                 if (

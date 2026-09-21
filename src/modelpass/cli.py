@@ -51,6 +51,7 @@ from .connections import Connection, CredentialKind, Guards
 from .errors import ConfigError, SubpassError
 from .manage import Credential, binding_from_receipt, receipt_for
 from .preflight import Receipt
+from .prompt_cache import plan_prompt_cache
 from .runtimes import VENDOR_OF, Runtime
 from .store import ConnectionStore
 from .types import AuthMode, Message, Role
@@ -1039,6 +1040,21 @@ def _list(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:
                 else f"{connection.max_input_tokens:,} input tokens (as configured)"
             )
             print(f"      window    {window}", file=out)
+            # Only when the connection stated something. Unlike the window
+            # above, silence here is not a hazard: a connection that asked for
+            # nothing is not at risk of misreading an answer it never got.
+            if connection.prompt_cache is not None:
+                plan = plan_prompt_cache(
+                    connection.prompt_cache,
+                    connection.runtime,
+                    name=connection.name,
+                )
+                lifetime = plan.ttl or "the vendor's own lifetime"
+                print(
+                    f"      cache     prompt caching requested at {lifetime} "
+                    f"-- {plan.disposition.value} on {connection.runtime.value}",
+                    file=out,
+                )
             if connection.retry == "never":
                 print(
                     '      retry     never -- every retryable verdict here reads "no"',

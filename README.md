@@ -671,6 +671,10 @@ maxInputTokens = 200000              # optional; the model's usable input window
                                      # is unknown -- there is no table of model sizes
                                      # here and nothing guesses one. Nothing in
                                      # modelpass reads it; it is for the tools that do.
+promptCache   = "default"            # optional; ask for prompt caching. "default" =
+                                     # the vendor's own lifetime, or name one the
+                                     # runtime accepts. Omit it and nothing is stated
+                                     # -- which is NOT "caching off" (see below).
 
   # Spend guards. NO DEFAULTS -- see "Guards" below. A connection with no
   # [guards] table genuinely has nothing bounding one run's spend, and the file
@@ -1424,6 +1428,47 @@ stored, and anything that is not a positive whole number is refused with it.
 Read it as `is None`, never as falsy.
 
 `modelpass list --verbose` prints it, and prints `unknown` when nothing is set.
+
+### A connection can ask for prompt caching, and be told what that bought
+
+```toml
+[connections.production-judge]
+promptCache = "default"   # or a lifetime this runtime accepts, e.g. "1h"
+```
+
+Read back as `connection.prompt_cache`. It is the **standing** half of prompt
+caching. The per-call half already exists and is unchanged: `CacheControl` on a
+`TextBlock` is how you say *where* the cacheable prefix ends, which only a
+caller holding one payload can say.
+
+**Asking has three possible answers, and they are not the same answer.**
+
+* **Honoured explicitly** — the runtime takes an instruction, so your
+  `cache_control` breakpoints reach the vendor. `anthropic-api` today.
+* **Already satisfied** — the runtime caches without being asked and gives you
+  no way to stop it, which is true of most of them. This is **not an error**.
+  Nothing is sent for it and nothing needs to be.
+* **Refused** — modelpass has not established that this runtime caches prompts,
+  so there is nothing to honour and nothing already happening. You get an
+  `InvalidConnection` when the connection is built, rather than a setting that
+  quietly does nothing.
+
+You tell the first two apart on the receipt:
+`receipt.prompt_cache_disposition` reads `"explicit"` or `"automatic"`, with one
+explaining sentence in `receipt.notes`. `modelpass list --verbose` prints the
+same thing.
+
+**Omitting the key states nothing, and that is not "caching off."** Most of
+these runtimes cache whether or not anyone asks; a connection with no
+`promptCache` has simply not said anything about it.
+
+**The lifetime is the vendor's word, not modelpass's.** `"default"` means the
+vendor's own, and is distinguishable from every explicit value. An explicit one
+is checked against what that runtime accepts, read off the SDK installed here —
+`anthropic` types `'5m'`/`'1h'`, `openai` types `'in-memory'`/`'24h'`. There is
+no house vocabulary and no translation between them, because nobody published
+one. A lifetime a runtime does not take is refused when the connection is built,
+not by a 400 halfway through a run.
 
 ### What is safe to share between threads
 
