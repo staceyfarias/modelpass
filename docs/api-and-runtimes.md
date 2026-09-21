@@ -766,7 +766,8 @@ promptCache   = "default"   # optional; "default" = the vendor's own lifetime
 Read back as `Connection.prompt_cache`, a `str | None`.
 
 **This is the standing half of prompt caching. The per-call half already
-exists** and is not replaced: `CacheControl` on a `TextBlock` (§1.5) is how a
+exists** and is not replaced: `CacheControl` on a `TextBlock` (the ticket 1.5 content-block vocabulary) is
+how a
 caller says *where* the cacheable prefix ends, which is inherently per call
 because it is a statement about one payload's shape. `promptCache` is the other
 question — *do I want caching on this connection at all, and for how long* —
@@ -843,9 +844,9 @@ whatever you normally do" other than by not saying anything.
 Everywhere else `promptCache` is a **declaration**, in the same way `retry =
 "never"` is a stance rather than a retry loop. In particular, on `anthropic-api`
 modelpass does not write the connection's lifetime onto the caller's
-breakpoints: §1.5 promises that modelpass never invents a breakpoint and never
-moves one, and filling in a `ttl` the caller left off would be editing their
-content. Place it on the `CacheControl` where it belongs; what the connection
+breakpoints: `TextBlock`'s own contract is that modelpass never invents a
+breakpoint and never moves one, and filling in a `ttl` the caller left off would
+be editing their content. Place it on the `CacheControl` where it belongs; what the connection
 buys you is that an impossible lifetime is refused before a run rather than
 after a 400.
 
