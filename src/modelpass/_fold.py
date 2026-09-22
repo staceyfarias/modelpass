@@ -52,6 +52,7 @@ from .errors import (
 )
 from .guards import GuardTracker
 from .preflight import Receipt
+from .prompt_cache import observed_effort_continuity
 from .reasoning import reasoning_metric
 from .retry import classify_terminal, vendor_error_facts
 from .types import (
@@ -107,6 +108,11 @@ class EventFold:
         #: never intercepted -- because the event it comes from is a passthrough
         #: the caller is entitled to see whole.
         self.reasoning_echo: str | None = None
+        #: Whether this run changed effort partway through. Set by an adapter's
+        #: ``reasoning_effort_changed`` vendor event; nothing emits one yet, so
+        #: this is the seam a mid-session mechanism plugs into rather than a
+        #: live signal.
+        self.effort_changed = False
 
     # --- what the pump asks -----------------------------------------------------
 
@@ -172,6 +178,11 @@ class EventFold:
             # Observed on the way past, never intercepted: the event still
             # reaches the caller exactly as before (D20).
             self.allowance = event.data
+
+        if isinstance(event, VendorEvent) and event.name == "reasoning_effort_changed":
+            # Observed, never intercepted -- the third member of the family the
+            # allowance and the echo already belong to.
+            self.effort_changed = True
 
         if isinstance(event, VendorEvent) and event.name == "reasoning_echo":
             # Same treatment, same reason. ``openai-sdk`` is the only runtime
@@ -269,6 +280,14 @@ class EventFold:
             reasoning_metric=reasoning_metric(
                 connection.runtime, usage.reasoning_output_tokens
             ).value,
+            # Telemetry, not capability. Silent unless this run both changed
+            # effort and reported cache counts; a run that changed nothing gets
+            # None rather than a False it did not earn.
+            effort_change_cache_preserved=observed_effort_continuity(
+                effort_changed=self.effort_changed,
+                cached_input_tokens=usage.cached_input_tokens,
+                prompt_tokens=usage.prompt_tokens,
+            ),
         )
 
     def timed_out(self) -> TerminalEvent:

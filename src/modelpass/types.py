@@ -859,6 +859,18 @@ class TokenUsage:
         )
 
     @property
+    def prompt_tokens(self) -> int:
+        """Everything that went *in*: fresh input, cache reads and cache writes.
+
+        The denominator for any "what fraction of my prompt was cached" question
+        (2026-09-22), and a property rather than a sum each caller writes for
+        itself because writing it out is where the nesting mistakes happen --
+        modelpass counts these three side by side, and one vendor's wire nests
+        two of them. Getting it wrong reports a cache break as a hit.
+        """
+        return self.input_tokens + self.cached_input_tokens + self.cache_write_tokens
+
+    @property
     def billable_input_tokens(self) -> int:
         """Input the run paid full or premium rate for: fresh plus cache writes.
 
@@ -1253,6 +1265,20 @@ class TerminalEvent(_Event):
     #: read ``usage.reasoning_output_tokens``, so a consumer never has to infer
     #: *why* a count is missing from the fact that it is.
     reasoning_metric: str | None = None
+    #: Whether *this turn* reused the cached prefix across an effort change
+    #: (2026-09-22). ``None`` unless the run actually changed effort mid-session
+    #: **and** reported cache counts -- which is a strictly narrower thing than
+    #: the receipt's ``effort_cache_continuity``, and the narrowness is the
+    #: point. The receipt says what the vendor allows; this says what happened.
+    #: A capability of ``supported`` never implies a ``True`` here, and this
+    #: field is never derived from it.
+    #:
+    #: ``None`` on every run today, because no adapter changes effort
+    #: mid-session yet: the seam is a ``reasoning_effort_changed`` vendor event,
+    #: which :class:`~modelpass._fold.RunFold` observes and nothing emits. That
+    #: is a gap stated rather than hidden -- the alternative was a field that
+    #: quietly reported ``False`` for every run that never changed anything.
+    effort_change_cache_preserved: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

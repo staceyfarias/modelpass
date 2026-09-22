@@ -1132,6 +1132,29 @@ class Receipt:
     reasoning_requested: str | None = None
     reasoning_applied: str | None = None
     reasoning_value: str | None = None
+    #: Whether *changing* the effort mid-conversation could keep the cached
+    #: prefix on this model, and by what mechanism (2026-09-22). Three separate
+    #: facts, kept separate on purpose -- see
+    #: :class:`~modelpass.prompt_cache.EffortCacheContinuity`:
+    #:
+    #: * ``effort_cache_continuity`` -- ``supported`` / ``experimental`` /
+    #:   ``unsupported`` / ``unknown``. What the **vendor** establishes. Not a
+    #:   claim that this run cached anything, and not a claim that the runtime
+    #:   accepts an effort setting at all; that is ``reasoning_value`` above.
+    #: * ``effort_cache_mechanism`` -- which protocol move carries it.
+    #: * ``effort_cache_reachable`` -- whether **modelpass** can perform that
+    #:   move today. ``False`` beside a ``supported`` capability is a real
+    #:   state, and the field exists so a consumer cannot read the vendor's
+    #:   guarantee as modelpass's. Anthropic ships per-message effort and
+    #:   ``anthropic`` 0.97.0 cannot express it; reporting only the first half
+    #:   would repeat, inverted, the stale-string failure of 2026-09-22.
+    #:
+    #: Silent -- all three ``None`` -- when the connection states no effort at
+    #: all, on the same rule as the three fields above: a line about a dial
+    #: nobody touched is noise on every receipt.
+    effort_cache_continuity: str | None = None
+    effort_cache_mechanism: str | None = None
+    effort_cache_reachable: bool | None = None
     #: What this run asked the model to do about word choice, and what will
     #: actually be sent (R5, ticket 1.7). Two dicts rather than one flag,
     #: because the interesting case is exactly where they disagree and a
@@ -1365,6 +1388,9 @@ class Receipt:
             "reasoning_requested": self.reasoning_requested,
             "reasoning_applied": self.reasoning_applied,
             "reasoning_value": self.reasoning_value,
+            "effort_cache_continuity": self.effort_cache_continuity,
+            "effort_cache_mechanism": self.effort_cache_mechanism,
+            "effort_cache_reachable": self.effort_cache_reachable,
             "sampling_requested": dict(self.sampling_requested),
             "sampling_applied": dict(self.sampling_applied),
             "sampling_notes": list(self.sampling_notes),

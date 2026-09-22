@@ -178,6 +178,19 @@ class RunRecord:
     reasoning_echo: str | None = None
     reasoning_output_tokens: int | None = None
     reasoning_metric: str | None = None
+    #: The **declared** capability, off the receipt: could an effort change have
+    #: kept the cache on this model, by what mechanism, and can modelpass drive
+    #: it. Three fields because they are three claims with three sources.
+    effort_cache_continuity: str | None = None
+    effort_cache_mechanism: str | None = None
+    effort_cache_reachable: bool | None = None
+    #: The **observed** answer for this one run, off the terminal: did the
+    #: prefix actually survive. ``None`` where no effort change happened or no
+    #: cache counts arrived. Stored beside the capability rather than merged
+    #: into it so that a stored history can be asked the question that matters
+    #: -- *where the vendor promised continuity, did we get it?* -- which needs
+    #: both columns and is unanswerable from either one.
+    effort_change_cache_preserved: bool | None = None
     #: ``RateLimitInfo.status`` -- ``allowed``, ``allowed_warning``, ``rejected``.
     allowance_status: str | None = None
     #: ``rate_limit_type`` -- which window the figures below describe.
@@ -204,6 +217,9 @@ class RunRecord:
         sampling_requested: Mapping[str, Any] | None = None,
         sampling_applied: Mapping[str, Any] | None = None,
         sampling_notes: tuple[str, ...] = (),
+        effort_cache_continuity: str | None = None,
+        effort_cache_mechanism: str | None = None,
+        effort_cache_reachable: bool | None = None,
         when: datetime | None = None,
     ) -> RunRecord:
         """Build a record from the stamped terminal event.
@@ -245,6 +261,10 @@ class RunRecord:
             reasoning_echo=terminal.reasoning_echo,
             reasoning_output_tokens=usage.reasoning_output_tokens,
             reasoning_metric=terminal.reasoning_metric,
+            effort_cache_continuity=effort_cache_continuity,
+            effort_cache_mechanism=effort_cache_mechanism,
+            effort_cache_reachable=effort_cache_reachable,
+            effort_change_cache_preserved=terminal.effort_change_cache_preserved,
             **allowance_fields(allowance),
         )
 
@@ -273,6 +293,10 @@ class RunRecord:
             "reasoning_echo": self.reasoning_echo,
             "reasoning_output_tokens": self.reasoning_output_tokens,
             "reasoning_metric": self.reasoning_metric,
+            "effort_cache_continuity": self.effort_cache_continuity,
+            "effort_cache_mechanism": self.effort_cache_mechanism,
+            "effort_cache_reachable": self.effort_cache_reachable,
+            "effort_change_cache_preserved": self.effort_change_cache_preserved,
             "allowance_status": self.allowance_status,
             "allowance_window": self.allowance_window,
             "allowance_utilization": self.allowance_utilization,
@@ -539,9 +563,21 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     # ``reasoning_metric`` is left as ``None`` rather than guessed at from the
     # runtime, because the word describes a *run* and an old line was never
     # measured.
-    for field_name in ("reasoning_value", "reasoning_echo", "reasoning_metric"):
+    for field_name in (
+        "reasoning_value",
+        "reasoning_echo",
+        "reasoning_metric",
+        "effort_cache_continuity",
+        "effort_cache_mechanism",
+    ):
         value = out.get(field_name)
         out[field_name] = value if isinstance(value, str) and value else None
+    # Toward None, never toward False: "nobody measured" and "the cache broke"
+    # are the two answers this pair exists to keep apart, and a bool() cast
+    # would collapse them on every line written before the field existed.
+    for field_name in ("effort_cache_reachable", "effort_change_cache_preserved"):
+        value = out.get(field_name)
+        out[field_name] = value if isinstance(value, bool) else None
     reasoning_tokens = out.get("reasoning_output_tokens")
     if isinstance(reasoning_tokens, bool) or not isinstance(reasoning_tokens, int):
         out["reasoning_output_tokens"] = None

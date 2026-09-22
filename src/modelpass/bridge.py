@@ -109,7 +109,11 @@ from .errors import (
     VendorRunFailed,
 )
 from .preflight import PreflightPlan, Receipt, plan_launch
-from .prompt_cache import plan_prompt_cache
+from .prompt_cache import (
+    EffortCacheContinuity,
+    effort_cache_continuity,
+    plan_prompt_cache,
+)
 from .reasoning import stated_reasoning
 from .runlog import RunLog, RunRecord, run_log_for
 from .runtimes import API_RUNTIMES, Runtime
@@ -1143,12 +1147,36 @@ class Bridge:
         plan = stated_reasoning(request.connection)
         if plan is None:
             return receipt
+        # The *other* question about the same dial, and deliberately not folded
+        # into the note above: "this run will think at X" and "changing X later
+        # would/would not keep the cache" are different claims with different
+        # evidence, and a consumer acting on the second one is designing a
+        # session rather than a call.
+        continuity = effort_cache_continuity(
+            request.connection.runtime, request.model or request.connection.model
+        )
+        notes = [plan.note]
+        if continuity.claimed or continuity.capability is EffortCacheContinuity.UNSUPPORTED:
+            reach = "reachable from modelpass" if continuity.reachable else (
+                "not reachable from modelpass today"
+            )
+            notes.append(
+                f"changing effort mid-conversation reads "
+                f"{continuity.capability.value!r} on this model"
+                + (f" via {continuity.mechanism.value}" if continuity.mechanism else "")
+                + f" -- {reach}. {continuity.detail}"
+            )
         return replace(
             receipt,
-            notes=(*receipt.notes, plan.note),
+            notes=(*receipt.notes, *notes),
             reasoning_requested=plan.requested.value,
             reasoning_applied=plan.applied.value,
             reasoning_value=plan.runtime_value,
+            effort_cache_continuity=continuity.capability.value,
+            effort_cache_mechanism=(
+                continuity.mechanism.value if continuity.mechanism else None
+            ),
+            effort_cache_reachable=continuity.reachable,
         )
 
     @staticmethod
@@ -3132,11 +3160,37 @@ class Bridge:
         (R5), and is what lets a stored run be asked whether the temperature its
         config names is the temperature it actually ran at.
         """
+        # Recomputed rather than threaded down from the receipt, and safe to
+        # recompute for a reason that does not hold for auth mode: this is a
+        # pure function of (runtime, model) over a static table of vendor
+        # documentation. No adapter contributes to it, so there is nothing here
+        # for one to forge and no way for the ledger and the receipt to
+        # disagree. Gated on a stated effort, like the receipt's own line: a
+        # continuity column on a run that never touched the dial is noise in
+        # every query that reads this file.
+        continuity = (
+            effort_cache_continuity(
+                request.connection.runtime, request.model or request.connection.model
+            )
+            if stated_reasoning(request.connection) is not None
+            else None
+        )
         try:
             self.run_log.append(
                 RunRecord.from_terminal(
                     terminal,
                     model=request.model,
+                    effort_cache_continuity=(
+                        continuity.capability.value if continuity else None
+                    ),
+                    effort_cache_mechanism=(
+                        continuity.mechanism.value
+                        if continuity and continuity.mechanism
+                        else None
+                    ),
+                    effort_cache_reachable=(
+                        continuity.reachable if continuity else None
+                    ),
                     guards_configured=guards.configured,
                     allowance=allowance,
                     binary=binary,

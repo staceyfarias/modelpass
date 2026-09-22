@@ -2405,6 +2405,59 @@ that will not reconcile. The related gap found at the same time: the exec mapper
 had never read `cache_write_input_tokens` although the wire carries it; it does
 now.
 
+### 3.8 Changing reasoning effort mid-conversation, and what it does to the cache
+
+Three questions, three answers, and modelpass keeps them apart because merging
+any two of them produces a claim nobody can back:
+
+| question | where it is answered | when it is knowable |
+| --- | --- | --- |
+| does this runtime take an effort setting? | `reasoning_effort` capability cell, `RUNTIME_EFFORTS` | before the run |
+| could *changing* it mid-conversation keep the cached prefix? | `prompt_cache.effort_cache_continuity(runtime, model)` | before the run |
+| did *this turn* actually reuse the prefix? | `terminal.effort_change_cache_preserved` | only afterwards |
+
+This is the same *can* / *did* split `CacheEligibility` already draws, for the
+same reason: no honest answer to "did it hit" exists before the bytes are sent.
+
+**The capability is model-specific, not runtime-specific.** One vendor, one API,
+three different answers — `claude-opus-5` is `supported`, `claude-sonnet-4-6` is
+`unsupported`, `claude-haiku-4-5` is `unknown`. A runtime-level cell would be
+wrong for most pairs it covered.
+
+| runtime + model | verdict | mechanism | evidence (read 2026-09-22) |
+| --- | --- | --- | --- |
+| `anthropic-api` + Fable 5.1, Mythos 5.1, Opus 5 | `supported` | `anthropic_per_message_effort` | *"On Claude Fable 5.1, Claude Mythos 5.1, and Claude Opus 5, use a per-message effort change, which keeps the prompt cache"* — a `role: "system"` message with empty `content` carrying `output_config.effort`, beta header `mid-conversation-output-config-2026-07-01` |
+| `anthropic-api` + the other effort-capable models | `unsupported` | — | *"Changing the `output_config.effort` value always invalidates message blocks"*, and models without per-message effort return 400 `output_config.effort requires a model that supports per-turn effort` (Claude Fable 5 named) |
+| `openai-api` + `gpt-6-astra` | `supported` | `openai_configuration_update` | a `{"type": "configuration_update", "reasoning": {"effort": …}}` input item with the request-level `reasoning.effort` left unchanged — *"this preserves the original prompt prefix for prompt caching"*. Astra only, single-agent mode, no adjacent updates, not with automatic compaction |
+| `openai-sdk` + `gpt-6-astra` | `experimental` | `codex_configuration_update` | `openai-codex` 0.154.0 types `ConfigurationUpdateResponseItem`; no vendor statement about the cache; `model/list` carries no `supports_reasoning_effort_updates` |
+| `anthropic-sdk` | `unknown` | — | no mid-session change exists to characterize: effort is set on `ClaudeAgentOptions` at session start and `ClaudeSDKClient` has no `set_effort` |
+| everything else | `unknown` | — | nothing established |
+
+**A pair absent from the table is `unknown`, and an `unsupported` needs a
+citation exactly as much as a `supported` does.** An unreleased
+`claude-opus-5-1` gets `unknown`, not the guarantee its name would inherit under
+a family matcher and not a negative written about today's models.
+
+**The vendor's capability and modelpass's reach are separate fields.**
+`effort_cache_reachable` is `False` on every row above, including the
+`supported` ones: `anthropic` 0.97.0 types message roles as `user|assistant`
+with no per-message `output_config`, and `openai` 2.32.0's input union has no
+`configuration_update` member. The vendors ship these mechanisms; modelpass
+cannot send them yet. Reporting only the vendor's half would be the
+2026-09-22 stale-string failure inverted — a consumer designing a long cached
+session around an effort change that never happens.
+
+**Nothing in modelpass changes effort mid-session today**, on any runtime, so
+`effort_change_cache_preserved` is `None` on every run. Two specific gaps, both
+named in `tests/live/test_codex_effort_continuity_live.py`: `ChatSession.send`
+takes no effort override, and `_session_turn_start_params` does not send
+`effort` at all. Codex's `TurnStartParams.effort` — *"Override the reasoning
+effort for this turn and subsequent turns"* — is the vendor-typed lever that
+would close both, and using it is preferable to synthesizing a
+`configuration_update` item the installed `codex.exe` 0.151.0 shows no sign of
+understanding (zero occurrences of the string, against four for
+`supportedReasoningEfforts`).
+
 ---
 
 ## 4. Post-MVP candidate: evaluate the rest of each vendor SDK's surface

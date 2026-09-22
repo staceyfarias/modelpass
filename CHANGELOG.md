@@ -7,6 +7,37 @@ work landed.
 
 ### Added
 
+- **Effort-change cache continuity is its own capability, kept apart from
+  "effort is supported" and from "this turn hit cache"** (2026-09-22).
+  `prompt_cache.effort_cache_continuity(runtime, model)` answers whether
+  *changing* effort mid-conversation can preserve the cached prefix, as
+  `supported` / `experimental` / `unsupported` / `unknown` with the mechanism
+  named — `anthropic_per_message_effort`, `openai_configuration_update` or
+  `codex_configuration_update`. Model-specific, because one vendor and one API
+  give three different answers.
+
+  Seeded from primary vendor documentation only: Anthropic documents
+  per-message effort as cache-preserving on Claude Fable 5.1, Claude Mythos 5.1
+  and Claude Opus 5, and documents the negative for its other effort-capable
+  models; OpenAI documents `configuration_update` for `gpt-6-astra` alone.
+  Codex is `experimental` — `openai-codex` 0.154.0 types the item, nothing
+  states its cache behaviour, and `model/list` exposes no
+  `supports_reasoning_effort_updates`. A pair nobody established is `unknown`,
+  and an unreleased point release inherits nothing.
+
+  `Receipt.effort_cache_reachable` is the field that keeps this honest: every
+  `supported` cell currently reads `False` for it, because the installed SDKs
+  cannot express either mechanism. The vendor's guarantee and modelpass's
+  ability to use it are two claims, and collapsing them would repeat, inverted,
+  the stale-string failure this project fixed the same week.
+
+  Observed telemetry stays separate: `TerminalEvent.effort_change_cache_preserved`
+  and the matching run-log column are `None` unless a run both changed effort
+  and reported cache counts. That is `None` everywhere today — nothing in
+  modelpass changes effort mid-session yet — which is stated rather than papered
+  over with a `False`. `tests/live/test_codex_effort_continuity_live.py` holds
+  the characterization harness and names the two gaps that block it.
+
 - **Reasoning tokens are a bucket of their own, and the effort dial is reported
   end to end** (2026-09-22). `TokenUsage.reasoning_output_tokens` carries what a
   run spent thinking on the five runtimes that report it — a **subset** of
