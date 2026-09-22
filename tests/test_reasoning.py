@@ -213,7 +213,15 @@ def test_the_standing_default_reaches_the_existing_per_model_routing():
 
     merged = _with_standing_reasoning(_api(reasoning="xhigh"), None)
     plan = plan_sampling(merged, Runtime.OPENAI_API, "gpt-5")
-    assert plan.applied["reasoning_effort"] == "xhigh"
+    # **Amended 2026-09-22: this asserted 'xhigh' passed through, and the vendor
+    # says otherwise.** A live probe -- free, because a rejected request is not
+    # billed -- established that `gpt-5` takes 'minimal', 'low', 'medium' and
+    # 'high' and refuses 'xhigh'. So the routing now moves the standing level to
+    # this model's ceiling and says so, which is the behaviour this test was
+    # written to check; only the expected value was wrong, because the table it
+    # trusted claimed six rungs for every gpt-5* model.
+    assert plan.applied["reasoning_effort"] == "high"
+    assert any("xhigh" in note and "high" in note for note in plan.notes)
 
 
 def test_there_is_one_vocabulary_not_two():
@@ -872,3 +880,144 @@ def test_a_session_thread_start_echo_reaches_the_stream():
     assert event.data["sent"] == "high"
     assert event.data["echoed"] == "low"
     assert "low" in event.data["note"]
+
+
+# --- 6. what the vendors said when asked directly --------------------------------
+
+
+def test_the_openai_api_echoes_the_level_it_was_sent():
+    """Driven 2026-09-22: `Response.reasoning.effort` is populated, not just typed.
+
+    `openai` 2.32.0 declares the field; a declaration is not a value. A live call
+    to `gpt-5.4-mini` with `reasoning={'effort': 'low'}` answered
+    `Reasoning(effort='low', ..., context='current_turn', mode='standard')`, and
+    `'high'` answered `'high'` -- it tracks the request rather than repeating a
+    constant, which is what makes an echo worth reading.
+    """
+    from modelpass.adapters.openai_api import (
+        reasoning_echo_events,
+        response_reasoning_echo,
+    )
+
+    class _Reasoning:
+        effort = "low"
+
+    class _Response:
+        reasoning = _Reasoning()
+
+    class _Sampling:
+        reasoning_effort = "high"
+
+    class _Request:
+        sampling = _Sampling()
+
+    assert response_reasoning_echo(_Response()) == "low"
+    (event,) = reasoning_echo_events(_Request(), _Response(), Runtime.OPENAI_API)
+    assert event.name == "reasoning_echo"
+    assert event.data == {
+        "sent": "high",
+        "echoed": "low",
+        "note": event.data["note"],
+    }
+    assert "low" in event.data["note"]
+
+
+def test_an_agreeing_echo_says_nothing_and_a_missing_one_is_not_an_error():
+    from modelpass.adapters.openai_api import reasoning_echo_events
+
+    class _Response:
+        reasoning = type("R", (), {"effort": "high"})()
+
+    class _Request:
+        sampling = type("S", (), {"reasoning_effort": "high"})()
+
+    (agreed,) = reasoning_echo_events(_Request(), _Response(), Runtime.OPENAI_API)
+    assert "note" not in agreed.data
+    # A model with no reasoning surface answers without the field.
+    assert reasoning_echo_events(_Request(), object(), Runtime.OPENAI_API) == []
+
+
+def test_two_runtimes_now_echo_and_anthropic_still_does_not():
+    """The shape of the evidence, as of 2026-09-22.
+
+    `openai-api` and `openai-sdk` both answer with the level they are running at;
+    Anthropic answers with nothing on either of its runtimes, which was driven
+    rather than inferred. That asymmetry is why the receipt exists.
+    """
+    from modelpass.adapters.openai import thread_reasoning_effort
+    from modelpass.adapters.openai_api import response_reasoning_echo
+
+    assert thread_reasoning_effort({"thread": {"reasoningEffort": "high"}}) == "high"
+    echoing = type("R", (), {"reasoning": type("X", (), {"effort": "high"})()})()
+    assert response_reasoning_echo(echoing) == "high"
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("gpt-5.4", ("none", "low", "medium", "high", "xhigh")),
+        ("gpt-5.4-mini", ("none", "low", "medium", "high", "xhigh")),
+        ("gpt-5.4-nano", ("none", "low", "medium", "high", "xhigh")),
+        ("gpt-5.2", ("none", "low", "medium", "high", "xhigh")),
+        ("gpt-5.1", ("none", "low", "medium", "high")),
+        ("gpt-5", ("minimal", "low", "medium", "high")),
+        ("gpt-5-nano", ("minimal", "low", "medium", "high")),
+        ("gpt-5-pro", ("high",)),
+    ],
+)
+def test_the_per_model_ladders_are_the_ones_the_vendor_accepts(model, expected):
+    """Probed live on 2026-09-22, free, because a rejected request is not billed.
+
+    The table previously claimed all six rungs for every one of these with
+    `model_known=True` -- wrong in both directions. A caller setting 'minimal' on
+    `gpt-5.4-mini` got a vendor 400 modelpass had said would not happen, and
+    'none' on `gpt-5` the same.
+    """
+    from modelpass.sampling_rules import model_efforts
+
+    assert model_efforts(Runtime.OPENAI_API, model) == expected
+
+
+def test_the_gpt5_ladder_is_the_inverse_of_its_successors():
+    """Why one family row could not have served both.
+
+    `gpt-5` has 'minimal' and lacks 'none' and 'xhigh'; `gpt-5.4` has 'none' and
+    'xhigh' and lacks 'minimal'. A single set covering both would be wrong for
+    whichever model it was not written for.
+    """
+    from modelpass.sampling_rules import model_efforts
+
+    five = set(model_efforts(Runtime.OPENAI_API, "gpt-5"))
+    later = set(model_efforts(Runtime.OPENAI_API, "gpt-5.4"))
+    assert "minimal" in five and "minimal" not in later
+    assert {"none", "xhigh"} <= later and not {"none", "xhigh"} & five
+
+
+def test_a_rung_the_model_lacks_is_moved_here_rather_than_refused_by_the_vendor():
+    """The point of recording ladders at all: the 400 never happens.
+
+    It is reported, not silent -- and the direction of the move is worth a look.
+    'minimal' sits between 'none' and 'low', and the tie breaks *downward*, so a
+    caller asking for minimal thinking on gpt-5.4-mini gets 'none', which
+    disables reasoning rather than reducing it.
+    """
+    from modelpass.sampling_rules import plan_sampling
+    from modelpass.types import Sampling
+
+    plan = plan_sampling(
+        Sampling(reasoning_effort="minimal"), Runtime.OPENAI_API, "gpt-5.4-mini"
+    )
+    assert plan.applied["reasoning_effort"] == "none"
+    assert any("moved down to 'none'" in note for note in plan.notes)
+
+
+def test_max_is_rejected_by_every_openai_model_probed():
+    """Beside modelpass's own refusal of the word, the vendor refuses it too.
+
+    Worth recording where the `max` question is decided: on `openai-api` there is
+    nothing to allow. The case for `max` is Anthropic's alone.
+    """
+    from modelpass.sampling_rules import model_efforts
+
+    for model in ("gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-pro"):
+        assert "max" not in model_efforts(Runtime.OPENAI_API, model)

@@ -7,6 +7,39 @@ work landed.
 
 ### Added
 
+- **`openai-api` echoes the effort it ran at, and modelpass now reads it**
+  (2026-09-22). `Response.reasoning.effort` is populated — established by a live
+  call, because `openai` 2.32.0 declaring the field established only that it
+  exists. `low` came back `low` and `high` came back `high`, so it tracks the
+  request rather than repeating a constant. Emitted as the same
+  `reasoning_echo` vendor event `openai-sdk` uses, so the fold and the terminal
+  need no second path. Two runtimes now answer for themselves; Anthropic still
+  answers with nothing on either of its.
+
+  The same drive found that `gpt-5.4-mini`'s default effort is `none`, not
+  `high`: send nothing and it echoes `none` with zero reasoning tokens.
+
+### Fixed
+
+- **The per-model effort ladders on `openai-api` were wrong, and confidently so**
+  (2026-09-22). The table claimed all six rungs for every `gpt-5*` family with
+  `model_known=True`. The vendor disagrees, per model: `gpt-5.4` and `gpt-5.2`
+  take `none`…`xhigh` and refuse `minimal`; `gpt-5.1` stops at `high`; `gpt-5`
+  and `gpt-5-nano` take `minimal` and refuse `none` and `xhigh` — the exact
+  inverse of their successors. So a caller setting `minimal` on `gpt-5.4-mini`
+  got a vendor 400 that modelpass had said would not happen.
+
+  Probed live and free: a rung the enum allows but the model does not is a 400,
+  and a rejected request is not billed. Note the two validation layers — a
+  nonsense value is checked against the union of all rungs any model has, so
+  only a valid-enum-but-unsupported value reveals the per-model set. No OpenAI
+  model probed accepts `max`, which is worth knowing beside modelpass's own
+  refusal of that word.
+
+  One existing test asserted `xhigh` passed through on `gpt-5` and has been
+  amended in place: the behaviour it checked was right, the expected value came
+  from the table that was wrong.
+
 - **`reasoning_effort_per_turn`, a capability cell of its own** (2026-09-22).
   "This runtime takes an effort setting" and "it can be changed once a
   conversation is under way" are different questions, and most runtimes answer

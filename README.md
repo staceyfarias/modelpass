@@ -1348,6 +1348,21 @@ Each runtime takes the rungs it has: `anthropic-sdk` and `anthropic-api` start a
 `low`, Gemini stops at `high`, and a rung a runtime lacks is moved to its nearest and
 **reported as moved** — never silently rounded.
 
+**Rungs also differ per model, and not in a pattern you can guess.** Probed against the
+Responses API on 2026-09-22:
+
+| model | rungs |
+| --- | --- |
+| `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.2` | `none`, `low`, `medium`, `high`, `xhigh` |
+| `gpt-5.1` | `none`, `low`, `medium`, `high` |
+| `gpt-5`, `gpt-5-nano` | `minimal`, `low`, `medium`, `high` |
+| `gpt-5-pro` | `high` only |
+
+`gpt-5` has `minimal` and lacks `none` and `xhigh`; `gpt-5.4` is the exact inverse. So a
+level that works on one model is refused by the next, and modelpass moves it here with a
+note rather than letting the vendor answer with a 400 after a round trip. No OpenAI model
+probed accepts `max`.
+
 `ultra` and `max` are refused. `ultra` is not a depth at all on the runtimes that have
 it: it also turns on agentic execution that can spin off subagents, which is a different
 cost shape and tool surface, and nobody asking to think harder should get that as a side
@@ -1362,11 +1377,21 @@ a note saying which key does work.
 
 ### Did it actually do anything?
 
-Only one runtime answers back. `openai-sdk` echoes the thread's own `reasoningEffort`
-from `thread/start`, so modelpass compares what it sent against what the server says it
-is running and reports a disagreement. **Anthropic echoes nothing** — driven, not
-assumed: across six `claude -p --output-format stream-json --effort <level>` runs the
-string `effort` appears in the whole transcript once, as a slash-command name.
+**Two runtimes answer back, and Anthropic is not one of them.** `openai-sdk` echoes the
+thread's own `reasoningEffort` from `thread/start`; `openai-api` echoes
+`reasoning.effort` on the finished `Response` — both driven on 2026-09-22, and the second
+one matters because a declared field is not a populated one. Sending `low` came back
+`low`, sending `high` came back `high`, so it tracks the request rather than repeating a
+constant. modelpass compares the two and reports a disagreement.
+
+**Anthropic echoes nothing** — also driven, not assumed: across six
+`claude -p --output-format stream-json --effort <level>` runs the string `effort` appears
+in the whole transcript once, as a slash-command name.
+
+One thing the same drive turned up: on `gpt-5.4-mini` the default effort is `none`, not
+`high`. Send nothing and it echoes `none` and spends zero reasoning tokens. Anthropic's
+default is `high`. Do not carry an assumption about one vendor's default across to the
+other.
 
 So the evidence that a level took effect is the token count:
 

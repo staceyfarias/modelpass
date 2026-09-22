@@ -448,6 +448,68 @@ def final_response(event: Any) -> Any | None:
     return None
 
 
+def _echo_note(sent: str | None, echoed: str | None) -> str | None:
+    """The disagreement sentence, borrowed from the Codex adapter.
+
+    Imported rather than reimplemented: the wording is what a caller reads on a
+    receipt, and two runtimes describing the same disagreement differently would
+    be the same fact in two voices. Imported lazily because that module is a
+    sibling adapter and importing one adapter from another at module scope is
+    how an optional extra becomes a hard dependency.
+    """
+    from .openai import reasoning_echo_note
+
+    return reasoning_echo_note(sent, echoed)
+
+
+def response_reasoning_echo(response: Any) -> str | None:
+    """The effort the server says it ran at, off the finished ``Response``.
+
+    **Driven 2026-09-22, and the drive is the reason this exists.** ``openai``
+    2.32.0 types ``Response.reasoning`` as ``Optional[Reasoning]``, which
+    established only that a field was declared -- a typed-but-never-populated
+    field would have made this function a lie. A live call against
+    ``gpt-5.4-mini`` settled it: ``reasoning={'effort': 'low'}`` came back as
+    ``Reasoning(effort='low', ..., context='current_turn', mode='standard')`` in
+    the raw payload, and ``'high'`` came back ``'high'`` -- so the field tracks
+    the request rather than repeating a constant, which is the property that
+    makes an echo worth reading at all.
+
+    The same drive answered a question nobody had asked: with **no** effort
+    sent, ``gpt-5.4-mini`` echoes ``'none'`` and spends zero reasoning tokens.
+    This runtime's default is not ``high``, unlike Anthropic's.
+
+    So ``openai-api`` joins ``openai-sdk`` as a runtime whose claim about itself
+    can be checked. Anthropic remains the one where the receipt is the only
+    record: its ``Message`` carries no effort field, driven the same day.
+    """
+    reasoning = getattr(response, "reasoning", None)
+    effort = getattr(reasoning, "effort", None) if reasoning is not None else None
+    return effort if isinstance(effort, str) and effort else None
+
+
+def reasoning_echo_events(
+    request: Any, response: Any, runtime: Runtime
+) -> list[AgentEvent]:
+    """The echo as a vendor event, in the shape ``openai-sdk`` already emits.
+
+    One shape for both runtimes so the fold and the terminal need no second
+    path: ``sent`` beside ``echoed``, and a ``note`` only when they disagree.
+    Silent when the server echoed nothing, which is not an error -- a model with
+    no reasoning surface answers without the field.
+    """
+    echoed = response_reasoning_echo(response)
+    if echoed is None:
+        return []
+    sampling = getattr(request, "sampling", None)
+    sent = getattr(sampling, "reasoning_effort", None) if sampling else None
+    data: dict[str, Any] = {"sent": sent, "echoed": echoed}
+    note = _echo_note(sent, echoed)
+    if note is not None:
+        data["note"] = note
+    return [VendorEvent(runtime=runtime, name="reasoning_echo", data=data)]
+
+
 def stream_events(
     event: Any, runtime: Runtime = Runtime.OPENAI_API
 ) -> list[AgentEvent]:
@@ -1039,6 +1101,7 @@ class OpenAIAPIAdapter(Adapter):
                 )
                 return
 
+            yield from reasoning_echo_events(request, response, self.runtime)
             yield UsageEvent(
                 usage=token_usage(getattr(response, "usage", None)),
                 scope=UsageScope.DELTA,
@@ -1156,6 +1219,10 @@ class OpenAIAPIAdapter(Adapter):
                 )
                 return
 
+            for _echo_event in reasoning_echo_events(
+                request, response, self.runtime
+            ):
+                yield _echo_event
             yield UsageEvent(
                 usage=token_usage(getattr(response, "usage", None)),
                 scope=UsageScope.DELTA,

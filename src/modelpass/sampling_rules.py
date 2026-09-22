@@ -377,6 +377,12 @@ _TABLE: dict[Runtime, tuple[SamplingRules, tuple[tuple[str, dict[str, Any]], ...
             # GPT-5 accepts temperature and only the default value of it. A
             # downstream agent host sets temperature=1.0 unconditionally and
             # warns that top_p and top_k are ignored.
+            #
+            # Its ladder is the *inverse* of its successors' (probed 2026-09-22):
+            # 'minimal' yes, 'none' and 'xhigh' no, where gpt-5.4 and gpt-5.2
+            # have 'none' and 'xhigh' and not 'minimal'. Two rows rather than one
+            # because no single set covers both, and a family token that covered
+            # both would be wrong for whichever model it was not written for.
             (
                 "gpt-5",
                 {
@@ -385,6 +391,62 @@ _TABLE: dict[Runtime, tuple[SamplingRules, tuple[tuple[str, dict[str, Any]], ...
                     ),
                     "forced": {"temperature": 1.0},
                     "reasoning_parameter": "reasoning.effort",
+                    "efforts": frozenset({"minimal", "low", "medium", "high"}),
+                },
+            ),
+            # **The per-model ladders, probed live on 2026-09-22, and the probe
+            # cost nothing.** A rung the enum allows but the model does not is a
+            # 400, and a rejected request is not billed -- so sending each
+            # disputed rung to each model is a free, authoritative read of what
+            # that model actually has. Before this the table claimed all six
+            # rungs for every gpt-5* family with ``model_known=True``, which is
+            # confidently wrong in both directions: a caller setting 'minimal'
+            # on gpt-5.4-mini got a vendor 400 that modelpass had said would not
+            # happen, and 'none' on gpt-5 the same.
+            #
+            # The exact vendor sentence for the first case: *"Unsupported value:
+            # 'minimal' is not supported with the 'gpt-5.4-mini' model.
+            # Supported values are: 'none', 'low', 'medium', 'high', and
+            # 'xhigh'."*
+            #
+            # Note the two validation layers, because a probe that stops at the
+            # first one reads the wrong answer: a nonsense value is rejected
+            # against the *union* of all rungs any model has (which does include
+            # 'minimal' and 'max'), and only a valid-enum-but-unsupported value
+            # reveals the per-model set. ``max`` is rejected by every model
+            # probed, which is worth knowing beside modelpass's own refusal of
+            # that word.
+            #
+            # An unprobed model still gets the runtime ladder and
+            # ``model_known`` from its family, which is the floor these
+            # refinements narrow -- not a claim about a model nobody asked.
+            *(
+                (
+                    token,
+                    {
+                        "accepted": frozenset(
+                            {"temperature", "max_output_tokens", "reasoning_effort"}
+                        ),
+                        "forced": {"temperature": 1.0},
+                        "reasoning_parameter": "reasoning.effort",
+                        # No 'minimal', no 'max' (probed 2026-09-22).
+                        "efforts": frozenset(
+                            {"none", "low", "medium", "high", "xhigh"}
+                        ),
+                    },
+                )
+                for token in ("gpt-5.4", "gpt-5.2")
+            ),
+            # gpt-5.1 stops at 'high': no 'minimal', no 'xhigh', no 'max'.
+            (
+                "gpt-5.1",
+                {
+                    "accepted": frozenset(
+                        {"temperature", "max_output_tokens", "reasoning_effort"}
+                    ),
+                    "forced": {"temperature": 1.0},
+                    "reasoning_parameter": "reasoning.effort",
+                    "efforts": frozenset({"none", "low", "medium", "high"}),
                 },
             ),
             # gpt-5-pro "defaults to (and only supports) high reasoning effort"
