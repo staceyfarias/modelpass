@@ -297,3 +297,60 @@ def test_a_model_family_resolves_to_its_own_rules_not_a_shorter_prefix():
         tokens = tuple(token for token, _ in refinements)
         for token in tokens:
             assert _matches(token, tokens) == token, token
+
+
+# --- 8. each runtime carries it exactly once ------------------------------------
+
+
+def _sub(runtime):
+    from modelpass.connections import Connection, CredentialRef
+    from modelpass.types import AuthMode
+
+    return Connection(
+        name="c",
+        runtime=runtime,
+        auth_mode=AuthMode.SUBSCRIPTION,
+        credential_ref=CredentialRef.native_login(),
+        reasoning="high",
+    )
+
+
+@pytest.mark.parametrize("runtime", [Runtime.ANTHROPIC_SDK, Runtime.OPENAI_SDK])
+def test_an_agent_runtime_is_not_told_through_sampling(runtime):
+    """It would be reported dropped while the adapter applied it anyway.
+
+    Both agent runtimes report ``sampling_controls`` unsupported and drop every
+    field, so merging the standing default into Sampling there put a
+    "reasoning_effort not supported, dropped" note on a receipt for a run where
+    ``ClaudeAgentOptions.effort`` / ``TurnStartParams.effort`` carried it. That
+    is worse than silence: it tells the caller the opposite of what happened.
+    """
+    from modelpass.bridge import _with_standing_reasoning
+    from modelpass.reasoning import stated_reasoning
+
+    assert _with_standing_reasoning(_sub(runtime), None) is None
+    # ...and the adapter reads it directly instead, so it is not lost.
+    assert stated_reasoning(_sub(runtime)).runtime_value == "high"
+
+
+def test_an_api_runtime_is_told_through_sampling():
+    from modelpass.bridge import _with_standing_reasoning
+
+    merged = _with_standing_reasoning(_api(reasoning="high"), None)
+    assert merged is not None and merged.reasoning_effort == "high"
+
+
+def test_no_runtime_is_told_twice():
+    """Exactly one carrier per runtime: sampling or the adapter, never both."""
+    from modelpass.bridge import _with_standing_reasoning
+    from modelpass.sampling_rules import rules_for
+
+    for runtime in (Runtime.ANTHROPIC_SDK, Runtime.OPENAI_SDK, Runtime.OPENAI_API):
+        conn = (
+            _api(runtime=runtime, reasoning="high")
+            if runtime is Runtime.OPENAI_API
+            else _sub(runtime)
+        )
+        via_sampling = _with_standing_reasoning(conn, None) is not None
+        carried = "reasoning_effort" in rules_for(runtime, conn.model or "").accepted
+        assert via_sampling is carried, runtime

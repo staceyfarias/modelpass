@@ -367,6 +367,7 @@ from ..preflight import (
     Receipt,
     check_launch_args,
 )
+from ..reasoning import stated_reasoning
 from ..runtimes import Runtime
 from ..schema import build_structured_event, openai_strict_issues
 from ..types import (
@@ -1002,6 +1003,16 @@ def _turn_start_params(
     }
     if request.schema is not None:
         params["outputSchema"] = dict(request.schema)
+    # The connection's standing effort. ``effort`` is a TurnStartParams field
+    # on this transport -- the same dated read that found ``outputSchema``
+    # (codex.exe 0.151.0, 2026-08-31) lists it beside ``model`` and ``cwd``.
+    # Carried here rather than through sampling_rules because this runtime's
+    # sampling_controls cell reads unsupported: the sampling pipeline drops
+    # everything, so a standing default routed through it would reach no wire
+    # and be reported as dropped while being applied.
+    effort = stated_reasoning(request.connection)
+    if effort is not None:
+        params["effort"] = effort.runtime_value
     return params
 
 

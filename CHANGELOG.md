@@ -56,6 +56,16 @@ work landed.
   previously valid value still is. It is the single vocabulary; `EFFORT_LADDER`
   derives from it.
 
+  **Each runtime is told exactly once.** The three API runtimes take it through
+  the sampling pipeline; both agent runtimes are wired directly
+  (`ClaudeAgentOptions.effort`, and `effort` on Codex's `TurnStartParams`)
+  because their `sampling_controls` cell reads `unsupported` and that pipeline
+  drops every field. Merging the standing default into `Sampling` there put a
+  "reasoning_effort not supported, dropped" note on a receipt for a run where
+  the adapter had applied it — worse than silence, because it told the caller
+  the opposite of what happened. A test now holds the invariant: a runtime is
+  carried by sampling if and only if its rules accept the field.
+
   **Which rungs a *model* has, behind an interface** (`sampling_rules.
   model_efforts`). A static lookup today: a per-model `efforts` set where one
   has been recorded, otherwise the runtime's ladder. The point of the function

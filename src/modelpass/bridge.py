@@ -112,7 +112,7 @@ from .preflight import PreflightPlan, Receipt, plan_launch
 from .prompt_cache import plan_prompt_cache
 from .runlog import RunLog, RunRecord, run_log_for
 from .runtimes import API_RUNTIMES, Runtime
-from .sampling_rules import plan_sampling
+from .sampling_rules import plan_sampling, rules_for
 from .schema import normalize_schema, resolve_schema_name
 from .secrets import SecretStore
 from .sessions import ChatSession, Session, WorkerSession, scratch_project_folder
@@ -446,6 +446,15 @@ def _with_standing_reasoning(
     if stated is None:
         return sampling
     if sampling is not None and sampling.reasoning_effort is not None:
+        return sampling
+    if "reasoning_effort" not in rules_for(connection.runtime, connection.model).accepted:
+        # This runtime's sampling pipeline does not carry the dial -- both agent
+        # runtimes report sampling_controls unsupported and drop everything.
+        # Merging here anyway would put a "reasoning_effort not supported,
+        # dropped" note on a receipt for a run where the adapter *did* apply it
+        # (ClaudeAgentOptions.effort, TurnStartParams.effort), which is worse
+        # than silence: it tells the caller the opposite of what happened.
+        # Those adapters read the connection directly instead.
         return sampling
     base = sampling or Sampling()
     return replace(base, reasoning_effort=stated)
