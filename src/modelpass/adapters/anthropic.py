@@ -1666,8 +1666,25 @@ class AnthropicSessionHandle:
 
     # --- turns -------------------------------------------------------------------
 
-    def send(self, message: str) -> Iterator[AgentEvent]:
+    def send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
         """Run one turn against the live client and stream normalized events."""
+        if effort is not None:
+            # Not a gap this adapter can close. claude-agent-sdk 0.2.148 takes
+            # effort on ClaudeAgentOptions, which is read when the session is
+            # created, and ClaudeSDKClient exposes set_model and
+            # set_permission_mode and no set_effort (read 2026-09-22). There is
+            # no per-turn lever to put this on, so it is refused rather than
+            # accepted and dropped.
+            raise CapabilityNotSupported(
+                Runtime.ANTHROPIC_SDK.value,
+                "per-turn reasoning effort",
+                "claude-agent-sdk sets effort on ClaudeAgentOptions when the "
+                "session is created and offers no way to change it afterwards "
+                "(0.2.148: set_model and set_permission_mode exist, set_effort "
+                "does not). State the level on the connection instead, or open "
+                "a new session to run at a different one",
+            )
+
         if self._closed:
             raise VendorRunFailed(
                 "this session's client has been closed; open a new session, or "

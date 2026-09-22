@@ -500,8 +500,19 @@ class SessionHandle(Protocol):
         """
         ...
 
-    def send(self, message: str) -> Iterator[AgentEvent]:
+    def send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
         """Run one turn and stream normalized events.
+
+        ``effort`` is this turn's reasoning level **already in the runtime's own
+        spelling** -- the session layer resolves the house rung before it gets
+        here, so an adapter never translates one (2026-09-22). ``None`` means
+        the session's standing level, which is the connection's.
+
+        A handle whose runtime has no per-turn effort control raises
+        :class:`~modelpass.errors.CapabilityNotSupported` rather than ignoring
+        the argument. Silently dropping it would hand a caller a turn they
+        believe ran at a different level, and the whole reason this argument
+        exists is to measure what a level change does.
 
         The same event vocabulary and the same failure rules as
         :meth:`Adapter.run` -- rules 2 through 6 above apply unchanged, and a

@@ -2447,16 +2447,37 @@ cannot send them yet. Reporting only the vendor's half would be the
 2026-09-22 stale-string failure inverted — a consumer designing a long cached
 session around an effort change that never happens.
 
-**Nothing in modelpass changes effort mid-session today**, on any runtime, so
-`effort_change_cache_preserved` is `None` on every run. Two specific gaps, both
-named in `tests/live/test_codex_effort_continuity_live.py`: `ChatSession.send`
-takes no effort override, and `_session_turn_start_params` does not send
-`effort` at all. Codex's `TurnStartParams.effort` — *"Override the reasoning
-effort for this turn and subsequent turns"* — is the vendor-typed lever that
-would close both, and using it is preferable to synthesizing a
-`configuration_update` item the installed `codex.exe` 0.151.0 shows no sign of
-understanding (zero occurrences of the string, against four for
-`supportedReasoningEfforts`).
+**Changing effort mid-session: `session.send(message, reasoning="high")`.**
+Available on `openai-sdk` over the app-server transport, which is the only
+runtime where a vendor types a per-turn effort field —
+`TurnStartParams.effort`, *"Override the reasoning effort for this turn and
+subsequent turns"*. modelpass uses that field rather than synthesizing a
+`configuration_update` item, because the installed `codex.exe` 0.151.0 contains
+that string zero times (against four for `supportedReasoningEfforts`) and would
+not understand one.
+
+It is **refused, not ignored**, everywhere else: `anthropic-sdk` reads effort off
+`ClaudeAgentOptions` when the session opens and has no `set_effort`, and the
+`exec` transport runs one process per turn with no `TurnStartParams` to carry an
+override. A turn a caller believes ran at a new level and did not is the failure
+this refusal exists to prevent.
+
+Two things follow, and they are deliberately not the same thing:
+
+* The turn that *changes* the level emits a `reasoning_effort_changed` vendor
+  event. The fold observes it the way it observes the allowance, and the
+  terminal reports `effort_change_cache_preserved` from that turn's own token
+  counts. Passing the level already in force is not a change: no event, no
+  measurement, because nothing was asked to survive anything.
+* **`send(reasoning=…)` existing is not a promise that the cache survives.** The
+  capability cell above still reads `experimental` on Codex, and the receipt
+  carries it on the same run that performs the change. Capability says what may
+  happen; telemetry says what did.
+
+A related gap closed with it: `_session_turn_start_params` never sent `effort`
+at all, so a session ran at the server's default while its receipts reported the
+level the connection stated. The stateless path had carried it since the day
+effort was wired; the session path never had.
 
 ---
 

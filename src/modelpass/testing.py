@@ -585,6 +585,9 @@ class FakeSessionHandle:
     def __init__(self, adapter: FakeSessionAdapter, request: SessionRequest) -> None:
         self.adapter = adapter
         self.request = request
+        #: What each turn was told about effort, in order; ``None`` where a turn
+        #: stated nothing. Parallel to :attr:`messages`.
+        self.efforts: list[str | None] = []
         self.messages: list[str] = []
         self.closes = 0
         self._id: str | None = request.resume_id
@@ -594,7 +597,17 @@ class FakeSessionHandle:
     def id(self) -> str | None:
         return self._id
 
-    def send(self, message: str) -> Iterator[AgentEvent]:
+    def send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
+        """One scripted turn. ``efforts`` records what each turn was told.
+
+        The recorded list is the point, the same way ``messages`` is: a test for
+        a mid-session effort change has to be able to ask *what went on the
+        wire*, and on the one runtime that has this the answer is a field on
+        ``TurnStartParams`` that no fake can otherwise show. ``None`` is
+        recorded for a turn that stated nothing, because "this turn said
+        nothing" and "this turn said the standing level" are different turns.
+        """
+        self.efforts.append(effort)
         self.messages.append(message)
         self._history.append(Message(role=Role.USER, content=message))
         yield from self.adapter.script

@@ -108,41 +108,106 @@ def _render(rows: list[tuple[str, dict[str, int | None]]]) -> str:
     return "\n".join(lines)
 
 
-def test_the_seam_this_characterization_needs_does_not_exist_yet():
-    """**Run this first. It is the finding, not a placeholder.**
+def test_effort_change_within_one_thread(capsys):
+    """medium -> medium -> high -> low, on one persistent thread.
 
-    The sequence the ticket describes -- build a 30k-50k prefix at ``medium``,
-    baseline it, then change to ``high`` on the same thread -- cannot be
-    expressed against modelpass today, and the reason is two specific gaps
-    rather than a missing convenience:
+    **Turn 2 is the baseline and it is not optional.** Without it a large cached
+    read on turn 3 proves nothing, because it could be the prefix that any
+    second turn would have hit. What the transition has to beat is *that*
+    number, not zero.
 
-    1. ``ChatSession.send`` takes ``message`` and ``timeout`` and nothing else.
-       Effort comes from the connection, which is frozen for the session's life,
-       so there is no turn at which a different level could be stated.
-    2. ``_session_turn_start_params`` does not send ``effort`` at all. The
-       stateless path does; the session path never did. So even a session whose
-       connection changed underneath it would transmit nothing.
+    The assertion is deliberately coarse -- a majority of the prompt still read
+    from cache -- because the conversation grows every turn and no vendor
+    promises token equality across a change. **The printed table is the
+    finding**; the assertion is only its crudest reading.
 
-    Codex's own ``TurnStartParams.effort`` is documented as *"Override the
-    reasoning effort for this turn and subsequent turns"* -- a per-turn field,
-    which is exactly the lever this needs and is a vendor-typed one rather than
-    a synthesized protocol message. Wiring it is a small change to a method
-    whose docstring is a deliberate caching contract (``send`` excludes
-    ``tools=`` and ``system_prompt=`` precisely because they move the prefix),
-    so it is a decision rather than a fix.
+    What a result means:
 
-    Until then this file establishes the *baseline* below, which is the half of
-    the experiment that does not need the seam and is worth having ready.
+    * preserved -- ``openai-sdk`` + this model stays ``EXPERIMENTAL``, now with a
+      dated observation beside it. Only a vendor statement makes it
+      ``SUPPORTED``.
+    * broken -- direct evidence for ``UNSUPPORTED``. Record it in
+      ``modelpass.prompt_cache`` with today's date rather than rerunning until
+      it passes. One clean negative settles more than three ambiguous positives.
     """
-    import inspect
+    connection, model = _skip_unless_opted_in()
 
-    from modelpass.sessions import ChatSession
-
-    assert "reasoning" not in inspect.signature(ChatSession.send).parameters, (
-        "ChatSession.send now takes a reasoning override -- the seam exists, so "
-        "delete this test and enable the transition half of "
-        "test_effort_change_within_one_thread"
+    declared = effort_cache_continuity(Runtime.OPENAI_SDK, model)
+    print(
+        f"declared capability: {declared.capability.value} "
+        f"({declared.mechanism.value if declared.mechanism else 'no mechanism'}), "
+        f"reachable={declared.reachable}"
     )
+    print(declared.detail)
+
+    bridge = Bridge()
+    rows: list[tuple[str, dict[str, int | None]]] = []
+    preserved: bool | None = None
+    session = bridge.new_chat(connection=connection, model=model)
+    try:
+        rows.append(
+            (
+                "1 build prefix",
+                _counts(
+                    session.send(_prefix() + "Reply with the single word: ready.")
+                ),
+            )
+        )
+        rows.append(
+            ("2 baseline", _counts(session.send("Reply with the single word: still.")))
+        )
+        baseline = rows[-1][1]
+
+        # The transition. `reasoning=` is refused on a runtime with no per-turn
+        # lever, so reaching this line at all is part of the result.
+        third, preserved = _turn_with_change(
+            session, "Reply with the single word: changed.", "high"
+        )
+        rows.append(("3 medium->high", third))
+
+        fourth, preserved_down = _turn_with_change(
+            session, "Reply with the single word: again.", "low"
+        )
+        rows.append(("4 high->low", fourth))
+    finally:
+        session.close()
+
+    print(_render(rows))
+    print(f"effort_change_cache_preserved: medium->high {preserved}, "
+          f"high->low {preserved_down}")
+
+    if preserved is None:
+        pytest.skip(
+            "the server reported no cache counts on the transition turn, so "
+            "nothing was measured and nothing is concluded"
+        )
+    assert baseline["cached_input"], (
+        "this thread cached nothing on turn 2, so turn 3 proves nothing about "
+        "the effort change. Check the prefix is byte-identical across turns and "
+        "clears the runtime's minimum cacheable prefix before concluding "
+        "anything about effort"
+    )
+    assert preserved, (
+        "the cached prefix did not survive the effort change: "
+        f"{rows[2][1]['cached_input']} cached of {rows[2][1]['prompt']} prompt "
+        f"tokens, against a baseline of {baseline['cached_input']}. That is "
+        "direct evidence for EffortCacheContinuity.UNSUPPORTED on this model "
+        "and build -- record it rather than treating this as a flaky test"
+    )
+
+
+def _turn_with_change(session, message: str, level: str):
+    """One turn that states a new level, and what modelpass measured about it.
+
+    The verdict comes off the terminal rather than being recomputed here: that
+    is the number a consumer's run log will carry, so a harness that derived its
+    own could agree with the library today and drift from it tomorrow.
+    """
+    from modelpass.types import TerminalEvent
+
+    events = list(session.send(message, reasoning=level))
+    terminal = next(e for e in events if isinstance(e, TerminalEvent))
+    return _counts(events), terminal.effort_change_cache_preserved
 
 
 def test_baseline_cache_behaviour_of_a_persistent_thread(capsys):

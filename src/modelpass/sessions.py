@@ -75,6 +75,7 @@ import tempfile
 import textwrap
 import threading
 from collections.abc import AsyncIterator, Iterator, Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from ._deadline import Deadline
@@ -89,6 +90,7 @@ from .adapters.base import (
 from .capabilities import Capability, CapabilityRegistry, Support
 from .connections import Guards, QuotaAction
 from .errors import (
+    CapabilityNotSupported,
     GuardStop,
     SessionBusy,
     SessionClosed,
@@ -97,6 +99,7 @@ from .errors import (
 )
 from .guards import GuardTracker
 from .preflight import Receipt
+from .reasoning import Effort, ReasoningPlan, plan_reasoning, stated_reasoning
 from .runlog import RunRecord
 from .runtimes import Runtime
 from .tools import ToolDef
@@ -108,6 +111,7 @@ from .types import (
     TerminalStatus,
     Timeout,
     TokenUsage,
+    VendorEvent,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -235,6 +239,14 @@ class Session:
         self._closed = False
         self._stopped: str | None = None
         self._turns = 0
+        #: The effort level this session is currently running at, in the
+        #: runtime's own spelling, or ``None`` where none was ever stated. Starts
+        #: as the connection's standing level, because that is what the first
+        #: turn will send, and moves when a turn overrides it.
+        _standing = stated_reasoning(request.connection)
+        self._effort_in_force: str | None = (
+            _standing.runtime_value if _standing else None
+        )
 
         # Opening the handle is local work by contract (adapter rule 7): no
         # subprocess, no request, no spend. Doing it here rather than lazily on
@@ -336,7 +348,11 @@ class Session:
     # --- turns -------------------------------------------------------------------
 
     def send(
-        self, message: str, *, timeout: Timeout | float | None = None
+        self,
+        message: str,
+        *,
+        timeout: Timeout | float | None = None,
+        reasoning: str | Effort | None = None,
     ) -> Iterator[AgentEvent]:
         """Run one turn and stream normalized events.
 
@@ -350,6 +366,30 @@ class Session:
         all. Keeping ``system_prompt`` a construction argument rather than
         letting callers concatenate instructions into the message is what makes
         the prefix stable across a loop.
+
+        **``reasoning=`` is admitted anyway, and the exception is argued rather
+        than assumed** (2026-09-22). It states this turn's effort level,
+        overriding the connection's. It is allowed into a method that excludes
+        the two arguments above because it is not the same kind of thing: those
+        two *are* the front of the cached prefix, so moving them moves
+        everything after them, on every runtime, always. Effort is a parameter
+        about how hard to think, and whether changing it disturbs the prefix is
+        a per-vendor, per-model question with three different answers -- which
+        is what :func:`~modelpass.prompt_cache.effort_cache_continuity` reports
+        and what the receipt already carries.
+
+        So this argument promises nothing about the prefix. It is refused where
+        the runtime has no per-turn lever at all -- ``anthropic-sdk`` fixes
+        effort when the session opens, as does the ``exec`` transport on
+        ``openai-sdk`` -- and where it is accepted, the turn that changes the
+        level is marked, so ``terminal.effort_change_cache_preserved`` can say
+        from that turn's own token counts whether the prefix survived.
+        Capability says what may happen; telemetry says what did.
+
+        Passing the level already in force is not a transition: repeating
+        ``reasoning='high'`` on a session already at ``high`` emits no change
+        signal and leaves the measurement ``None``, because nothing was asked to
+        survive anything.
 
         The stream contract is :meth:`Bridge.chat`'s, per turn:
 
@@ -387,10 +427,14 @@ class Session:
         does not pretend to know.
         """
         self._require_sendable(message)
-        return self._turn(message, Timeout.coerce(timeout))
+        return self._turn(message, Timeout.coerce(timeout), self._plan_effort(reasoning))
 
     def asend(
-        self, message: str, *, timeout: Timeout | float | None = None
+        self,
+        message: str,
+        *,
+        timeout: Timeout | float | None = None,
+        reasoning: str | Effort | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """:meth:`send`, on a loop (R1, ticket 1.13)::
 
@@ -418,16 +462,19 @@ class Session:
         policy about where a conversation lives rather than a gap here.
         """
         self._require_sendable(message)
-        return self._aturn(message, Timeout.coerce(timeout))
+        return self._aturn(message, Timeout.coerce(timeout), self._plan_effort(reasoning))
 
     async def _aturn(
-        self, message: str, timeout: Timeout | None
+        self,
+        message: str,
+        timeout: Timeout | None,
+        effort: ReasoningPlan | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """:meth:`_turn`, awaited: take the session for one turn, then give it back."""
         self._take()
         deadline = Deadline(timeout) if timeout else None
         try:
-            async for event in self._arun_turn(message, deadline):
+            async for event in self._arun_turn(message, deadline, effort):
                 yield event
         finally:
             if deadline is not None:
@@ -435,12 +482,15 @@ class Session:
             self._busy.release()
 
     async def _arun_turn(
-        self, message: str, deadline: Deadline | None
+        self,
+        message: str,
+        deadline: Deadline | None,
+        effort: ReasoningPlan | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """:meth:`_run_turn` with ``await`` where it blocks. One fold, two pumps."""
         fold = TurnFold(
             connection=self._request.connection,
-            receipt=self._receipt,
+            receipt=self._turn_receipt(effort),
             guards=self._guards,
             tracker=self._tracker,
             deadline=deadline,
@@ -456,9 +506,18 @@ class Session:
             # on a worker thread and the loop waits on a queue rather than on a
             # subprocess. ``send`` is called **on that thread**: on
             # ``anthropic-sdk`` it is where the vendor session is created.
+            for event in self._announce_effort(effort):
+                for out in fold.feed(event):
+                    yield out
+            # Same rule as the sync pump: the older signature still works.
+            level = effort.runtime_value if effort is not None else None
             stream = threaded_run(
                 self._adapter,
-                lambda: self._handle.send(message),
+                (
+                    (lambda: self._handle.send(message, effort=level))
+                    if level is not None
+                    else (lambda: self._handle.send(message))
+                ),
                 name=self.connection,
             )
             async for event in stream:
@@ -501,6 +560,92 @@ class Session:
                 deadline=deadline,
                 timeout_reason="the turn timed out",
             )
+
+    #: Runtimes with a *per-turn* effort control, as opposed to one fixed when
+    #: the session opens. One member, and it is a fact about the vendors rather
+    #: than a gap here: ``openai-codex`` 0.154.0 types ``TurnStartParams.effort``
+    #: as "Override the reasoning effort for this turn and subsequent turns",
+    #: while ``claude-agent-sdk`` 0.2.148 reads ``ClaudeAgentOptions.effort``
+    #: once at session creation and offers no setter (both read 2026-09-22).
+    #: The exec transport is excluded by the adapter rather than here, because
+    #: the transport is chosen per session and this is a runtime-level table.
+    _PER_TURN_EFFORT: ClassVar[frozenset[Runtime]] = frozenset({Runtime.OPENAI_SDK})
+
+    def _plan_effort(self, reasoning: str | Effort | None) -> ReasoningPlan | None:
+        """Resolve a per-turn level, or refuse it where there is nowhere to put it.
+
+        **Refused at the call, like the other three things ``send`` rejects**,
+        and for the same reason: a caller who asked this turn to think harder
+        and got a stream that silently ran at the old level has been told the
+        opposite of what happened. The refusal names the runtime's own reason.
+
+        Resolution is :func:`~modelpass.reasoning.plan_reasoning`, so a per-turn
+        level goes through the same ladder, the same nearest-rung adjustment and
+        the same refusals as the connection's standing one. A second vocabulary
+        here would be two spellings of the same dial disagreeing at the worst
+        possible moment.
+        """
+        if reasoning is None:
+            return None
+        if self.runtime not in self._PER_TURN_EFFORT:
+            raise CapabilityNotSupported(
+                self.runtime.value,
+                "per-turn reasoning effort",
+                "this runtime fixes effort when the session opens and offers no "
+                "way to change it mid-conversation, so a per-turn level here "
+                "would be a setting that does nothing. State it on the "
+                "connection, or open a new session at the level you want",
+            )
+        return plan_reasoning(reasoning, self.runtime, name=self.connection)
+
+    def _turn_receipt(self, effort: ReasoningPlan | None) -> Receipt:
+        """This turn's receipt: the session's, with an override's level on it.
+
+        The session's receipt is built once and describes the conversation. A
+        turn that states its own level is the one case where that receipt is
+        wrong about the turn in front of it, so the fold -- which stamps the
+        terminal from this object -- gets a corrected copy rather than the
+        original. Nothing else about the receipt moves: the identity, the auth
+        mode, the cache eligibility and the continuity capability all belong to
+        the session and are unchanged by one turn's depth of thinking.
+        """
+        if effort is None:
+            return self._receipt
+        return replace(
+            self._receipt,
+            reasoning_requested=effort.requested.value,
+            reasoning_applied=effort.applied.value,
+            reasoning_value=effort.runtime_value,
+            notes=(*self._receipt.notes, effort.note),
+        )
+
+    def _announce_effort(self, effort: ReasoningPlan | None) -> tuple[AgentEvent, ...]:
+        """The change signal, emitted only when the level actually *changed*.
+
+        **Comparing against the level in force, not against ``None``**, is what
+        keeps ``effort_change_cache_preserved`` meaningful: a caller who passes
+        ``reasoning='high'`` on every turn of a session that was already at
+        ``high`` has changed nothing, and a run of those turns marked as
+        transitions would fill the ledger with measurements of a cache that was
+        never asked to survive anything.
+
+        The event is fed through the fold on its way to the caller, the way
+        every other event on this stream is -- :class:`~modelpass._fold.RunFold`
+        observes it to set the flag and passes it along untouched.
+        """
+        if effort is None:
+            return ()
+        previous = self._effort_in_force
+        self._effort_in_force = effort.runtime_value
+        if previous == effort.runtime_value:
+            return ()
+        return (
+            VendorEvent(
+                runtime=self.runtime,
+                name="reasoning_effort_changed",
+                data={"from": previous, "to": effort.runtime_value, "turn": self._turns},
+            ),
+        )
 
     def _require_sendable(self, message: str) -> None:
         """The three refusals every turn makes before it takes the session.
@@ -560,7 +705,10 @@ class Session:
         self._record(stopped, fold.allowance)
 
     def _turn(
-        self, message: str, timeout: Timeout | None
+        self,
+        message: str,
+        timeout: Timeout | None,
+        effort: ReasoningPlan | None = None,
     ) -> Iterator[AgentEvent]:
         """Take the session for the duration of one turn, then give it back.
 
@@ -570,14 +718,17 @@ class Session:
         self._take()
         deadline = Deadline(timeout) if timeout else None
         try:
-            yield from self._run_turn(message, deadline)
+            yield from self._run_turn(message, deadline, effort)
         finally:
             if deadline is not None:
                 deadline.stop()
             self._busy.release()
 
     def _run_turn(
-        self, message: str, deadline: Deadline | None
+        self,
+        message: str,
+        deadline: Deadline | None,
+        effort: ReasoningPlan | None = None,
     ) -> Iterator[AgentEvent]:
         """One turn: a thin pump around :class:`~modelpass._fold.TurnFold`.
 
@@ -590,7 +741,7 @@ class Session:
         """
         fold = TurnFold(
             connection=self._request.connection,
-            receipt=self._receipt,
+            receipt=self._turn_receipt(effort),
             guards=self._guards,
             tracker=self._tracker,
             deadline=deadline,
@@ -599,9 +750,22 @@ class Session:
         stream: Iterator[AgentEvent] | None = None
         try:
             yield from fold.begin()
+            for event in self._announce_effort(effort):
+                yield from fold.feed(event)
             if deadline is not None:
                 deadline.start(self._adapter)
-            stream = self._handle.send(message)
+            # **The kwarg goes only when there is something to say.**
+            # ``SessionHandle`` is a public protocol, so an adapter written
+            # against the older signature is a supported thing to have; passing
+            # ``effort=None`` to every turn would break all of them to say
+            # nothing. A handle that never sees the argument behaves exactly as
+            # it did, and one that does has already been checked by
+            # ``_plan_effort`` for a runtime that can honour it.
+            stream = (
+                self._handle.send(message, effort=effort.runtime_value)
+                if effort is not None
+                else self._handle.send(message)
+            )
             for event in stream:
                 yield from fold.feed(event)
                 if fold.done:

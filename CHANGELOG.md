@@ -7,6 +7,34 @@ work landed.
 
 ### Added
 
+- **A session turn can state its own reasoning effort**, on the one runtime
+  whose vendor types a per-turn field (2026-09-22).
+  `session.send(message, reasoning="high")` travels as
+  `TurnStartParams.effort` on `openai-sdk`'s app-server transport, and is
+  *refused* on `anthropic-sdk` and on the `exec` transport, which fix effort
+  when the session opens — accepting it there would hand back a turn that ran
+  at the old level.
+
+  The turn that changes the level emits `reasoning_effort_changed`, which the
+  fold observes and turns into `effort_change_cache_preserved` from that turn's
+  own cache counts. Repeating the level in force is not a change and is not
+  measured. The capability cell is unmoved by any of this: `openai-sdk` still
+  reads `experimental`, on the same receipt as the change.
+
+  `ChatSession.send` is a documented caching contract — it excludes `tools=` and
+  `system_prompt=` because both sit at the front of the cached prefix — so the
+  exception is argued in place rather than assumed.
+
+### Fixed
+
+- **A Codex session never sent the connection's reasoning effort** (2026-09-22).
+  `_session_turn_start_params` built its params without looking at the
+  connection, so a session ran at the server's default while every receipt
+  reported the level it had been told. The stateless path has carried it since
+  the day effort was wired; the session path never had. Same family as the
+  2026-09-22 stale-string fix: the record and the wire disagreed, and only the
+  record was visible.
+
 - **Effort-change cache continuity is its own capability, kept apart from
   "effort is supported" and from "this turn hit cache"** (2026-09-22).
   `prompt_cache.effort_cache_continuity(runtime, model)` answers whether

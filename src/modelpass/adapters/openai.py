@@ -2115,7 +2115,7 @@ class CodexSession:
 
     # --- turns -------------------------------------------------------------------
 
-    def send(self, message: str) -> Iterator[AgentEvent]:
+    def send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
         """Run one turn as its own ``codex exec`` process and stream its events.
 
         The same vocabulary and failure rules as :meth:`OpenAIAdapter.run`, with
@@ -2125,6 +2125,23 @@ class CodexSession:
         not an outcome of the turn -- the turn never started, and nothing was
         spent finding out.
         """
+        if effort is not None:
+            # 'codex exec' takes no per-turn effort: each turn is its own
+            # process, the level would travel as -c model_reasoning_effort on
+            # the argv, and a config override is not the vendor's per-turn
+            # field. The app-server transport has TurnStartParams.effort and is
+            # the default; this is the opted-out path
+            # (options={'transport': 'exec'}), so it says so rather than
+            # accepting a level it would send as something else.
+            raise CapabilityNotSupported(
+                Runtime.OPENAI_SDK.value,
+                "per-turn reasoning effort",
+                "the exec transport runs one process per turn and has no "
+                "TurnStartParams to carry an effort override. Drop "
+                "options={'transport': 'exec'} to use the app-server transport, "
+                "where the vendor types effort as a per-turn field",
+            )
+
         if self._closed:
             raise SessionClosed(
                 f"session on connection {self._request.connection.name!r} is closed"
@@ -2395,7 +2412,12 @@ def _session_thread_start_params(request: SessionRequest, cwd: str) -> dict[str,
 
 
 def _session_turn_start_params(
-    request: SessionRequest, thread_id: str, message: str, *, first_turn: bool
+    request: SessionRequest,
+    thread_id: str,
+    message: str,
+    *,
+    first_turn: bool,
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """``TurnStartParams`` for one turn of a session. **Only the new message.**
 
@@ -2418,7 +2440,24 @@ def _session_turn_start_params(
         if first_turn and request.appends_system_prompt
         else message
     )
-    return {"threadId": thread_id, "input": [{"type": "text", "text": text}]}
+    params: dict[str, Any] = {
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": text}],
+    }
+    # **The gap this closes.** The stateless path has carried the connection's
+    # effort since 2026-09-21 and this one never did, so a session ran at the
+    # server's default while the receipt reported the level it was told
+    # (2026-09-22). ``effort`` overrides it for this turn, which is what makes a
+    # mid-session change expressible at all; without an override the standing
+    # level is resent every turn rather than assumed to be sticky, because
+    # "subsequent turns" is the vendor's promise about *their* state and
+    # resending is what makes this params object describe the turn it starts.
+    level = effort or (
+        plan.runtime_value if (plan := stated_reasoning(request.connection)) else None
+    )
+    if level is not None:
+        params["effort"] = level
+    return params
 
 
 def _notification_turn_id(params: Mapping[str, Any]) -> str | None:
@@ -2661,8 +2700,17 @@ class CodexAppServerSession:
 
     # --- turns -------------------------------------------------------------------
 
-    def send(self, message: str) -> Iterator[AgentEvent]:
+    def send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
         """Run one turn on this thread and stream normalized events.
+
+        ``effort`` overrides the session's standing level for this turn and,
+        by the vendor's own description of the field, for the ones after it:
+        ``TurnStartParams.effort`` is *"Override the reasoning effort for this
+        turn and subsequent turns"* (openai-codex 0.154.0, typed). That is why
+        this is the lever modelpass uses rather than synthesizing a
+        ``configuration_update`` item -- the item is typed in the protocol
+        package but the installed codex.exe 0.151.0 contains the string zero
+        times, so nothing here would understand one.
 
         The same vocabulary and failure rules as :meth:`CodexSession.send`,
         including the one addition sessions have over the stateless path: a
@@ -2680,9 +2728,11 @@ class CodexAppServerSession:
             # driving the adapter directly, and the same words run() uses.
             yield self._terminal(TerminalStatus.ERROR, "codex CLI not found", TokenUsage())
             return
-        yield from self._stream_turn(message)
+        yield from self._stream_turn(message, effort=effort)
 
-    def _stream_turn(self, message: str) -> Iterator[AgentEvent]:
+    def _stream_turn(
+        self, message: str, *, effort: str | None = None
+    ) -> Iterator[AgentEvent]:
         """One ``turn/start`` and its drain, ending in exactly one terminal.
 
         ``turn/start`` returns immediately with ``status: "inProgress"`` (live
@@ -2710,7 +2760,11 @@ class CodexAppServerSession:
             started = client.request(
                 "turn/start",
                 _session_turn_start_params(
-                    self._request, thread_id, message, first_turn=self._turns == 0
+                    self._request,
+                    thread_id,
+                    message,
+                    first_turn=self._turns == 0,
+                    effort=effort,
                 ),
             )
             turn.turn_id = _started_turn_id(started) or turn.turn_id
