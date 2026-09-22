@@ -354,3 +354,105 @@ def test_no_runtime_is_told_twice():
         via_sampling = _with_standing_reasoning(conn, None) is not None
         carried = "reasoning_effort" in rules_for(runtime, conn.model or "").accepted
         assert via_sampling is carried, runtime
+
+
+# --- 9. what the runtime says it used -------------------------------------------
+
+
+def test_the_receipt_carries_the_level_on_an_agent_runtime(tmp_path):
+    """The only place the answer exists on anthropic-sdk.
+
+    anthropic 0.97.0's Message response has no effort field and the effort
+    documentation describes none, so a level sent to that runtime is never
+    echoed. If the receipt does not say it, nothing does.
+    """
+    from modelpass.testing import fake_bridge
+    from modelpass.types import ReceiptEvent, TextDeltaEvent
+
+    bridge, *_ = fake_bridge(
+        connections=[_sub(Runtime.ANTHROPIC_SDK)],
+        script=[TextDeltaEvent(text="hi")],
+        home=tmp_path / "home",
+    )
+    receipts = [e.receipt for e in bridge.chat(connection="c", message="x")
+                if isinstance(e, ReceiptEvent)]
+    assert receipts
+    assert receipts[0].reasoning_requested == "high"
+    assert receipts[0].reasoning_applied == "high"
+    assert receipts[0].reasoning_value == "high"
+
+
+def test_the_receipt_shows_an_adjustment_rather_than_hiding_it(tmp_path):
+    from modelpass.connections import Connection, CredentialRef
+    from modelpass.testing import fake_bridge
+    from modelpass.types import AuthMode, ReceiptEvent, TextDeltaEvent
+
+    conn = Connection(
+        name="c",
+        runtime=Runtime.ANTHROPIC_SDK,
+        auth_mode=AuthMode.SUBSCRIPTION,
+        credential_ref=CredentialRef.native_login(),
+        reasoning="none",
+    )
+    bridge, *_ = fake_bridge(
+        connections=[conn], script=[TextDeltaEvent(text="hi")], home=tmp_path / "home"
+    )
+    receipt = next(
+        e.receipt for e in bridge.chat(connection="c", message="x")
+        if isinstance(e, ReceiptEvent)
+    )
+    assert receipt.reasoning_requested == "none"
+    assert receipt.reasoning_applied == "low"  # this runtime's floor
+
+
+def test_a_connection_that_states_nothing_puts_nothing_on_the_receipt(tmp_path):
+    """A line reading "reasoning: not requested" on every receipt is noise."""
+    from modelpass.connections import Connection, CredentialRef
+    from modelpass.testing import fake_bridge
+    from modelpass.types import AuthMode, ReceiptEvent, TextDeltaEvent
+
+    conn = Connection(
+        name="c",
+        runtime=Runtime.ANTHROPIC_SDK,
+        auth_mode=AuthMode.SUBSCRIPTION,
+        credential_ref=CredentialRef.native_login(),
+    )
+    bridge, *_ = fake_bridge(
+        connections=[conn], script=[TextDeltaEvent(text="hi")], home=tmp_path / "home"
+    )
+    receipt = next(
+        e.receipt for e in bridge.chat(connection="c", message="x")
+        if isinstance(e, ReceiptEvent)
+    )
+    assert receipt.reasoning_requested is None
+    assert receipt.reasoning_value is None
+
+
+def test_codex_echoes_the_level_and_a_disagreement_is_reported():
+    """The one runtime that answers back. Read off the live capture, not a mock."""
+    import json
+    from pathlib import Path
+
+    from modelpass.adapters.openai import reasoning_echo_note, thread_reasoning_effort
+
+    capture = Path(__file__).parent / "fixtures/appserver/live-capture-2026-08-31.jsonl"
+    started = next(
+        json.loads(line)["payload"]
+        for line in capture.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("_kind") == "thread_start_response"
+    )
+    echoed = thread_reasoning_effort(started)
+    assert echoed == "medium"
+    # agreement is silent; disagreement is not
+    assert reasoning_echo_note("medium", echoed) is None
+    assert "reports running at 'medium'" in reasoning_echo_note("high", echoed)
+    # and nothing to compare is not a finding
+    assert reasoning_echo_note(None, echoed) is None
+    assert reasoning_echo_note("high", None) is None
+
+
+def test_an_absent_echo_is_not_an_error():
+    from modelpass.adapters.openai import thread_reasoning_effort
+
+    assert thread_reasoning_effort({"thread": {"id": "t1"}}) is None
+    assert thread_reasoning_effort({}) is None

@@ -56,6 +56,23 @@ work landed.
   previously valid value still is. It is the single vocabulary; `EFFORT_LADDER`
   derives from it.
 
+  **The receipt says what the runtime was told**, on
+  `Receipt.reasoning_requested` / `reasoning_applied` / `reasoning_value` —
+  the last being the vendor's own word, since Gemini spells the same depth
+  `'MEDIUM'` and a caller reconciling against vendor logs needs that spelling.
+  On `anthropic-sdk` this is the **only** place the answer exists: anthropic
+  0.97.0's `Message` carries no effort field and the effort documentation
+  describes none, so a level sent there is never echoed.
+
+  **Codex does echo it, and modelpass now reads it back.**
+  `thread_reasoning_effort()` takes the `reasoningEffort` the server returns on
+  `thread/start`, and `reasoning_echo_note()` compares it against what was
+  sent — silent when they agree, explicit when they do not. That matters most
+  on this runtime, because `effort` on `TurnStartParams` rests on a read of the
+  shipped binary's parameter table rather than a typed SDK field, and a server
+  that silently ignored the parameter would look identical to one that honoured
+  it. Verified against the committed live capture, which echoes `'medium'`.
+
   **Each runtime is told exactly once.** The three API runtimes take it through
   the sampling pipeline; both agent runtimes are wired directly
   (`ClaudeAgentOptions.effort`, and `effort` on Codex's `TurnStartParams`)

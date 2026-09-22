@@ -110,6 +110,7 @@ from .errors import (
 )
 from .preflight import PreflightPlan, Receipt, plan_launch
 from .prompt_cache import plan_prompt_cache
+from .reasoning import stated_reasoning
 from .runlog import RunLog, RunRecord, run_log_for
 from .runtimes import API_RUNTIMES, Runtime
 from .sampling_rules import plan_sampling, rules_for
@@ -783,6 +784,7 @@ class Bridge:
         )
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
+        receipt = self._with_reasoning_disclosure(request, receipt)
         receipt = self._with_prompt_cache(request, receipt)
         return self._with_sampling_disclosure(request, receipt)
 
@@ -1097,6 +1099,39 @@ class Bridge:
             notes=(*receipt.notes, plan.note),
             prompt_cache_requested=plan.requested,
             prompt_cache_disposition=plan.disposition.value,
+        )
+
+    @staticmethod
+    def _with_reasoning_disclosure(
+        request: RunRequest, receipt: Receipt
+    ) -> Receipt:
+        """Say what effort was asked for and what the runtime is actually told.
+
+        Here rather than in an adapter for the reason the cache and sampling
+        steps are: the answer comes from a *table*, so every runtime reports it
+        the same way and an adapter that has never heard of the key still
+        produces a receipt that carries it.
+
+        This is the only place the answer exists on two of the runtimes.
+        ``anthropic-sdk`` sends the level and gets no echo -- anthropic 0.97.0's
+        ``Message`` has no effort field and the effort documentation describes
+        none -- so a caller who cannot read it here cannot read it anywhere.
+        ``openai-sdk`` does echo it, on ``thread/start``, which is why
+        :func:`~modelpass.adapters.openai.thread_reasoning_effort` exists to
+        compare the two.
+
+        Silent when nothing was stated. Cannot refuse: that happened when the
+        connection was built.
+        """
+        plan = stated_reasoning(request.connection)
+        if plan is None:
+            return receipt
+        return replace(
+            receipt,
+            notes=(*receipt.notes, plan.note),
+            reasoning_requested=plan.requested.value,
+            reasoning_applied=plan.applied.value,
+            reasoning_value=plan.runtime_value,
         )
 
     @staticmethod
@@ -2176,6 +2211,7 @@ class Bridge:
         receipt = self._with_identity_verification(resolved, receipt)
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
+        receipt = self._with_reasoning_disclosure(request, receipt)
         receipt = self._with_prompt_cache(request, receipt)
         receipt.require_ok()
         receipt.require_auth_mode(
@@ -2836,6 +2872,7 @@ class Bridge:
             receipt = replace(receipt, notes=(*receipt.notes, _note))
         receipt = self._with_cache_disclosure(plan.adapter, plan.request, receipt)
         receipt = self._with_cache_breakpoints(plan.request, receipt)
+        receipt = self._with_reasoning_disclosure(plan.request, receipt)
         receipt = self._with_prompt_cache(plan.request, receipt)
         receipt = self._with_sampling_disclosure(plan.request, receipt)
         receipt.require_ok()

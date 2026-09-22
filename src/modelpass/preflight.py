@@ -1094,6 +1094,26 @@ class Receipt:
     #: is an ``InvalidConnection`` raised when the connection is built.
     prompt_cache_requested: str | None = None
     prompt_cache_disposition: str | None = None
+    #: What the connection's ``reasoning`` asked for, what was honoured, and the
+    #: runtime's own word for it (2026-09-21). All ``None`` when nothing was
+    #: stated.
+    #:
+    #: Three fields, because the abstract rung cannot answer the question that
+    #: was actually asked -- *what did the model get*. Gemini spells the depth
+    #: modelpass calls ``'medium'`` as ``'MEDIUM'``, and a caller reconciling a
+    #: receipt against a vendor's own logs needs the vendor's word.
+    #:
+    #: ``reasoning_applied`` differs from ``reasoning_requested`` exactly when
+    #: the runtime or the model lacked the rung and modelpass moved to its
+    #: nearest. That substitution is otherwise invisible: ``claude-agent-sdk``
+    #: documents ``xhigh`` as falling back to ``high`` on models that lack it
+    #: and says nothing at runtime, and Anthropic's Message response carries no
+    #: effort field at all (checked against anthropic 0.97.0 and the effort
+    #: documentation, 2026-09-21), so on that runtime this receipt is the only
+    #: place the answer exists.
+    reasoning_requested: str | None = None
+    reasoning_applied: str | None = None
+    reasoning_value: str | None = None
     #: What this run asked the model to do about word choice, and what will
     #: actually be sent (R5, ticket 1.7). Two dicts rather than one flag,
     #: because the interesting case is exactly where they disagree and a
@@ -1324,6 +1344,9 @@ class Receipt:
             "cache_breakpoints_honoured": self.cache_breakpoints_honoured,
             "prompt_cache_requested": self.prompt_cache_requested,
             "prompt_cache_disposition": self.prompt_cache_disposition,
+            "reasoning_requested": self.reasoning_requested,
+            "reasoning_applied": self.reasoning_applied,
+            "reasoning_value": self.reasoning_value,
             "sampling_requested": dict(self.sampling_requested),
             "sampling_applied": dict(self.sampling_applied),
             "sampling_notes": list(self.sampling_notes),

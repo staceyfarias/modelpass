@@ -1034,6 +1034,54 @@ def _started_thread_id(result: Mapping[str, Any]) -> str:
     )
 
 
+def thread_reasoning_effort(result: Mapping[str, Any]) -> str | None:
+    """The effort the server says this thread is running at, from ``thread/start``.
+
+    The **only echo of an effort level on any runtime modelpass drives.**
+    Anthropic has none: ``anthropic`` 0.97.0's ``Message`` carries no effort
+    field and the effort documentation describes no response field for it
+    (checked 2026-09-21), so there the request is the only record. Codex answers
+    ``thread/start`` with the thread's own ``reasoningEffort`` beside its
+    ``model`` and ``approvalPolicy`` -- seen in
+    ``tests/fixtures/appserver/live-capture-2026-08-31.jsonl`` -- which makes a
+    round trip possible: send a level, read back what the server took.
+
+    That matters more here than anywhere else. ``effort`` on ``TurnStartParams``
+    rests on a read of the shipped binary's parameter table rather than on a
+    typed SDK field, and a server that silently ignored the parameter would
+    produce a run indistinguishable from one that honoured it. This is how the
+    difference becomes visible.
+
+    ``None`` when the response does not carry one, which is not an error: the
+    field is the server's to send and its absence is a fact about the response,
+    not a failure of the turn.
+    """
+    thread = result.get("thread")
+    value = thread.get("reasoningEffort") if isinstance(thread, Mapping) else None
+    if value is None:
+        value = result.get("reasoningEffort")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def reasoning_echo_note(sent: str | None, echoed: str | None) -> str | None:
+    """One line comparing what was sent against what the thread came back with.
+
+    Silent when nothing was sent, and silent when the two agree -- a receipt
+    line saying a setting worked is noise standing where a disclosure should
+    be. It speaks when they differ, which is the case a caller cannot find out
+    any other way.
+    """
+    if sent is None or echoed is None:
+        return None
+    if sent == echoed:
+        return None
+    return (
+        f"reasoning effort {sent!r} was sent on turn start, but the thread "
+        f"reports running at {echoed!r}. The server took a different level "
+        "than the one asked for; trust the reported one"
+    )
+
+
 def interrupt_app_server_turn(
     client: Any, thread_id: str | None, turn_id: str | None, *, timeout: float = 5.0
 ) -> bool:
