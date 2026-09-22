@@ -623,8 +623,10 @@ def test_usage_puts_geminis_four_counts_where_modelpass_keeps_them():
 
     Gemini reports 100 prompt tokens *including* 30 cached, and reports 12
     thinking tokens *beside* 40 candidate tokens. Anthropic reports the same call
-    as 70 fresh, 30 read and 52 output. A consumer's accounting must not be able
-    to tell which runtime produced the number.
+    as 70 fresh, 30 read and 52 output, with the 12 *inside* the 52. A consumer's
+    accounting must not be able to tell which runtime produced the number --
+    which, since 2026-09-22, includes the reasoning count -- with one exception
+    named below.
     """
     usage = FakeUsage(
         prompt_token_count=100,
@@ -634,9 +636,22 @@ def test_usage_puts_geminis_four_counts_where_modelpass_keeps_them():
     )
     mapped = token_usage(usage)
     assert mapped == TokenUsage(
-        input_tokens=70, output_tokens=52, cached_input_tokens=30, cache_write_tokens=0
+        input_tokens=70,
+        output_tokens=52,
+        cached_input_tokens=30,
+        cache_write_tokens=0,
+        reasoning_output_tokens=12,
     )
-    assert mapped == anthropic_token_usage(
+    # The exception, and it is the vendor's rather than this library's:
+    # ``anthropic-api`` reports **no** reasoning count at any depth --
+    # ``anthropic`` 0.97.0's ``Usage`` has no details object -- so parity is
+    # asserted on the four counts both runtimes report, and the fifth is
+    # compared against the ``None`` that says "this vendor cannot tell us".
+    # Inventing a 12 there to make the assertion pretty would be the exact
+    # claim ``reasoning_output_tokens`` exists to refuse.
+    from dataclasses import replace
+
+    messages_api = anthropic_token_usage(
         {
             "input_tokens": 70,
             "output_tokens": 52,
@@ -644,10 +659,16 @@ def test_usage_puts_geminis_four_counts_where_modelpass_keeps_them():
             "cache_creation_input_tokens": 0,
         }
     )
+    assert messages_api.reasoning_output_tokens is None
+    assert replace(mapped, reasoning_output_tokens=None) == messages_api
     # And the arithmetic that says nothing was double counted or lost: the
     # vendor's own total is modelpass's total.
     assert mapped.total_tokens == usage.total_token_count
     assert mapped.billable_input_tokens == 70
+    # ...and the reasoning count is inside the output, not beside it: adding it
+    # to the total would double-count the 12 Gemini already folded in.
+    assert mapped.reasoning_output_tokens is not None
+    assert mapped.reasoning_output_tokens <= mapped.output_tokens
 
 
 def test_usage_reads_a_mapping_as_well_as_a_model_and_never_raises():

@@ -2342,6 +2342,42 @@ If you do your own arithmetic on `TokenUsage`, read this section.
 counted **separately from** `input_tokens`, not inside it. `cache_write_tokens`
 is separate again. `total_tokens` is the sum of all four fields.
 
+**`reasoning_output_tokens` is the exception to that sentence, and the exception
+is deliberate** (2026-09-22). It is a **subset of `output_tokens`**, not a fifth
+peer, and it is therefore **excluded from `total_tokens`**. Adding it would bill
+the same tokens twice. The relation was checked on every runtime that reports
+one rather than assumed from the field names:
+
+| runtime | field | checked |
+| --- | --- | --- |
+| `anthropic-sdk` | `usage.output_tokens_details.thinking_tokens` | live, claude-code 2.1.278: `output_tokens 996` of which `thinking_tokens 993`, answer text `5` |
+| `openai-sdk` | `reasoningOutputTokens` (app-server), `reasoning_output_tokens` (exec) | 66,406 real `token_count` records: no row where reasoning exceeded output, and `input + output == total` throughout |
+| `openai-api` | `output_tokens_details.reasoning_tokens` | typed as a member of the output-token details object |
+| `openai-compatible` | `completion_tokens_details.reasoning_tokens` | same, optional — most servers omit it |
+| `google-api` | `thoughts_token_count` | **a peer on the wire**: the vendor's own total sums it beside `candidates_token_count`. The adapter folds it into `output_tokens`, so by the time it reaches `TokenUsage` the subset relation holds here too |
+| `anthropic-api` | — | **no such field.** `anthropic` 0.97.0's `Usage` has no details object, so a 996-token answer that thought for 993 cannot be told from 996 tokens of prose |
+
+**`None` is not `0`.** A `None` means the runtime reported no count; a `0` means
+it reported that the model did not think. `TokenUsage.__add__` folds two `None`s
+to `None` rather than to zero, and `at_least` lets a number beat a silence in
+either direction. If you sum this field yourself, do the same: a zero you
+invented is a measurement you did not take.
+
+**Which kind of nothing a `None` is** is answered by `reasoning_metric`, carried
+on the terminal event, on `Answer`, and in the run log: `reported`, `unreported`
+(this runtime has the field, this run carried no value) or `unavailable` (no
+such field exists here, so retrying will not produce one).
+
+**What was asked and what the vendor said.** `reasoning_value` is the level
+modelpass sent, in the runtime's own spelling. `reasoning_echo` is the level the
+vendor said it used — and only `openai-sdk` says: `thread/start` answers with
+the thread's own `reasoningEffort`, and modelpass compares the two. Anthropic
+echoes nothing on either runtime, which was driven rather than inferred
+(2026-09-22): across six `claude -p --output-format stream-json --effort <level>`
+runs the string `effort` appears in the transcript once, as a slash-command
+name. So on a Claude connection the receipt is the only record of what was sent,
+and `reasoning_output_tokens` is the only evidence it did anything.
+
 That convention is **correct for Anthropic natively** — a live row reads
 `in 2, cached 1901`, which is impossible unless the two are parallel.
 

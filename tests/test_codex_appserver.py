@@ -757,7 +757,7 @@ def usage_note(last: dict, total: dict, window: int | None = 272000) -> Notifica
     )
 
 
-def breakdown(inp: int, out: int, cached: int = 0, write: int = 0) -> dict:
+def breakdown(inp: int, out: int, cached: int = 0, write: int = 0, reasoning: int = 0) -> dict:
     """One ``TokenUsageBreakdown``, shaped **the way the wire shapes it**.
 
     ``inp`` is the vendor's ``inputTokens``, which is *inclusive* of ``cached``
@@ -773,7 +773,7 @@ def breakdown(inp: int, out: int, cached: int = 0, write: int = 0) -> dict:
         "outputTokens": out,
         "cachedInputTokens": cached,
         "cacheWriteInputTokens": write,
-        "reasoningOutputTokens": 0,
+        "reasoningOutputTokens": reasoning,
         "totalTokens": inp + out,
     }
 
@@ -1005,11 +1005,16 @@ def test_a_usage_update_emits_the_last_breakdown_and_keeps_the_payload():
     # 100 on the wire is inclusive of the 8 cache reads, so 92 is the fresh
     # input; modelpass counts the two side by side (2026-08-31 measurement).
     assert usage.usage == TokenUsage(
-        input_tokens=92, output_tokens=20, cached_input_tokens=8, cache_write_tokens=4
+        input_tokens=92,
+        output_tokens=20,
+        cached_input_tokens=8,
+        cache_write_tokens=4,
+        reasoning_output_tokens=0,
     )
     assert usage.scope is UsageScope.DELTA
-    # total, modelContextWindow, reasoningOutputTokens and totalTokens have no
-    # home on TokenUsage and are not dropped to make the normalized half tidy.
+    # total, modelContextWindow and totalTokens have no home on TokenUsage and
+    # are not dropped to make the normalized half tidy. reasoningOutputTokens
+    # gained one on 2026-09-22 and is normalized above as well as passed through.
     assert isinstance(vendor, VendorEvent)
     assert vendor.data["tokenUsage"]["total"]["inputTokens"] == 9000
     assert vendor.data["tokenUsage"]["modelContextWindow"] == 272000
@@ -1025,8 +1030,12 @@ def test_turn_usage_sums_the_last_breakdowns_and_never_the_thread_total():
     turn.observe(usage_note(breakdown(100, 20), breakdown(9100, 920)))
     turn.observe(usage_note(breakdown(30, 5), breakdown(9130, 925)))
 
-    assert turn.usage == TokenUsage(input_tokens=130, output_tokens=25)
-    assert turn.thread_total_usage == TokenUsage(input_tokens=9130, output_tokens=925)
+    assert turn.usage == TokenUsage(
+        input_tokens=130, output_tokens=25, reasoning_output_tokens=0
+    )
+    assert turn.thread_total_usage == TokenUsage(
+        input_tokens=9130, output_tokens=925, reasoning_output_tokens=0
+    )
     assert turn.model_context_window == 272000
 
 
@@ -1040,6 +1049,29 @@ def test_a_usage_update_without_a_last_breakdown_is_only_a_vendor_event():
 def test_missing_token_fields_read_as_zero_rather_than_failing():
     assert token_usage_from_breakdown({"inputTokens": 7}) == TokenUsage(input_tokens=7)
     assert token_usage_from_breakdown(None) == TokenUsage()
+
+
+def test_reasoning_tokens_are_carried_as_a_subset_of_output():
+    """A reported count lands in its own field and stays out of the total.
+
+    The relation is the vendor's, established from 66,406 real ``token_count``
+    records rather than from a schema that describes neither field's meaning.
+    """
+    mapped = token_usage_from_breakdown(breakdown(100, 40, reasoning=30))
+    assert mapped.reasoning_output_tokens == 30
+    assert mapped.output_tokens == 40
+    assert mapped.total_tokens == 140
+
+
+def test_an_absent_reasoning_count_is_not_a_zero_one():
+    """``None`` is "the server did not say"; ``0`` is "the model did not think".
+
+    A transport that stops sending the field must not start claiming every run
+    reasoned for nothing -- that is a measurement a consumer would act on.
+    """
+    absent = token_usage_from_breakdown({"inputTokens": 7, "outputTokens": 2})
+    assert absent.reasoning_output_tokens is None
+    assert token_usage_from_breakdown(breakdown(7, 2)).reasoning_output_tokens == 0
 
 
 # --- usage: Codex nests its cache read inside input (2026-08-31) ----------------------------

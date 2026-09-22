@@ -257,6 +257,20 @@ class Answer:
     events: tuple[AgentEvent, ...] = ()
     sampling_applied: Mapping[str, Any] = field(default_factory=dict)
     sampling_notes: tuple[str, ...] = ()
+    #: The effort dial, lifted here on the same argument as ``sampling_applied``
+    #: (2026-09-22): a one-shot caller holds this object and nothing else, and
+    #: the three questions about effort are answered in three different places
+    #: otherwise -- the receipt, a vendor event, and a usage field.
+    #:
+    #: * ``reasoning_value`` -- the level sent, in the runtime's spelling.
+    #: * ``reasoning_echo`` -- the level the vendor said it used, where any
+    #:   vendor says: ``openai-sdk`` alone. ``None`` elsewhere because no echo
+    #:   exists, not because the run failed to report one.
+    #: * ``reasoning_metric`` -- how to read ``usage.reasoning_output_tokens``:
+    #:   ``reported``, ``unreported`` or ``unavailable``.
+    reasoning_value: str | None = None
+    reasoning_echo: str | None = None
+    reasoning_metric: str | None = None
 
 
 #: The cells that together answer "does this runtime hold a conversation of its
@@ -364,6 +378,9 @@ class _Collected:
             events=tuple(self.events),
             sampling_applied=dict(receipt.sampling_applied),
             sampling_notes=tuple(receipt.sampling_notes),
+            reasoning_value=terminal.reasoning_value,
+            reasoning_echo=terminal.reasoning_echo,
+            reasoning_metric=terminal.reasoning_metric,
         )
 
 

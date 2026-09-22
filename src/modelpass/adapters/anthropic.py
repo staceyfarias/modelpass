@@ -467,6 +467,22 @@ def token_usage(usage: Mapping[str, Any] | None) -> TokenUsage:
     ``cache_write_tokens`` against ``cached_input_tokens`` is what tells a caller
     whether their prefix is stable. The untouched dict still passes through as a
     ``vendor_event``.
+
+    **``output_tokens_details.thinking_tokens`` is read here and is the only
+    thing on this runtime that says an effort setting did anything** (2026-09-22).
+    The level goes out on ``ClaudeAgentOptions.effort`` and nothing comes back
+    naming it -- driven on claude-code 2.1.278, where the string ``effort``
+    appears in the whole ``stream-json`` transcript exactly once, as a
+    *slash-command name*. What does come back is this count: one drive of a
+    fixed prompt gave 993 thinking tokens of 996 output at ``xhigh`` against 365
+    of 368 at ``low``. It is a subset of ``output_tokens``, so it is recorded as
+    one.
+
+    Note for anyone re-deriving this from the SDK: ``thinking_tokens`` is *not*
+    in the typed surface. ``ResultMessage.usage`` is ``dict[str, Any]`` and the
+    ``ModelUsage`` TypedDict -- which carries the same figure as
+    ``thinkingTokens`` -- does not declare it either. The wire is ahead of the
+    types here, which is why this cell rests on a live read.
     """
     if not isinstance(usage, Mapping):
         return TokenUsage()
@@ -475,11 +491,20 @@ def token_usage(usage: Mapping[str, Any] | None) -> TokenUsage:
         value = usage.get(key)
         return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
+    def reported(group: str, key: str) -> int | None:
+        """``None`` where the vendor said nothing -- never ``0``, which is a claim."""
+        inner = usage.get(group)
+        value = inner.get(key) if isinstance(inner, Mapping) else None
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
     return TokenUsage(
         input_tokens=count("input_tokens"),
         output_tokens=count("output_tokens"),
         cached_input_tokens=count("cache_read_input_tokens"),
         cache_write_tokens=count("cache_creation_input_tokens"),
+        reasoning_output_tokens=reported("output_tokens_details", "thinking_tokens"),
     )
 
 

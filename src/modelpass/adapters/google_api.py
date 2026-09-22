@@ -170,6 +170,23 @@ def _count(usage: Any, key: str) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _reported(usage: Any, key: str) -> int | None:
+    """One integer off a usage object or mapping, or ``None`` when absent.
+
+    The sibling of :func:`_count` and deliberately not a wrapper of it: a
+    reasoning count must keep *no report* distinct from *zero tokens*, which is
+    the one distinction ``or 0`` destroys. See
+    :attr:`~modelpass.types.TokenUsage.reasoning_output_tokens`.
+    """
+    if isinstance(usage, Mapping):
+        value = usage.get(key)
+    else:
+        value = getattr(usage, key, None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def token_usage(usage: Any) -> TokenUsage:
     """Normalize ``GenerateContentResponseUsageMetadata`` onto modelpass tokens.
 
@@ -220,6 +237,14 @@ def token_usage(usage: Any) -> TokenUsage:
         ),
         cached_input_tokens=cached,
         cache_write_tokens=0,
+        # The one runtime where the vendor counts thoughts *beside* the answer
+        # rather than inside it. They are folded into ``output_tokens`` above
+        # for cross-runtime comparability; recording the same number here keeps
+        # the subset convention true on this runtime too, so a consumer reading
+        # ``reasoning_output_tokens`` never has to ask which vendor produced
+        # the line. ``None`` when the field is absent, which is what a
+        # non-thinking model reports.
+        reasoning_output_tokens=_reported(usage, "thoughts_token_count"),
     )
 
 

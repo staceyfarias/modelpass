@@ -974,6 +974,42 @@ def _thread_start_params(request: RunRequest, cwd: str) -> dict[str, Any]:
     return params
 
 
+def _reasoning_echo_events(
+    request: RunRequest, started: Mapping[str, Any]
+) -> tuple[AgentEvent, ...]:
+    """The ``thread/start`` echo as an event, or nothing when there is none.
+
+    Nothing when the connection stated no effort, and nothing when the server
+    answered without a ``reasoningEffort`` -- an absent echo is not an error
+    (older servers, and the exec transport, answer nothing at all).
+    """
+    plan = stated_reasoning(request.connection)
+    if plan is None:
+        return ()
+    echoed = thread_reasoning_effort(started)
+    if echoed is None:
+        return ()
+    data: dict[str, Any] = {"sent": plan.runtime_value, "echoed": echoed}
+    note = reasoning_echo_note(plan.runtime_value, echoed)
+    if note is not None:
+        data["note"] = note
+    return (
+        VendorEvent(runtime=Runtime.OPENAI_SDK, name="reasoning_echo", data=data),
+    )
+
+
+def _reported_int(value: Any) -> int | None:
+    """A wire integer, or ``None`` when the field was absent.
+
+    A reasoning count of ``0`` is a report that the model did not think; an
+    absent field is the runtime not saying. See
+    :attr:`~modelpass.types.TokenUsage.reasoning_output_tokens`.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _turn_start_params(
     request: RunRequest, thread_id: str, *, history_injected: bool = True
 ) -> dict[str, Any]:
@@ -1040,7 +1076,11 @@ def thread_reasoning_effort(result: Mapping[str, Any]) -> str | None:
     The **only echo of an effort level on any runtime modelpass drives.**
     Anthropic has none: ``anthropic`` 0.97.0's ``Message`` carries no effort
     field and the effort documentation describes no response field for it
-    (checked 2026-09-21), so there the request is the only record. Codex answers
+    (checked 2026-09-21), and the agent runtime's untyped ``SystemMessage.data``
+    -- the one place a typed read could not rule one out -- carries none either
+    (driven live on claude-code 2.1.278, 2026-09-22; see
+    :attr:`~modelpass.preflight.Receipt.reasoning_value`). So there the request
+    is the only record. Codex answers
     ``thread/start`` with the thread's own ``reasoningEffort`` beside its
     ``model`` and ``approvalPolicy`` -- seen in
     ``tests/fixtures/appserver/live-capture-2026-08-31.jsonl`` -- which makes a
@@ -1318,6 +1358,14 @@ def map_codex_event(payload: Mapping[str, Any]) -> tuple[AgentEvent, ...]:
                     output_tokens=int(usage.get("output_tokens", 0) or 0),
                     cached_input_tokens=cached,
                     cache_write_tokens=int(usage.get("cache_write_input_tokens", 0) or 0),
+                    # ``reasoning_output_tokens`` on exec's own ``turn.completed``
+                    # usage, snake_case where the app-server spells it
+                    # ``reasoningOutputTokens``. Absent reads as ``None`` rather
+                    # than 0: a release that stops sending the field must not
+                    # start claiming the model did no thinking.
+                    reasoning_output_tokens=_reported_int(
+                        usage.get("reasoning_output_tokens")
+                    ),
                 )
             ),
         )
@@ -3617,6 +3665,15 @@ class OpenAIAdapter(Adapter):
             client.start()
             started = self._start_thread(client, request, cwd)
             turn.thread_id = _started_thread_id(started)
+            # The round trip this runtime alone makes possible: the level was
+            # sent on turn/start, and thread/start answers with the level the
+            # thread is actually running at. Emitted as a vendor event so the
+            # fold can stamp it on the terminal (and the run log), which is the
+            # only way a caller can tell a level that was honoured from one the
+            # server ignored. Silent about agreement; explicit about a
+            # disagreement, which is discoverable no other way.
+            for event in _reasoning_echo_events(request, started):
+                yield event
             injected = True
             for event in self._inject_history(client, request, turn.thread_id):
                 injected = False

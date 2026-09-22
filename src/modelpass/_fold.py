@@ -52,6 +52,7 @@ from .errors import (
 )
 from .guards import GuardTracker
 from .preflight import Receipt
+from .reasoning import reasoning_metric
 from .retry import classify_terminal, vendor_error_facts
 from .types import (
     AgentEvent,
@@ -101,6 +102,11 @@ class EventFold:
         #: Last wins. A run may report the allowance several times; the most
         #: recent report is the one that describes where the plan stands now.
         self.allowance: Mapping[str, Any] | None = None
+        #: The level the vendor said this run is using, where one says anything
+        #: (2026-09-22). Observed the way the allowance is -- on the way past,
+        #: never intercepted -- because the event it comes from is a passthrough
+        #: the caller is entitled to see whole.
+        self.reasoning_echo: str | None = None
 
     # --- what the pump asks -----------------------------------------------------
 
@@ -166,6 +172,14 @@ class EventFold:
             # Observed on the way past, never intercepted: the event still
             # reaches the caller exactly as before (D20).
             self.allowance = event.data
+
+        if isinstance(event, VendorEvent) and event.name == "reasoning_echo":
+            # Same treatment, same reason. ``openai-sdk`` is the only runtime
+            # that answers with the effort it is running at, so this is the one
+            # place a stamped terminal can say the vendor agreed -- or did not.
+            echoed = event.data.get("echoed")
+            if isinstance(echoed, str) and echoed:
+                self.reasoning_echo = echoed
 
         return [event]
 
@@ -233,16 +247,28 @@ class EventFold:
             stateless=self.stateless,
             connection_retry=connection.retry,
         )
+        # The reasoning trio is stamped here for the reason everything else in
+        # this method is: it is modelpass's statement about the run, assembled
+        # from the receipt (what was sent), the observed echo (what the vendor
+        # said) and the folded usage (what it cost). An adapter cannot forge it,
+        # and a consumer gets all three in one object rather than having to
+        # join a receipt to a usage event after the fact.
+        usage = self._terminal_usage()
         return TerminalEvent(
             status=status,
             connection=connection.name,
             runtime=connection.runtime,
             auth_mode=self.receipt.effective_auth_mode,
             reason=reason,
-            usage=self._terminal_usage(),
+            usage=usage,
             retryable=verdict.retryable,
             status_code=status_code,
             retry_after=verdict.retry_after,
+            reasoning_value=self.receipt.reasoning_value,
+            reasoning_echo=self.reasoning_echo,
+            reasoning_metric=reasoning_metric(
+                connection.runtime, usage.reasoning_output_tokens
+            ).value,
         )
 
     def timed_out(self) -> TerminalEvent:

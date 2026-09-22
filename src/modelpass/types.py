@@ -814,6 +814,39 @@ class TokenUsage:
     output_tokens: int = 0
     cached_input_tokens: int = 0
     cache_write_tokens: int = 0
+    #: Output tokens the model spent thinking -- **a subset of**
+    #: :attr:`output_tokens`, never a peer of it, and therefore **excluded from**
+    #: :attr:`total_tokens`. This is the opposite convention from
+    #: :attr:`cached_input_tokens`, which is counted separately from
+    #: :attr:`input_tokens`, and the difference is stated here because getting
+    #: it backwards double-counts every reasoning run.
+    #:
+    #: The relation was **checked, not assumed**, on each runtime that reports
+    #: one (2026-09-22):
+    #:
+    #: * ``anthropic-sdk`` -- ``usage.output_tokens_details.thinking_tokens``,
+    #:   driven live on claude-code 2.1.278: ``output_tokens 996`` of which
+    #:   ``thinking_tokens 993``, answer text ``'5'``.
+    #: * ``openai-sdk`` -- ``reasoningOutputTokens`` on ``TokenUsageBreakdown``.
+    #:   66,406 ``token_count`` records in a real Codex history: **zero** where
+    #:   reasoning exceeded output, and ``input + output == total`` throughout,
+    #:   so the vendor does not add it in either.
+    #: * ``openai-api`` / ``openai-compatible`` -- ``reasoning_tokens`` inside
+    #:   the output-token details object, which is what "details" means.
+    #: * ``google-api`` -- the **exception on the wire**:
+    #:   ``thoughts_token_count`` is a *peer* of ``candidates_token_count`` and
+    #:   the vendor's own total sums both. The adapter already folds thoughts
+    #:   into :attr:`output_tokens` for cross-runtime comparability, so by the
+    #:   time a count reaches this field the subset relation holds here too.
+    #:
+    #: ``None`` means **not reported**, and is not the same claim as ``0``.
+    #: ``anthropic-api`` is ``None`` forever -- ``anthropic`` 0.97.0's ``Usage``
+    #: has no details object at all, so a 996-token answer that thought for 993
+    #: is indistinguishable there from 996 tokens of prose. A run that genuinely
+    #: did no thinking reports ``0``. Collapsing the two would turn "the vendor
+    #: cannot tell us" into "the model did not think", which is the single
+    #: inference this field exists to prevent.
+    reasoning_output_tokens: int | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -843,6 +876,9 @@ class TokenUsage:
             output_tokens=self.output_tokens + other.output_tokens,
             cached_input_tokens=self.cached_input_tokens + other.cached_input_tokens,
             cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+            reasoning_output_tokens=_add_optional(
+                self.reasoning_output_tokens, other.reasoning_output_tokens
+            ),
         )
 
     def at_least(self, other: TokenUsage) -> TokenUsage:
@@ -861,12 +897,43 @@ class TokenUsage:
             output_tokens=max(self.output_tokens, other.output_tokens),
             cached_input_tokens=max(self.cached_input_tokens, other.cached_input_tokens),
             cache_write_tokens=max(self.cache_write_tokens, other.cache_write_tokens),
+            reasoning_output_tokens=_max_optional(
+                self.reasoning_output_tokens, other.reasoning_output_tokens
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
         data = _as_dict(self)
         data["total_tokens"] = self.total_tokens
         return data
+
+
+def _add_optional(left: int | None, right: int | None) -> int | None:
+    """Sum two reasoning counts where either may be *not reported*.
+
+    ``None`` + ``None`` is ``None``: folding two silences must not manufacture a
+    zero, which would read as "this run did no thinking". ``None`` + a number is
+    that number, because discarding a count we actually hold is the worse of the
+    two errors -- and the mixed case is an anomaly rather than a shape to design
+    around, since a runtime either reports this metric or does not.
+    """
+    if left is None and right is None:
+        return None
+    return (left or 0) + (right or 0)
+
+
+def _max_optional(left: int | None, right: int | None) -> int | None:
+    """Component-wise maximum, with ``None`` meaning *no report* rather than zero.
+
+    The same asymmetry :meth:`TokenUsage.at_least` has everywhere else: a
+    ``run_total`` that reports nothing must not drag an observed count down, so
+    a number always beats a silence.
+    """
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return max(left, right)
 
 
 # --- events --------------------------------------------------------------------
@@ -1167,6 +1234,25 @@ class TerminalEvent(_Event):
     retryable: Retryable = Retryable.UNKNOWN
     status_code: int | None = None
     retry_after: float | None = None
+    #: The effort level this run was told to use, in the runtime's own spelling,
+    #: or ``None`` when the connection stated none (2026-09-22). Copied from the
+    #: receipt onto the terminal so that *what we asked for* and *what it cost*
+    #: arrive in the same object -- a caller comparing the two across a batch
+    #: would otherwise have to keep the receipt and match it up by hand.
+    reasoning_value: str | None = None
+    #: The level the **vendor says** the run used, where a vendor says anything.
+    #: ``openai-sdk`` answers ``thread/start`` with the thread's own
+    #: ``reasoningEffort``; ``anthropic-sdk`` and ``anthropic-api`` echo nothing
+    #: at all, which was driven rather than assumed (2026-09-22) -- so ``None``
+    #: here is usually *no echo exists*, not *the run failed to report*. When it
+    #: is present and differs from :attr:`reasoning_value`, the server did not
+    #: take the level modelpass sent.
+    reasoning_echo: str | None = None
+    #: ``reported`` / ``unreported`` / ``unavailable`` -- see
+    #: :class:`~modelpass.reasoning.ReasoningMetric`. The word that says how to
+    #: read ``usage.reasoning_output_tokens``, so a consumer never has to infer
+    #: *why* a count is missing from the fact that it is.
+    reasoning_metric: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

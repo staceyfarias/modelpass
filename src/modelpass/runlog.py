@@ -153,6 +153,31 @@ class RunRecord:
     sampling_applied: Mapping[str, Any] = field(default_factory=dict)
     #: Why they disagree, one sentence per field. Empty when they agree.
     sampling_notes: tuple[str, ...] = ()
+    #: The effort dial, as the durable half of the same disclosure (2026-09-22).
+    #: All four come off the stamped terminal rather than the connection, for the
+    #: reason :meth:`from_terminal` gives: the terminal is the one object an
+    #: adapter cannot forge.
+    #:
+    #: The question they make answerable of a stored history is the one a
+    #: consumer of this library asked and could not answer -- *did asking for
+    #: more effort do anything?* Before them, a run at ``xhigh`` and a run at
+    #: ``low`` left identical ledger lines.
+    #:
+    #: * ``reasoning_value`` -- the level sent, in the runtime's own spelling.
+    #: * ``reasoning_echo`` -- the level the vendor said it used. ``None`` on
+    #:   every runtime but ``openai-sdk``, which is a fact about the vendors and
+    #:   not about the run: Anthropic echoes nothing, driven 2026-09-22.
+    #: * ``reasoning_output_tokens`` -- what the thinking cost, a **subset** of
+    #:   ``output_tokens`` and therefore already inside ``total_tokens``.
+    #:   ``None`` means no count, which is not ``0``.
+    #: * ``reasoning_metric`` -- which kind of ``None`` that is:
+    #:   ``reported`` / ``unreported`` / ``unavailable``. Written out as a word
+    #:   rather than left implicit, so a line can be read without a table of
+    #:   which runtimes have the field.
+    reasoning_value: str | None = None
+    reasoning_echo: str | None = None
+    reasoning_output_tokens: int | None = None
+    reasoning_metric: str | None = None
     #: ``RateLimitInfo.status`` -- ``allowed``, ``allowed_warning``, ``rejected``.
     allowance_status: str | None = None
     #: ``rate_limit_type`` -- which window the figures below describe.
@@ -216,6 +241,10 @@ class RunRecord:
             sampling_requested=dict(sampling_requested or {}),
             sampling_applied=dict(sampling_applied or {}),
             sampling_notes=tuple(sampling_notes),
+            reasoning_value=terminal.reasoning_value,
+            reasoning_echo=terminal.reasoning_echo,
+            reasoning_output_tokens=usage.reasoning_output_tokens,
+            reasoning_metric=terminal.reasoning_metric,
             **allowance_fields(allowance),
         )
 
@@ -240,6 +269,10 @@ class RunRecord:
             "sampling_requested": dict(self.sampling_requested),
             "sampling_applied": dict(self.sampling_applied),
             "sampling_notes": list(self.sampling_notes),
+            "reasoning_value": self.reasoning_value,
+            "reasoning_echo": self.reasoning_echo,
+            "reasoning_output_tokens": self.reasoning_output_tokens,
+            "reasoning_metric": self.reasoning_metric,
             "allowance_status": self.allowance_status,
             "allowance_window": self.allowance_window,
             "allowance_utilization": self.allowance_utilization,
@@ -499,6 +532,19 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     for field_name in ("allowance_status", "allowance_window", "allowance_resets_at"):
         value = out.get(field_name)
         out[field_name] = value if isinstance(value, str) and value else None
+    # The reasoning fields normalize toward ``None`` for the reason the
+    # allowance ones do, and one of them harder than the rest: a line written
+    # before these keys existed says nothing about what the run reasoned, and a
+    # ``0`` there would claim the model thought for no tokens. A missing
+    # ``reasoning_metric`` is left as ``None`` rather than guessed at from the
+    # runtime, because the word describes a *run* and an old line was never
+    # measured.
+    for field_name in ("reasoning_value", "reasoning_echo", "reasoning_metric"):
+        value = out.get(field_name)
+        out[field_name] = value if isinstance(value, str) and value else None
+    reasoning_tokens = out.get("reasoning_output_tokens")
+    if isinstance(reasoning_tokens, bool) or not isinstance(reasoning_tokens, int):
+        out["reasoning_output_tokens"] = None
     utilization = out.get("allowance_utilization")
     if isinstance(utilization, bool) or not isinstance(utilization, (int, float)):
         try:

@@ -191,6 +191,32 @@ def _nested(usage: Any, group: str, key: str) -> int:
     return _count(inner, key) if inner is not None else 0
 
 
+def _reported(usage: Any, key: str) -> int | None:
+    """One integer off a usage object or mapping, or ``None`` when absent.
+
+    The sibling of :func:`_count` and deliberately not a wrapper of it: a
+    reasoning count must keep *no report* distinct from *zero tokens*, which is
+    the one distinction ``or 0`` destroys. See
+    :attr:`~modelpass.types.TokenUsage.reasoning_output_tokens`.
+    """
+    if isinstance(usage, Mapping):
+        value = usage.get(key)
+    else:
+        value = getattr(usage, key, None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _reported_nested(usage: Any, group: str, key: str) -> int | None:
+    """:func:`_reported`, one level in. ``None`` when the group itself is absent."""
+    if isinstance(usage, Mapping):
+        inner = usage.get(group)
+    else:
+        inner = getattr(usage, group, None)
+    return _reported(inner, key) if inner is not None else None
+
+
 def token_usage(usage: Any) -> TokenUsage:
     """Normalize ``ResponseUsage`` onto modelpass tokens. **The subtraction is the
     point.**
@@ -212,10 +238,12 @@ def token_usage(usage: Any) -> TokenUsage:
       a zero says "this runtime does not report cache writes", which is true,
       while folding fresh input in there would claim a cost nobody paid.
     * ``output_tokens_details.reasoning_tokens`` stays **inside**
-      ``output_tokens``, untouched. That is where the vendor already counts it,
-      it is where Anthropic counts thinking output, and ``TokenUsage`` has no
-      fifth field to move it to. The number is not lost: it reaches a caller on
-      the ``vendor_event`` path with the rest of the response envelope.
+      ``output_tokens``, untouched -- and is *also* carried on
+      ``reasoning_output_tokens`` (2026-09-22), which is a subset field rather
+      than a fifth addend precisely so that this sentence stays true. Before
+      that field existed the number reached a caller only on the
+      ``vendor_event`` path, which meant the question "what did my effort
+      setting actually cost" could not be asked of the run log.
     """
     cached = _nested(usage, "input_tokens_details", "cached_tokens")
     total_input = _count(usage, "input_tokens")
@@ -224,6 +252,9 @@ def token_usage(usage: Any) -> TokenUsage:
         output_tokens=_count(usage, "output_tokens"),
         cached_input_tokens=cached,
         cache_write_tokens=0,
+        reasoning_output_tokens=_reported_nested(
+            usage, "output_tokens_details", "reasoning_tokens"
+        ),
     )
 
 

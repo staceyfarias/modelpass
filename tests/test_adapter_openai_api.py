@@ -593,9 +593,20 @@ def test_usage_puts_openais_cached_tokens_where_modelpass_keeps_them():
     )
     mapped = token_usage(usage)
     assert mapped == TokenUsage(
-        input_tokens=70, output_tokens=40, cached_input_tokens=30, cache_write_tokens=0
+        input_tokens=70,
+        output_tokens=40,
+        cached_input_tokens=30,
+        cache_write_tokens=0,
+        reasoning_output_tokens=12,
     )
-    assert mapped == anthropic_token_usage(
+    # ``anthropic-api`` reports no reasoning count at all -- ``anthropic``
+    # 0.97.0's ``Usage`` has no details object -- so the parity these two
+    # mappings owe each other is on the four counts both vendors report. The
+    # fifth is asserted against the ``None`` that says this vendor cannot tell
+    # us, rather than made to match by inventing a number.
+    from dataclasses import replace
+
+    messages_api = anthropic_token_usage(
         {
             "input_tokens": 70,
             "output_tokens": 40,
@@ -603,12 +614,15 @@ def test_usage_puts_openais_cached_tokens_where_modelpass_keeps_them():
             "cache_creation_input_tokens": 0,
         }
     )
-    # Reasoning tokens stay inside output_tokens: there is no fifth field, and
-    # subtracting them would make one runtime's output tokens mean something
-    # different from another's.
+    assert messages_api.reasoning_output_tokens is None
+    assert replace(mapped, reasoning_output_tokens=None) == messages_api
+    # Reasoning tokens stay *inside* output_tokens -- recorded as a subset, not
+    # moved out of it. Subtracting them would make one runtime's output tokens
+    # mean something different from another's, and adding them to the total
+    # would bill the same tokens twice.
     assert mapped.output_tokens == 40
     assert mapped.total_tokens == 140
-    assert mapped.billable_input_tokens == 70
+    assert mapped.reasoning_output_tokens == 12
 
 
 def test_usage_reads_a_mapping_as_well_as_a_model_and_never_raises():

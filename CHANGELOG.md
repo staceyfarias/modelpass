@@ -7,6 +7,33 @@ work landed.
 
 ### Added
 
+- **Reasoning tokens are a bucket of their own, and the effort dial is reported
+  end to end** (2026-09-22). `TokenUsage.reasoning_output_tokens` carries what a
+  run spent thinking on the five runtimes that report it — a **subset** of
+  `output_tokens`, excluded from `total_tokens`, `None` where the vendor said
+  nothing and `0` only where it said zero. `anthropic-api` is `None` forever:
+  `anthropic` 0.97.0's `Usage` has no details object, so thinking there is
+  unrecoverable from the answer's token count.
+
+  Beside it, three fields on the terminal event, on `Answer` and in
+  `runs.jsonl`: `reasoning_value` (the level sent, in the runtime's own
+  spelling), `reasoning_echo` (the level the vendor says it used — `openai-sdk`
+  alone, read off `thread/start` and compared) and `reasoning_metric`
+  (`reported` / `unreported` / `unavailable`, which says how to read a missing
+  count instead of leaving a consumer to infer why it is missing).
+
+  This answers the question a consumer of this library could not: *did asking
+  for more effort do anything?* On a Claude subscription nothing echoes the
+  level back — driven on claude-code 2.1.278, where `effort` appears in the
+  whole `stream-json` transcript once, as a slash-command name — so the
+  thinking-token count is the only evidence, and modelpass was dropping it.
+  One fixed prompt across the four levels gives median thinking tokens
+  399 / 578 / 992 / 1193: monotone in aggregate, noisy per call, and therefore
+  a batch-level signal rather than a per-run confirmation.
+
+  Existing `runs.jsonl` lines read back with `None` in all four fields, which is
+  the truth about them — they were never measured.
+
 - **Reasoning effort as one vocabulary, with the runtime's own word reported
   back** (2026-09-21). `modelpass.reasoning` carries an ordered ladder —
   `none`, `minimal`, `low`, `medium`, `high`, `xhigh` — and `plan_reasoning()`

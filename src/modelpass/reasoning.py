@@ -61,11 +61,14 @@ from .types import REASONING_EFFORTS
 
 __all__ = [
     "EFFORT_LADDER",
+    "REASONING_METRIC_FIELDS",
     "RUNTIME_EFFORTS",
     "Effort",
     "ReasoningDisposition",
+    "ReasoningMetric",
     "ReasoningPlan",
     "plan_reasoning",
+    "reasoning_metric",
     "stated_reasoning",
 ]
 
@@ -178,6 +181,74 @@ RUNTIME_EFFORTS: dict[Runtime, dict[Effort, str]] = {
         Effort.XHIGH: "xhigh",
     },
 }
+
+
+class ReasoningMetric(StrEnum):
+    """Whether this run's reasoning-token count is a number, a silence, or a void.
+
+    Three values rather than a count-or-``None``, because ``None`` alone cannot
+    say *why* there is no number, and the two reasons call for different actions
+    from a caller. A consumer sweeping effort levels can retry an
+    :attr:`UNREPORTED` run and learn something; retrying an :attr:`UNAVAILABLE`
+    one on the same connection will never produce a count no matter how many
+    times they try.
+
+    The distinction is the same one :class:`~modelpass.capabilities.Support`
+    draws between ``unsupported`` and ``unverified``: an absence somebody
+    established, against an absence nobody has looked into.
+    """
+
+    #: The runtime reported a count. ``0`` is a report -- the model thought for
+    #: no tokens -- and is not the same answer as either member below.
+    REPORTED = "reported"
+    #: This runtime does report the metric, and this run carried none. A run
+    #: stopped by a guard before usage arrived lands here, as does one on a
+    #: transport that never asked.
+    UNREPORTED = "unreported"
+    #: No such field exists on this runtime, so no run of it will ever carry
+    #: one. ``anthropic-api`` is the established case: ``anthropic`` 0.97.0's
+    #: ``Usage`` carries ``input``, ``output``, the two cache counts,
+    #: ``server_tool_use`` and ``service_tier``, and no details object of any
+    #: kind (read 2026-09-22).
+    UNAVAILABLE = "unavailable"
+
+
+#: Where each runtime's reasoning-token count comes from, in the vendor's own
+#: field name. Read off the installed SDKs and, for the two subscription
+#: runtimes, off real traffic on 2026-09-22 -- the dates and the evidence are in
+#: :attr:`~modelpass.types.TokenUsage.reasoning_output_tokens`, which is the one
+#: place the subset convention is argued.
+#:
+#: A runtime absent from this mapping reports :attr:`ReasoningMetric.UNAVAILABLE`.
+#: As with :data:`RUNTIME_EFFORTS`, that is the narrow checkable claim -- no
+#: metric is established here -- and not a claim about what the vendor ships.
+REASONING_METRIC_FIELDS: dict[Runtime, str] = {
+    # Two carriers, and neither is in the SDK's typed surface: the CLI sends
+    # ``thinkingTokens`` on ``modelUsage`` as well, and ``ModelUsage`` (a
+    # TypedDict, passed through verbatim) declares no such key. A types-only
+    # read of this runtime is a floor, not a fact -- which is why this cell
+    # rests on a live drive.
+    Runtime.ANTHROPIC_SDK: "usage.output_tokens_details.thinking_tokens",
+    Runtime.OPENAI_SDK: "tokenUsage.last.reasoningOutputTokens",
+    Runtime.OPENAI_API: "usage.output_tokens_details.reasoning_tokens",
+    Runtime.OPENAI_COMPATIBLE: "usage.completion_tokens_details.reasoning_tokens",
+    # A peer of ``candidates_token_count`` on the wire, folded into
+    # ``output_tokens`` by the adapter before it reaches ``TokenUsage``.
+    Runtime.GOOGLE_API: "usage_metadata.thoughts_token_count",
+}
+
+
+def reasoning_metric(runtime: Runtime, value: int | None) -> ReasoningMetric:
+    """Which of the three answers this run's count is.
+
+    Takes the value rather than reading it off a usage object, so the terminal
+    stamp and the run log cannot disagree about a run they both describe.
+    """
+    if value is not None:
+        return ReasoningMetric.REPORTED
+    if runtime in REASONING_METRIC_FIELDS:
+        return ReasoningMetric.UNREPORTED
+    return ReasoningMetric.UNAVAILABLE
 
 
 class ReasoningDisposition(StrEnum):

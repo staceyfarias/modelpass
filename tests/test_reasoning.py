@@ -521,3 +521,258 @@ def test_the_capability_cell_and_the_connection_key_agree():
             is Support.SUPPORTED
         )
         assert stated_reasoning(_sub(runtime)) is not None
+
+
+def _fold_for(connection):
+    """A fold wired the way the pump wires one, for terminal-stamp assertions."""
+    from modelpass._fold import RunFold
+    from modelpass.connections import Guards
+    from modelpass.guards import GuardTracker
+    from modelpass.preflight import Receipt
+    from modelpass.types import AuthMode
+
+    guards = Guards()
+    receipt = Receipt(
+        connection=connection.name,
+        runtime=connection.runtime,
+        requested_auth_mode=AuthMode.SUBSCRIPTION,
+        detected_auth_mode=AuthMode.SUBSCRIPTION,
+        reasoning_value="high",
+    )
+    return RunFold(
+        connection=connection,
+        receipt=receipt,
+        guards=guards,
+        tracker=GuardTracker(guards, connection.name),
+        deadline=None,
+    )
+
+
+# --- 11. what the run actually spent thinking -----------------------------------
+
+
+def test_a_reasoning_count_is_a_subset_of_output_and_not_added_to_the_total():
+    """The invariant every adapter's mapping owes this field.
+
+    ``cached_input_tokens`` is a peer of ``input_tokens`` and counts toward the
+    total; ``reasoning_output_tokens`` is a *part of* ``output_tokens`` and must
+    not. Getting the two conventions the same way round double-counts every
+    thinking run, which is a billing-shaped error rather than a cosmetic one.
+    """
+    from modelpass.types import TokenUsage
+
+    usage = TokenUsage(input_tokens=2, output_tokens=996, reasoning_output_tokens=993)
+    assert usage.total_tokens == 998
+    assert usage.reasoning_output_tokens <= usage.output_tokens
+
+
+def test_folding_two_silences_does_not_manufacture_a_zero():
+    """``None`` + ``None`` is ``None``: a fold must not invent a measurement."""
+    from modelpass.types import TokenUsage
+
+    silent = TokenUsage(output_tokens=5)
+    reported = TokenUsage(reasoning_output_tokens=7)
+    assert (silent + silent).reasoning_output_tokens is None
+    assert (silent + reported).reasoning_output_tokens == 7
+    # at_least is the run_total fold: a number beats a silence in both
+    # directions, for the reason the other four components take a max.
+    assert silent.at_least(reported).reasoning_output_tokens == 7
+    assert reported.at_least(silent).reasoning_output_tokens == 7
+
+
+def test_zero_thinking_and_no_report_are_different_answers():
+    """The distinction the whole field exists for, at every layer that has it."""
+    from modelpass.adapters.anthropic import token_usage
+    from modelpass.reasoning import ReasoningMetric, reasoning_metric
+
+    thought_none = token_usage(
+        {"output_tokens": 4, "output_tokens_details": {"thinking_tokens": 0}}
+    )
+    said_nothing = token_usage({"output_tokens": 4})
+    assert thought_none.reasoning_output_tokens == 0
+    assert said_nothing.reasoning_output_tokens is None
+    assert reasoning_metric(Runtime.ANTHROPIC_SDK, 0) is ReasoningMetric.REPORTED
+    assert reasoning_metric(Runtime.ANTHROPIC_SDK, None) is ReasoningMetric.UNREPORTED
+    # ...and the runtime whose vendor has no such field at all is a third thing:
+    # anthropic 0.97.0's Usage has no details object, so no run of it will ever
+    # carry one and a consumer retrying to get a count is spending for nothing.
+    assert reasoning_metric(Runtime.ANTHROPIC_API, None) is ReasoningMetric.UNAVAILABLE
+
+
+def test_every_runtime_with_an_effort_ladder_declares_its_metric_or_lacks_one():
+    """No runtime may quietly have neither answer.
+
+    A runtime that accepts an effort level must either report what the thinking
+    cost or be named as one that cannot. Otherwise a caller can set the dial and
+    never find out whether it did anything -- which is the reporting hole this
+    whole ticket started from.
+    """
+    from modelpass.reasoning import REASONING_METRIC_FIELDS, RUNTIME_EFFORTS
+
+    for runtime in RUNTIME_EFFORTS:
+        assert runtime in REASONING_METRIC_FIELDS or runtime is Runtime.ANTHROPIC_API
+
+
+def _thinking_script():
+    from modelpass.types import TextDeltaEvent, TokenUsage, UsageEvent
+
+    return [
+        TextDeltaEvent(text="hi"),
+        UsageEvent(usage=TokenUsage(output_tokens=996, reasoning_output_tokens=993)),
+    ]
+
+
+def test_the_terminal_carries_what_was_sent_and_how_to_read_the_count(tmp_path):
+    """Three answers in one object, so a batch can be read without a join."""
+    from modelpass.testing import fake_bridge
+    from modelpass.types import TerminalEvent
+
+    bridge, *_ = fake_bridge(
+        connections=[_sub(Runtime.ANTHROPIC_SDK)],
+        script=_thinking_script(),
+        home=tmp_path / "home",
+    )
+    terminal = next(
+        e for e in bridge.chat(connection="c", message="x")
+        if isinstance(e, TerminalEvent)
+    )
+    assert terminal.reasoning_value == "high"
+    assert terminal.reasoning_metric == "reported"
+    assert terminal.usage.reasoning_output_tokens == 993
+    # No vendor on this runtime echoes the level back -- driven 2026-09-22 --
+    # so the honest value is None rather than a repeat of what was sent.
+    assert terminal.reasoning_echo is None
+
+
+def test_a_runtime_that_reports_no_count_says_which_kind_of_nothing(tmp_path):
+    from modelpass.testing import fake_bridge
+    from modelpass.types import TerminalEvent, TextDeltaEvent
+
+    bridge, *_ = fake_bridge(
+        connections=[_sub(Runtime.ANTHROPIC_SDK)],
+        script=[TextDeltaEvent(text="hi")],
+        home=tmp_path / "home",
+    )
+    terminal = next(
+        e for e in bridge.chat(connection="c", message="x")
+        if isinstance(e, TerminalEvent)
+    )
+    assert terminal.usage.reasoning_output_tokens is None
+    assert terminal.reasoning_metric == "unreported"
+
+
+def test_the_run_log_keeps_the_dial_and_its_cost(tmp_path):
+    """The durable half: a stored history can be asked what effort bought."""
+    from modelpass.testing import fake_bridge
+
+    bridge, *_ = fake_bridge(
+        connections=[_sub(Runtime.ANTHROPIC_SDK)],
+        script=_thinking_script(),
+        home=tmp_path / "home",
+    )
+    bridge.ask("c", "x")
+    (record,) = bridge.run_log.read(1)
+    assert record["reasoning_value"] == "high"
+    assert record["reasoning_output_tokens"] == 993
+    assert record["reasoning_metric"] == "reported"
+    assert record["reasoning_echo"] is None
+    # The count is inside output_tokens, so the stored total must not have grown
+    # by it: the ledger and the receipt agree, or the ledger is wrong.
+    assert record["total_tokens"] == 996
+
+
+def test_an_old_log_line_reads_back_as_unmeasured_rather_than_as_zero(tmp_path):
+    """Additive keys, coerced toward None -- unlike the breakpoint pair.
+
+    A line written before this existed says nothing about what the run reasoned.
+    Reading it back as 0 would turn every historical run into evidence that the
+    model never thought, which is exactly the inference this field forbids.
+    """
+    import json
+
+    from modelpass.runlog import RunLog
+
+    path = tmp_path / "runs.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-09-01T00:00:00+00:00",
+                "connection": "c",
+                "runtime": "anthropic-sdk",
+                "auth_mode": "subscription",
+                "status": "ok",
+                "output_tokens": 996,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (record,) = RunLog(tmp_path).read(1)
+    assert record["reasoning_output_tokens"] is None
+    assert record["reasoning_metric"] is None
+
+
+def test_the_answer_a_one_shot_caller_holds_carries_all_three(tmp_path):
+    from modelpass.testing import fake_bridge
+
+    bridge, *_ = fake_bridge(
+        connections=[_sub(Runtime.ANTHROPIC_SDK)],
+        script=_thinking_script(),
+        home=tmp_path / "home",
+    )
+    answer = bridge.ask("c", "x")
+    assert answer.reasoning_value == "high"
+    assert answer.reasoning_metric == "reported"
+    assert answer.usage is not None
+    assert answer.usage.reasoning_output_tokens == 993
+
+
+def test_codexs_echo_becomes_an_event_the_fold_can_stamp():
+    """The one runtime that answers back, wired rather than merely available.
+
+    ``thread/start`` reports the thread's own ``reasoningEffort``. The adapter
+    emits it as a vendor event; the fold observes it the way it observes the
+    allowance -- on the way past, never intercepted -- and stamps it on the
+    terminal. A server that silently ignored the level now says so somewhere.
+    """
+    from modelpass.adapters.openai import _reasoning_echo_events
+    from modelpass.types import VendorEvent
+
+    class _Request:
+        connection = _sub(Runtime.OPENAI_SDK)
+
+    (disagreed,) = _reasoning_echo_events(
+        _Request(), {"thread": {"id": "t1", "reasoningEffort": "medium"}}
+    )
+    assert isinstance(disagreed, VendorEvent)
+    assert disagreed.name == "reasoning_echo"
+    assert disagreed.data["sent"] == "high"
+    assert disagreed.data["echoed"] == "medium"
+    assert "medium" in disagreed.data["note"]
+    # Agreement is silent: a note on every run is noise, and the two fields
+    # already say it.
+    (agreed,) = _reasoning_echo_events(
+        _Request(), {"thread": {"id": "t1", "reasoningEffort": "high"}}
+    )
+    assert "note" not in agreed.data
+    # No echo at all is not an error -- older servers, and the exec transport,
+    # answer nothing.
+    assert _reasoning_echo_events(_Request(), {"thread": {"id": "t1"}}) == ()
+
+
+def test_the_echo_a_fold_observed_reaches_the_terminal():
+    """The other half of the wiring: observed, then stamped."""
+    from modelpass.types import Runtime as _Runtime
+    from modelpass.types import VendorEvent
+
+    fold = _fold_for(_sub(_Runtime.OPENAI_SDK))
+    fold.feed(
+        VendorEvent(
+            runtime=_Runtime.OPENAI_SDK,
+            name="reasoning_echo",
+            data={"sent": "high", "echoed": "medium"},
+        )
+    )
+    terminal = fold.finish()
+    assert terminal.reasoning_value == "high"
+    assert terminal.reasoning_echo == "medium"

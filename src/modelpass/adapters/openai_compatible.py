@@ -214,7 +214,41 @@ def token_usage(usage: Any) -> TokenUsage:
         output_tokens=_count(usage, "completion_tokens"),
         cached_input_tokens=cached,
         cache_write_tokens=0,
+        # ``completion_tokens_details.reasoning_tokens`` is Optional on
+        # ``CompletionUsage`` (openai 2.32.0) and most compatible servers omit
+        # the group entirely, which is exactly why absent reads as ``None``
+        # here: a local Ollama that reports no reasoning has not told us the
+        # model did none.
+        reasoning_output_tokens=_reported_nested(
+            usage, "completion_tokens_details", "reasoning_tokens"
+        ),
     )
+
+
+def _reported(usage: Any, key: str) -> int | None:
+    """One integer off a usage object or mapping, or ``None`` when absent.
+
+    The sibling of :func:`_count` and deliberately not a wrapper of it: a
+    reasoning count must keep *no report* distinct from *zero tokens*, which is
+    the one distinction ``or 0`` destroys. See
+    :attr:`~modelpass.types.TokenUsage.reasoning_output_tokens`.
+    """
+    if isinstance(usage, Mapping):
+        value = usage.get(key)
+    else:
+        value = getattr(usage, key, None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _reported_nested(usage: Any, group: str, key: str) -> int | None:
+    """:func:`_reported`, one level in. ``None`` when the group itself is absent."""
+    if isinstance(usage, Mapping):
+        inner = usage.get(group)
+    else:
+        inner = getattr(usage, group, None)
+    return _reported(inner, key) if inner is not None else None
 
 
 def has_usage(usage: Any) -> bool:

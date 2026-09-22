@@ -1111,6 +1111,24 @@ class Receipt:
     #: effort field at all (checked against anthropic 0.97.0 and the effort
     #: documentation, 2026-09-21), so on that runtime this receipt is the only
     #: place the answer exists.
+    #:
+    #: **Driven on a live subscription, 2026-09-22, because a typed surface can
+    #: only rule out a typed echo.** ``claude-agent-sdk``'s ``SystemMessage``
+    #: is ``subtype`` plus an untyped ``data`` dict, so the init frame could
+    #: have carried one without any type saying so. It does not: six
+    #: ``claude -p --output-format stream-json --verbose --effort <level>``
+    #: runs on claude-code 2.1.278 put the string ``effort`` in the stream
+    #: exactly once, as a *slash-command name* in the init listing. No init
+    #: field, no ``ResultMessage`` field, nothing on the assistant frames.
+    #:
+    #: The level *is* honoured, and the only evidence is indirect --
+    #: ``usage.output_tokens_details.thinking_tokens`` on one fixed reasoning
+    #: prompt, median over 2-3 runs each: low 399, medium 578, high 992,
+    #: xhigh 1193, same answer every time. Monotone in aggregate and noisy per
+    #: call (one ``high`` run spent 643, one ``xhigh`` run 2244), so it is a
+    #: signal a caller can watch across a batch and never a per-run
+    #: confirmation. That is why this receipt says what was *sent*: on this
+    #: runtime nothing says what was *used*.
     reasoning_requested: str | None = None
     reasoning_applied: str | None = None
     reasoning_value: str | None = None

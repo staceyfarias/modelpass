@@ -1336,10 +1336,20 @@ def token_usage_from_breakdown(breakdown: Any) -> TokenUsage:
 
     Field names are camelCase on the wire and mapped one for one:
     ``inputTokens``, ``outputTokens``, ``cachedInputTokens`` (all required) and
-    ``cacheWriteInputTokens`` (optional, default 0). ``reasoningOutputTokens``
-    and ``totalTokens`` have no home on ``TokenUsage`` and are not invented into
-    one -- they ride along in the accompanying ``vendor_event`` with the rest of
-    the payload.
+    ``cacheWriteInputTokens`` (optional, default 0). ``totalTokens`` has no home
+    on ``TokenUsage`` and is not invented into one -- it rides along in the
+    accompanying ``vendor_event`` with the rest of the payload.
+
+    **``reasoningOutputTokens`` now has one** (2026-09-22), and its relation to
+    ``outputTokens`` was settled from real traffic rather than from the schema,
+    which describes neither: **66,406** ``token_count`` records across a machine's
+    ``~/.codex/sessions`` and ``archived_sessions``, 56,749 of them with a
+    non-zero count, contain **zero** rows where reasoning exceeded output, and
+    ``input_tokens + output_tokens == total_tokens`` holds in all but 151 -- and
+    those 151 are a degenerate shape with every component zero and a non-zero
+    total. So the vendor neither adds it in nor counts it apart: it is a subset
+    of output, exactly as :attr:`~modelpass.types.TokenUsage
+    .reasoning_output_tokens` requires.
 
     **``inputTokens`` is inclusive of ``cachedInputTokens``** -- verified live on
     2026-08-31, on this transport and on ``codex exec`` alike, which is why the
@@ -1378,9 +1388,23 @@ def token_usage_from_breakdown(breakdown: Any) -> TokenUsage:
         # worse failure than the over-count this line exists to fix.
         input_tokens=max(0, wire_input - cached),
         output_tokens=_as_int(breakdown.get("outputTokens")),
+        reasoning_output_tokens=_reported_int(breakdown.get("reasoningOutputTokens")),
         cached_input_tokens=cached,
         cache_write_tokens=_as_int(breakdown.get("cacheWriteInputTokens")),
     )
+
+
+def _reported_int(value: Any) -> int | None:
+    """A wire integer, or ``None`` when the field was absent.
+
+    Not :func:`_as_int`: a reasoning count of ``0`` is a report that the model
+    did not think, and an absent field is the server not saying. Collapsing
+    them would make a transport that never sends the field indistinguishable
+    from a turn that spent no reasoning tokens.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _as_int(value: Any) -> int:
