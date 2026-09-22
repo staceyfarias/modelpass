@@ -776,3 +776,99 @@ def test_the_echo_a_fold_observed_reaches_the_terminal():
     terminal = fold.finish()
     assert terminal.reasoning_value == "high"
     assert terminal.reasoning_echo == "medium"
+
+
+# --- 5. the two routes that once sent nothing ------------------------------------
+
+
+def test_the_exec_transport_carries_the_standing_level():
+    """The gap that made a receipt name a level no process ever saw.
+
+    `_with_reasoning_disclosure` is table-driven and stamps every runtime, so a
+    run on `options={'transport': 'exec'}` reported `reasoning_value` while the
+    argv carried nothing at all. `model_reasoning_effort` is the vendor's own
+    config key, reached through the `-c` layer `codex exec --help` documents.
+    """
+    from modelpass.adapters.openai import effort_config_args
+
+    assert effort_config_args(_sub(Runtime.OPENAI_SDK)) == [
+        "-c",
+        "model_reasoning_effort=high",
+    ]
+
+
+def test_a_connection_that_states_nothing_adds_no_config_override():
+    """Silence stays silence: modelpass does not pick a level for anybody."""
+    from modelpass.adapters.openai import effort_config_args
+    from modelpass.connections import Connection, CredentialRef
+    from modelpass.types import AuthMode
+
+    quiet = Connection(
+        name="c",
+        runtime=Runtime.OPENAI_SDK,
+        auth_mode=AuthMode.SUBSCRIPTION,
+        credential_ref=CredentialRef.native_login(),
+    )
+    assert effort_config_args(quiet) == []
+
+
+def test_a_config_override_is_not_a_per_turn_field():
+    """Why exec gets the standing level and still refuses a per-turn one.
+
+    The two are different things: `-c` sets the thread's default before the
+    process starts, and `TurnStartParams.effort` changes it mid-conversation.
+    Translating a per-turn request into a config override would answer a
+    question nobody asked and report it as the one they did.
+    """
+    from modelpass.adapters.openai import OpenAIAdapter
+    from modelpass.capabilities import Capability, Support
+
+    assert (
+        OpenAIAdapter._EXEC_SUPPORT[Capability.REASONING_EFFORT_PER_TURN]
+        is Support.UNSUPPORTED
+    )
+
+
+def test_the_per_turn_cell_answers_per_transport_not_per_runtime():
+    """The reason this moved out of a private set in sessions.py.
+
+    `openai-sdk` supports per-turn effort on its default transport and does not
+    on `exec`. A runtime-level lookup cannot say that; the adapter's
+    `support_for` hook can, and it is what the session refusal consults.
+    """
+    from modelpass.adapters.openai import OpenAIAdapter
+    from modelpass.capabilities import DEFAULT_REGISTRY, Capability, Support
+
+    adapter = OpenAIAdapter()
+    assert (
+        DEFAULT_REGISTRY.support(Runtime.OPENAI_SDK, Capability.REASONING_EFFORT_PER_TURN)
+        is Support.SUPPORTED
+    )
+    assert (
+        adapter.support_for(Capability.REASONING_EFFORT_PER_TURN, {"transport": "exec"})
+        is Support.UNSUPPORTED
+    )
+    assert adapter.support_for(Capability.REASONING_EFFORT_PER_TURN, {}) is None
+
+
+def test_a_session_thread_start_echo_reaches_the_stream():
+    """The echo the *session* path never emitted.
+
+    `thread/start` answers with the thread's own `reasoningEffort`, and the
+    stateless run has compared the two since the echo was wired. A session --
+    the object the whole continuity question is about -- sent a level and never
+    looked at the answer. It is held on the handle because `thread/start`
+    happens inside a non-generator, then drained onto the first turn's stream.
+    """
+    from modelpass.adapters.openai import _reasoning_echo_events
+
+    class _Request:
+        connection = _sub(Runtime.OPENAI_SDK)
+
+    (event,) = _reasoning_echo_events(
+        _Request(), {"thread": {"id": "t1", "reasoningEffort": "low"}}
+    )
+    assert event.name == "reasoning_echo"
+    assert event.data["sent"] == "high"
+    assert event.data["echoed"] == "low"
+    assert "low" in event.data["note"]

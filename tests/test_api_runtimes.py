@@ -246,6 +246,13 @@ EXPECTED_UNSUPPORTED = {
     Capability.RESUME_CARRIES_SYSTEM_PROMPT,
     Capability.TTL_CONTROL,
     Capability.SUBAGENTS,
+    # Beside the three sessions cells above, and for the same reason
+    # (2026-09-22): these runtimes hold no conversation, so there is no
+    # mid-session in which effort could be changed per turn. Not a claim that
+    # effort cannot vary between calls -- on these runtimes every call states
+    # its own level, which is a different question and is answered by
+    # ``reasoning_effort``.
+    Capability.REASONING_EFFORT_PER_TURN,
 }
 
 

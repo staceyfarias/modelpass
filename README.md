@@ -961,6 +961,8 @@ run and again at setup time, and nothing is written or spent before you have see
 | `guards_configured`, `retry` | what bounds the run, including a `retry = "never"` stance |
 | `sampling_requested`, `sampling_applied`, `sampling_notes` | what you asked for, what is actually being sent, and one sentence per field dropped or coerced |
 | `cache_breakpoints_requested`, `cache_breakpoints_honoured` | whether the cache markers you set reach the vendor |
+| `reasoning_requested`, `reasoning_applied`, `reasoning_value` | the effort you asked for, the rung actually honoured, and the vendor's own word for it |
+| `effort_cache_continuity`, `effort_cache_mechanism`, `effort_cache_reachable` | whether *changing* effort mid-conversation could keep the cached prefix on this model, by what mechanism, and whether modelpass can drive it |
 | `cache`, `ok`, `problem`, `notes` | the caching disclosure, whether this would run at all, and anything else worth saying |
 
 ### What one looks like
@@ -1085,8 +1087,8 @@ real endpoint is a `live`-marked test the owner runs, not something a changelog 
 assert. The four live files and the variables they need are listed once in
 [docs/api-and-runtimes.md](docs/api-and-runtimes.md).
 
-The table below is the short form for the two agent runtimes — nine rows of
-twenty-five.
+The table below is the short form for the two agent runtimes — eleven rows of
+twenty-six.
 
 | Capability | `anthropic-sdk` | `openai-sdk` |
 | --- | --- | --- |
@@ -1098,6 +1100,8 @@ twenty-five.
 | `graceful_cancel` | supported (`interrupt()`) | unverified; the floor is terminating the process. modelpass sends `turn/interrupt` on the app-server transport — from `cancel()` and from an abandoned session turn — and a live drive on 2026-08-31 ended a turn with `status: "interrupted"`. The cell still does not move, because the half a caller would rely on is unchecked: modelpass does not wait for the terminal that interrupt produces, and nobody has shown a thread taking another turn afterwards |
 | `structured_output` — a schema-bound answer | **supported**, native (`output_format` → `--json-schema`), and it accepts a **loose** schema: optional properties, no `additionalProperties` | **supported**, native — a per-turn `outputSchema` field on the default transport (no temp file at all) and `codex exec --output-schema` on the opt-out. Expect the Responses API's **strict** subset either way — every property in `required`, `additionalProperties: false` everywhere. That constraint is *driven* on exec and **not re-driven** on app-server, so modelpass predicts it on both rather than claiming it |
 | `sampling_controls`, `max_output_tokens` | **unsupported** — a checked absence: no `temperature`, `top_p`, `top_k` or output-length parameter exists on either CLI protocol. Passing `sampling=` is still not an error; see [Sampling controls](#sampling-controls) | **unsupported**, same evidence |
+| `reasoning_effort` — ask the model to think harder | supported (`low`…`xhigh`) | supported (`none`…`xhigh`) — see [Reasoning effort](#reasoning-effort) |
+| `reasoning_effort_per_turn` — change it mid-conversation | **unsupported** — `claude-agent-sdk` 0.2.148 reads `effort` off `ClaudeAgentOptions` when the session opens and offers no `set_effort` | **supported** — `TurnStartParams.effort`, the vendor's own per-turn field. **Unsupported on `options={"transport": "exec"}`**, which runs one process per turn with no params object; the standing level still reaches it as `-c model_reasoning_effort` |
 | `subagents` | supported | unsupported |
 | `sessions_resume` | supported | supported |
 | `sessions_list` — enumerate stored conversations | supported, scoped by working directory | **supported since 2026-08-31** — `thread/list` on the default transport: token-free, paginated, account-wide. **Unsupported on `options={"transport": "exec"}`**, which has no scriptable listing at all, only an interactive picker — and is refused there rather than answered empty, because an empty list would be a false statement about an account that may have hundreds. |
@@ -1322,6 +1326,100 @@ never guesses a model into a family, because guessing that something reasons
 sends a parameter the vendor rejects and the call stops working, while guessing
 the other way costs one line of disclosure.
 
+## Reasoning effort
+
+One dial, one vocabulary, and a receipt that says what the runtime was actually told.
+
+```python
+bridge.chat(connection="claude-sub", message="...")   # the connection's standing level
+```
+
+The level is a connection key, because on the agent runtimes it is not a per-call
+setting on the wire:
+
+```toml
+[connections.claude-sub]
+runtime = "anthropic-sdk"
+reasoning = "high"
+```
+
+The house ladder is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, ascending.
+Each runtime takes the rungs it has: `anthropic-sdk` and `anthropic-api` start at
+`low`, Gemini stops at `high`, and a rung a runtime lacks is moved to its nearest and
+**reported as moved** — never silently rounded.
+
+`ultra` and `max` are refused. `ultra` is not a depth at all on the runtimes that have
+it: it also turns on agentic execution that can spin off subagents, which is a different
+cost shape and tool surface, and nobody asking to think harder should get that as a side
+effect. `max` is refused for a weaker and stated reason — one vendor types it as a plain
+level and another types it beside `ultra`, and a name two vendors disagree about is not
+portable.
+
+**On an API runtime you can also set it per call**, through `Sampling(reasoning_effort=
+"high")`. On the two subscription runtimes you cannot: they take no sampling at all, so
+the connection key is the route, and a `Sampling` that names effort there is dropped with
+a note saying which key does work.
+
+### Did it actually do anything?
+
+Only one runtime answers back. `openai-sdk` echoes the thread's own `reasoningEffort`
+from `thread/start`, so modelpass compares what it sent against what the server says it
+is running and reports a disagreement. **Anthropic echoes nothing** — driven, not
+assumed: across six `claude -p --output-format stream-json --effort <level>` runs the
+string `effort` appears in the whole transcript once, as a slash-command name.
+
+So the evidence that a level took effect is the token count:
+
+| field | meaning |
+| --- | --- |
+| `usage.reasoning_output_tokens` | what the model spent thinking — a **subset** of `output_tokens`, already inside `total_tokens` |
+| `terminal.reasoning_metric` | `reported` / `unreported` / `unavailable`, which says how to read a missing count |
+| `terminal.reasoning_echo` | the level the vendor says it used, where any vendor says |
+
+`None` is not `0`. A `None` means the runtime reported no count; a `0` means it reported
+that the model did not think. `anthropic-api` is `None` forever — its `Usage` has no
+details object, so a 996-token answer that thought for 993 cannot be told there from 996
+tokens of prose. Every other runtime reports one.
+
+The count is noisy per call and monotone in aggregate. One fixed prompt across the four
+levels on a Claude subscription gave median thinking tokens 399 / 578 / 992 / 1193 —
+useful across a batch, useless as a per-run confirmation.
+
+### Changing effort mid-conversation
+
+```python
+session = bridge.new_chat(connection="codex-sub")
+session.send("...")                       # the connection's level
+session.send("...", reasoning="high")     # this turn and the ones after it
+```
+
+Available on `openai-sdk` over the app-server transport, the only place a vendor types a
+per-turn effort field. It is **refused, not ignored**, everywhere else — `anthropic-sdk`
+fixes effort when the session opens, and the `exec` transport runs one process per turn
+with nowhere to put an override. A turn you believe ran at a new level and did not is
+the failure that refusal exists to prevent.
+
+**It is not a promise that your cached prefix survives.** Whether a change keeps the
+cache is a per-model question with four possible answers, and the receipt carries it on
+the same run:
+
+| runtime + model | continuity |
+| --- | --- |
+| `anthropic-api` + Fable 5.1, Mythos 5.1, Opus 5 | `supported` — per-message effort, vendor-documented as cache-preserving |
+| `anthropic-api` + its other effort-capable models | `unsupported` — the vendor documents that a top-level change invalidates |
+| `openai-api` + `gpt-6-astra` | `supported` — a `configuration_update` input item |
+| `openai-sdk` + `gpt-6-astra` | `experimental` — the protocol types it, no vendor statement about the cache |
+| anything else | `unknown` — nothing established, and modelpass makes no claim |
+
+`effort_cache_reachable` currently reads `False` on every `supported` row: the vendors
+ship those mechanisms and the installed SDKs cannot express them. The vendor's guarantee
+and modelpass's ability to use it are two fields, never one.
+
+What actually happened is separate again. `terminal.effort_change_cache_preserved` is
+`True` or `False` only when a run both changed effort and reported cache counts, and
+`None` otherwise — never inferred from the capability above.
+
+
 ## Timeouts, retries, and threads
 
 Three contracts that used to be four apps' worth of workarounds. Added 2026-09-13
@@ -1526,6 +1624,12 @@ handler is awaited there too -- no thread hop, no `run_coroutine_threadsafe`.
 Added 2026-09-13 (ticket 1.13).
 
 ## Sessions, where the runtime holds the conversation
+
+> A session turn can also state its own reasoning effort —
+> `session.send(msg, reasoning="high")` — on `openai-sdk`'s default transport,
+> which is the only place a vendor types a per-turn effort field. It is refused
+> rather than ignored elsewhere. See [Reasoning effort](#reasoning-effort) for
+> what that does and does not promise about your cached prefix.
 
 `chat()` is stateless: whatever `history=` you pass is re-sent every call, which is a
 known cost because you can see it. A **session** is the other door — the runtime holds

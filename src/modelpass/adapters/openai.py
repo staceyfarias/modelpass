@@ -1997,6 +1997,34 @@ _CHAT_TOOL_OVERRIDES: tuple[tuple[str, str], ...] = (
 )
 
 
+def effort_config_args(connection: object) -> list[str]:
+    """``-c model_reasoning_effort=<level>`` for a connection that states one.
+
+    **The exec transport's only route for a level**, and the reason it needed
+    one: the app-server has ``TurnStartParams.effort``, exec has one process per
+    turn and no params object, and until 2026-09-22 that meant a run on
+    ``options={'transport': 'exec'}`` sent nothing at all while its receipt
+    named a level. The receipt is table-driven and stamps every runtime, so the
+    silence was invisible from the caller's side -- the same failure as the
+    stale string this library fixed the same week, one layer down.
+
+    ``model_reasoning_effort`` is the vendor's own config key (typed as
+    ``ReasoningEffort`` on ``openai-codex`` 0.154.0's ``NewThreadModelDefaults``
+    and on its config schema, read 2026-09-22), reached through the ``-c``
+    layer ``codex exec --help`` documents. The value is passed bare, like
+    ``web_search=disabled`` beside it: ``-c`` parses the value as TOML and falls
+    back to the raw string, and every rung here is a bare word.
+
+    **A config override is not the per-turn field**, which is why this is used
+    for the standing level only and a per-turn override on this transport is
+    refused rather than translated into one.
+    """
+    plan = stated_reasoning(connection)
+    if plan is None:
+        return []
+    return ["-c", f"model_reasoning_effort={plan.runtime_value}"]
+
+
 def chat_tool_overrides() -> list[str]:
     """``-c`` arguments that leave a Codex turn with no toolbelt of its own (D15).
 
@@ -2189,6 +2217,7 @@ class CodexSession:
         # conversation with it.
         if not request.native_tools:
             args.extend(chat_tool_overrides())
+        args.extend(effort_config_args(request.connection))
         if request.model:
             args.extend(["--model", request.model])
         args.extend(mcp_config_args(request.mcp_servers))
@@ -2557,6 +2586,11 @@ class CodexAppServerSession:
         self._thread_ready = False
         self._closed = False
         self._client: AppServerClient | None = None
+        #: Events produced by starting the thread, waiting for a turn to carry
+        #: them. ``thread/start`` happens inside a non-generator, so what it
+        #: learns -- today, the server's own ``reasoningEffort`` -- would
+        #: otherwise have nowhere to go.
+        self._pending_events: list[AgentEvent] = []
         #: Turns modelpass stopped watching -- abandoned iterators, mostly. Their
         #: notifications are still coming and must not be folded into the next
         #: turn's usage; see :meth:`_drain`.
@@ -2650,7 +2684,15 @@ class CodexAppServerSession:
         request = self._request
         params = _session_thread_start_params(request, request.project_folder)
         try:
-            return client.request("thread/start", params)
+            started = client.request("thread/start", params)
+            # The echo, held rather than yielded: this method is reached from
+            # ``_ensure_thread``, which is not a generator, and the events
+            # belong on the turn's stream. Drained by the first ``_stream_turn``
+            # after the thread exists. Without this the session -- the object
+            # the whole continuity question is about -- was the one place that
+            # sent a level and never compared it against what the server said.
+            self._pending_events.extend(_reasoning_echo_events(request, started))
+            return started
         except AppServerRequestFailed as exc:
             if not request.tools:
                 raise
@@ -2750,6 +2792,8 @@ class CodexAppServerSession:
         finished = False
         try:
             client = self._ensure_thread()
+            while self._pending_events:
+                yield self._pending_events.pop(0)
             thread_id = self._thread_id
             if not thread_id:
                 raise VendorRunFailed(
@@ -3436,6 +3480,12 @@ class OpenAIAdapter(Adapter):
         Capability.INCREMENTAL_TEXT: Support.UNSUPPORTED,
         Capability.THINKING: Support.UNVERIFIED,
         Capability.MCP_SERVERS: Support.SUPPORTED,
+        # One process per turn and no TurnStartParams to carry an override, so
+        # the per-turn dial the app-server has does not exist here (2026-09-22).
+        # The standing level still reaches exec, as
+        # ``-c model_reasoning_effort`` -- a config override is not a per-turn
+        # field, and this cell is about the second thing.
+        Capability.REASONING_EFFORT_PER_TURN: Support.UNSUPPORTED,
     }
 
     def support_for(
@@ -3523,6 +3573,7 @@ class OpenAIAdapter(Adapter):
             )
 
         args = ["exec", "--json", "--skip-git-repo-check"]
+        args.extend(effort_config_args(request.connection))
         # D23: a chat-shaped call leaves the runtime's own toolbelt off, which
         # is what Bridge.chat's docstring has always promised and what
         # anthropic-sdk has always done. Mirrors the session path's own guard

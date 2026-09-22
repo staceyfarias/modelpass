@@ -561,16 +561,6 @@ class Session:
                 timeout_reason="the turn timed out",
             )
 
-    #: Runtimes with a *per-turn* effort control, as opposed to one fixed when
-    #: the session opens. One member, and it is a fact about the vendors rather
-    #: than a gap here: ``openai-codex`` 0.154.0 types ``TurnStartParams.effort``
-    #: as "Override the reasoning effort for this turn and subsequent turns",
-    #: while ``claude-agent-sdk`` 0.2.148 reads ``ClaudeAgentOptions.effort``
-    #: once at session creation and offers no setter (both read 2026-09-22).
-    #: The exec transport is excluded by the adapter rather than here, because
-    #: the transport is chosen per session and this is a runtime-level table.
-    _PER_TURN_EFFORT: ClassVar[frozenset[Runtime]] = frozenset({Runtime.OPENAI_SDK})
-
     def _plan_effort(self, reasoning: str | Effort | None) -> ReasoningPlan | None:
         """Resolve a per-turn level, or refuse it where there is nowhere to put it.
 
@@ -587,14 +577,26 @@ class Session:
         """
         if reasoning is None:
             return None
-        if self.runtime not in self._PER_TURN_EFFORT:
+        # Asked through :meth:`_support` rather than a table here, which is
+        # where this knowledge belongs (2026-09-22). Two reasons, and the second
+        # is the one that matters: the evidence is a dated SDK read and the
+        # registry is the one place this project promises to keep those; and
+        # ``_support`` asks the *adapter* first, so a session opened on
+        # ``options={'transport': 'exec'}`` gets its own answer rather than the
+        # default transport's. A private frozenset here could not have made that
+        # distinction, and would have let a level through to a transport with
+        # nowhere to put it. ``unverified`` is a no: a runtime nobody has checked
+        # does not get a caller's level sent hopefully.
+        support = self._support(Capability.REASONING_EFFORT_PER_TURN)
+        if support is not Support.SUPPORTED:
             raise CapabilityNotSupported(
                 self.runtime.value,
                 "per-turn reasoning effort",
-                "this runtime fixes effort when the session opens and offers no "
-                "way to change it mid-conversation, so a per-turn level here "
-                "would be a setting that does nothing. State it on the "
-                "connection, or open a new session at the level you want",
+                f"reasoning_effort_per_turn reads {support.value} on this "
+                "runtime -- it fixes effort when the session opens, so a "
+                "per-turn level here would be a setting that does nothing. "
+                "State it on the connection, or open a new session at the level "
+                "you want",
             )
         return plan_reasoning(reasoning, self.runtime, name=self.connection)
 

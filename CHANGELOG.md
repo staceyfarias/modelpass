@@ -7,6 +7,45 @@ work landed.
 
 ### Added
 
+- **`reasoning_effort_per_turn`, a capability cell of its own** (2026-09-22).
+  "This runtime takes an effort setting" and "it can be changed once a
+  conversation is under way" are different questions, and most runtimes answer
+  the first yes and the second no. `supported` on `openai-sdk`'s default
+  transport, `unsupported` on `anthropic-sdk` and on `exec`, `unsupported` on
+  the four API runtimes (they hold no conversation) and `unverified` on the two
+  undriven Google ones.
+
+  It replaces a private frozenset in `sessions.py` that decided the same thing.
+  The registry is where dated SDK evidence belongs, and — the reason that
+  mattered more — the adapter's `support_for` hook can answer *per transport*,
+  which a runtime-level set could not: a session on `options={"transport":
+  "exec"}` now gets exec's own answer instead of the default transport's.
+
+- **The README documents the effort dial.** A new *Reasoning effort* section
+  covers the ladder, the two refused words, what is reportable on each runtime,
+  the thinking-token evidence, and mid-conversation changes with the continuity
+  table. The receipt table and the agent-runtime capability table gained the
+  matching rows. Every one of these fields shipped over the preceding commits
+  with nothing in the file a consumer actually reads — which is how this whole
+  sequence started.
+
+### Fixed
+
+- **The `exec` transport never sent reasoning effort** (2026-09-22). The receipt
+  is table-driven and stamps every runtime, so a run on
+  `options={"transport": "exec"}` reported `reasoning_value` while its argv
+  carried nothing. It now carries `-c model_reasoning_effort=<level>`, the
+  vendor's own config key. A *per-turn* override is still refused there: a
+  config override is not `TurnStartParams.effort`, and translating one into the
+  other would answer a question nobody asked.
+
+- **A Codex session never compared its effort against the server's echo**
+  (2026-09-22). `thread/start` answers with the thread's own `reasoningEffort`
+  and the stateless path has checked it since the echo was wired; the session
+  path — the object the whole cache-continuity question is about — sent a level
+  and never looked at the reply. The echo is now held on the handle (that call
+  happens inside a non-generator) and drained onto the first turn's stream.
+
 - **A session turn can state its own reasoning effort**, on the one runtime
   whose vendor types a per-turn field (2026-09-22).
   `session.send(message, reasoning="high")` travels as

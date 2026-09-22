@@ -179,6 +179,14 @@ class Capability(StrEnum):
     # other is the question a caller can act on. A runtime can stream thinking
     # blocks and offer no dial, which is most of them.
     REASONING_EFFORT = "reasoning_effort"
+    # And a third question about the same dial: not "is there one" but "can it
+    # be moved once a conversation is under way". A runtime can take an effort
+    # setting and still fix it when the session opens, which is most of them,
+    # so this is not implied by the cell above. It is also *not* a claim about
+    # what a change does to the prompt cache -- that is per model and lives in
+    # :func:`~modelpass.prompt_cache.effort_cache_continuity`, because two
+    # models on one runtime disagree about it.
+    REASONING_EFFORT_PER_TURN = "reasoning_effort_per_turn"
 
 
 class Support(StrEnum):
@@ -506,6 +514,49 @@ STATIC_TABLE[Runtime.GOOGLE_API][Capability.REASONING_EFFORT] = Support.SUPPORTE
 # budget. sampling_rules has routed reasoning_effort to output_config.effort on
 # this runtime since ticket 1.7.)
 STATIC_TABLE[Runtime.ANTHROPIC_API][Capability.REASONING_EFFORT] = Support.SUPPORTED
+
+# Per-turn reasoning effort (2026-09-22). A missing cell reads ``unverified``,
+# which is the right default here: nobody has looked at most of these, and the
+# two that were looked at are recorded below.
+#
+# openai-codex 0.154.0 types ``TurnStartParams.effort`` as "Override the
+# reasoning effort for this turn and subsequent turns" -- a per-turn field on
+# the transport that is this runtime's default. Held by
+# tests/test_session_effort.py, which drives a change through a session and
+# asserts what reached the handle.
+#
+# **The cell describes the default transport, the rule rows have always
+# followed.** ``options={'transport': 'exec'}`` runs one process per turn and
+# has no params object to carry an override; the adapter refuses there rather
+# than translating the level into a ``-c`` config override, which is a different
+# thing from a per-turn field.
+STATIC_TABLE[Runtime.OPENAI_SDK][Capability.REASONING_EFFORT_PER_TURN] = Support.SUPPORTED
+# claude-agent-sdk 0.2.148 reads ``ClaudeAgentOptions.effort`` when the session
+# is created; ``ClaudeSDKClient`` offers ``set_model`` and
+# ``set_permission_mode`` and no ``set_effort`` (read 2026-09-22). An absence
+# somebody established, so ``unsupported`` rather than ``unverified``.
+STATIC_TABLE[Runtime.ANTHROPIC_SDK][Capability.REASONING_EFFORT_PER_TURN] = (
+    Support.UNSUPPORTED
+)
+# The four API runtimes hold no conversation (ticket 1.8), so there is no
+# mid-session to change anything within. ``unsupported`` rather than
+# ``unverified``, on the same reading ``sessions_resume`` gets on these rows: an
+# absence established by the shape of the runtime, not one nobody has looked at.
+# It is emphatically **not** a claim that effort cannot vary between calls --
+# every call on these runtimes states its own level, which is the ordinary way
+# to use them and a different question from this cell's.
+for _api_runtime in (
+    Runtime.ANTHROPIC_API,
+    Runtime.OPENAI_API,
+    Runtime.GOOGLE_API,
+    Runtime.OPENAI_COMPATIBLE,
+):
+    STATIC_TABLE[_api_runtime][Capability.REASONING_EFFORT_PER_TURN] = Support.UNSUPPORTED
+# The two Google agent runtimes have no adapter, so nothing about them is
+# established here -- including this. ``unverified`` is the whole point of the
+# tri-state: their ``reasoning_effort`` cell reads the same way.
+for _undriven in (Runtime.GOOGLE_CLI, Runtime.GOOGLE_SDK):
+    STATIC_TABLE[_undriven][Capability.REASONING_EFFORT_PER_TURN] = Support.UNVERIFIED
 
 #: The ``google-api`` cells the adapter of ticket 1.11 moved (2026-09-13).
 #:

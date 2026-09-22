@@ -2447,6 +2447,12 @@ cannot send them yet. Reporting only the vendor's half would be the
 2026-09-22 stale-string failure inverted — a consumer designing a long cached
 session around an effort change that never happens.
 
+`reasoning_effort_per_turn` is the capability cell for this, separate from
+`reasoning_effort`: most runtimes take a level and fix it when the session
+opens. It is answered per *transport* rather than per runtime, through the
+adapter's `support_for` hook — `openai-sdk` supports it on the app-server and
+not on `exec`.
+
 **Changing effort mid-session: `session.send(message, reasoning="high")`.**
 Available on `openai-sdk` over the app-server transport, which is the only
 runtime where a vendor types a per-turn effort field —
