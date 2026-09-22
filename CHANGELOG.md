@@ -116,6 +116,25 @@ work landed.
 
 ### Fixed
 
+- **`sampling_rules` no longer says reasoning effort is unreachable on the
+  agent runtimes** (2026-09-22). It is reachable — through the connection's
+  `reasoning` key, not through `Sampling`. Two places said otherwise and a
+  consumer believed both, correctly, because both were dated and both were
+  stale: the rules `source` cited a 2026-09-13 grep proving no sampling
+  parameter reached `adapters/anthropic.py`, and the dropped-field note read
+  "reasoning_effort not supported on anthropic-sdk, dropped". `ClaudeAgentOptions
+  .effort` and `TurnStartParams.effort` were wired on 2026-09-21 and neither
+  string moved with them.
+
+  The consumer concluded effort could not be varied on a Claude subscription
+  and planned to buy an API key to run the experiment. They did not need one.
+  The citation convention worked exactly as designed — it told them what was
+  checked and when — and the fact underneath it changed without the citation
+  changing. Both strings now name the key that works; `temperature`, which
+  genuinely has no route on these runtimes, still says plainly that it is
+  dropped.
+
+
 - **A fake bridge no longer quietly becomes a real one** (2026-09-21).
   `modelpass.testing.fake_bridge` injects its scripted adapter for **one**
   runtime. A connection naming any other runtime was not unserved: the bridge

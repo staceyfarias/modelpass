@@ -456,3 +456,68 @@ def test_an_absent_echo_is_not_an_error():
 
     assert thread_reasoning_effort({"thread": {"id": "t1"}}) is None
     assert thread_reasoning_effort({}) is None
+
+
+# --- 10. the two surfaces do not contradict each other --------------------------
+
+
+def test_dropping_reasoning_from_sampling_points_at_the_key_that_works():
+    """Reported by a consumer, 2026-09-22.
+
+    They read "reasoning_effort not supported on anthropic-sdk, dropped",
+    concluded effort was unreachable on a subscription connection, and planned
+    to buy an API key to run an effort experiment. Effort is reachable there --
+    through the connection's ``reasoning`` key, not through ``Sampling``. The
+    note was true of the path and false of the runtime.
+    """
+    from modelpass.sampling_rules import plan_sampling
+    from modelpass.types import Sampling
+
+    plan = plan_sampling(
+        Sampling(reasoning_effort="medium"), Runtime.ANTHROPIC_SDK, "claude-sonnet-5"
+    )
+    note = next(n for n in plan.notes if "reasoning_effort" in n)
+    assert "'reasoning' key" in note
+    assert "not supported" not in note
+
+
+def test_a_field_with_no_other_route_still_says_plainly_that_it_is_dropped():
+    """temperature really is unreachable on this runtime; do not soften that."""
+    from modelpass.sampling_rules import plan_sampling
+    from modelpass.types import Sampling
+
+    plan = plan_sampling(
+        Sampling(temperature=0.2), Runtime.ANTHROPIC_SDK, "claude-sonnet-5"
+    )
+    assert any("temperature not supported" in n for n in plan.notes)
+
+
+def test_the_rules_source_no_longer_claims_effort_is_unreachable():
+    """The dated-citation convention worked; the fact under it moved.
+
+    The source string cited a 2026-09-13 grep proving no sampling parameter
+    reached the agent adapters. True then. ClaudeAgentOptions.effort and
+    TurnStartParams.effort were wired on 2026-09-21 and the string did not move
+    with them, so it read as authoritative and was stale -- the exact failure
+    mode dating a claim is supposed to prevent.
+    """
+    from modelpass.sampling_rules import rules_for
+
+    source = rules_for(Runtime.ANTHROPIC_SDK, "claude-sonnet-5").source
+    assert "reasoning" in source.lower()
+    assert "not dropped" in source.lower() or "NOT dropped" in source
+
+
+def test_the_capability_cell_and_the_connection_key_agree():
+    """The registry says effort is supported on the agent runtimes. It is --
+    via the connection key. That is what the cell means, and this holds the two
+    together so the next reader does not have to guess which to believe."""
+    from modelpass.capabilities import DEFAULT_REGISTRY, Capability, Support
+    from modelpass.reasoning import stated_reasoning
+
+    for runtime in (Runtime.ANTHROPIC_SDK, Runtime.OPENAI_SDK):
+        assert (
+            DEFAULT_REGISTRY.support(runtime, Capability.REASONING_EFFORT)
+            is Support.SUPPORTED
+        )
+        assert stated_reasoning(_sub(runtime)) is not None

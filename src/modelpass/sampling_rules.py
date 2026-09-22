@@ -199,18 +199,33 @@ _ALL = frozenset(SAMPLING_FIELDS)
 #: What a thinking request takes off an Anthropic adaptive-thinking call.
 _ADAPTIVE_REMOVES = frozenset({"temperature", "top_p", "top_k"})
 
-#: Agent runtimes take no sampling at all, and this is a *checked* absence
+#: Agent runtimes take no *sampling* at all, and this is a *checked* absence
 #: rather than an unexamined one: ``grep -n 'temperature|top_p|top_k|max_tokens'``
 #: over ``adapters/anthropic.py``, ``adapters/openai.py`` and
 #: ``adapters/codex_appserver.py`` returns nothing (2026-09-13), and neither CLI
 #: takes such a flag. The two agent runtimes' capability cells moved to
 #: ``unsupported`` on this evidence in ticket 1.7.
+#:
+#: **Amended 2026-09-22, and the amendment is the point of dating these.** The
+#: sentence below once said reasoning effort was unreachable here too, and a
+#: consumer read it, believed it -- correctly, on the date it carried -- and
+#: concluded they needed an API key to vary effort on a Claude subscription.
+#: They did not: ``claude-agent-sdk`` 0.2.148 has ``ClaudeAgentOptions.effort``
+#: and Codex has ``effort`` on ``TurnStartParams``, both wired on 2026-09-21,
+#: both reached from the connection's ``reasoning`` key rather than from
+#: ``Sampling``. The citation did its job; the fact under it moved and this
+#: string did not move with it.
 _AGENT_SOURCE = (
     "the two agent runtimes drive a coding-agent CLI, not a completions "
     "endpoint: no sampling parameter exists anywhere in adapters/anthropic.py, "
     "adapters/openai.py or adapters/codex_appserver.py, and neither CLI accepts "
     f"one (grep, {SAMPLING_RULES_READ}). A Sampling on these runtimes is not an "
-    "error -- every field is dropped and named on the receipt"
+    "error -- every field is dropped and named on the receipt. "
+    "**Reasoning effort is the exception and is NOT dropped**: it is reachable "
+    "here, just not through Sampling. Set the connection's 'reasoning' key and "
+    "it travels as ClaudeAgentOptions.effort or TurnStartParams.effort "
+    "(claude-agent-sdk 0.2.148, codex 0.154.0, wired 2026-09-21); the receipt "
+    "reports it on reasoning_requested / reasoning_applied / reasoning_value"
 )
 
 #: The same absence, one degree less certain: no adapter for these two exists,
@@ -583,6 +598,12 @@ def _fmt(value: Any) -> str:
     return repr(value)
 
 
+def _runtime_efforts_map():
+    from .reasoning import RUNTIME_EFFORTS
+
+    return RUNTIME_EFFORTS
+
+
 def plan_sampling(
     sampling: Sampling | None,
     runtime: Runtime | str,
@@ -617,7 +638,20 @@ def plan_sampling(
 
     for name, value in requested.items():
         if not resolved.accepts(name):
-            notes.append(f"{name} not supported on {who}, dropped")
+            # "Not supported" is true of *this path* and false of the runtime
+            # when the field is reasoning_effort: both agent runtimes take an
+            # effort, just not through Sampling. A consumer reported reading the
+            # bare note, concluding effort was unreachable on a subscription
+            # connection, and planning to buy an API key they did not need
+            # (2026-09-22). Point at the key that works.
+            if name == "reasoning_effort" and _runtime_efforts_map().get(resolved.runtime):
+                notes.append(
+                    f"reasoning_effort is not a Sampling field on {who}; set the "
+                    "connection's 'reasoning' key instead and it travels as this "
+                    "runtime's own effort option. Dropped from Sampling here"
+                )
+            else:
+                notes.append(f"{name} not supported on {who}, dropped")
             continue
         if name in resolved.forced:
             forced = resolved.forced[name]
