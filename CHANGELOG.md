@@ -7,6 +7,20 @@ work landed.
 
 ### Added
 
+- **`reasoning: none` switches thinking off on `anthropic-sdk`** (2026-09-23).
+  It used to move up to `low` and say so, which was honest and still a caller
+  who asked for no thinking getting thinking. `claude-agent-sdk` 0.2.148 has a
+  separate switch, `ClaudeAgentOptions.thinking = {"type": "disabled"}` (sent
+  as `--thinking disabled`), and `none` now travels on it with `effort` left
+  unset. `THINKING_OFF` in `modelpass.reasoning` holds which runtimes have such
+  a switch; `ReasoningPlan.option` says which option carries a plan, and the
+  receipt's `reasoning_value` reads `thinking=disabled`. `minimal` still moves
+  up to `low`: the switch is not a rung, and asking for some thinking never
+  yields none. `anthropic-api` is unchanged (`none` still moves up to `low`);
+  its `thinking` parameter has the same variant and is not wired yet.
+  Found by a consumer: one scan call at the default level spent 31,140 of its
+  34,274 output tokens thinking.
+
 - **`openai-api` echoes the effort it ran at, and modelpass now reads it**
   (2026-09-22). `Response.reasoning.effort` is populated — established by a live
   call, because `openai` 2.32.0 declaring the field established only that it
