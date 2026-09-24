@@ -61,8 +61,11 @@ from .types import REASONING_EFFORTS
 
 __all__ = [
     "EFFORT_LADDER",
+    "OPTION_EFFORT",
+    "OPTION_THINKING",
     "REASONING_METRIC_FIELDS",
     "RUNTIME_EFFORTS",
+    "THINKING_OFF",
     "Effort",
     "ReasoningDisposition",
     "ReasoningMetric",
@@ -182,6 +185,30 @@ RUNTIME_EFFORTS: dict[Runtime, dict[Effort, str]] = {
     },
 }
 
+#: Runtimes where ``none`` is a **switch** rather than a rung: thinking turned
+#: off through a separate option, in that option's own spelling. Consulted
+#: only for :attr:`Effort.NONE`, and never as a rung to round to -- a caller
+#: who asked for ``minimal`` on a runtime whose ladder starts at ``low`` has
+#: asked for *some* thinking, and is moved up to ``low`` rather than down to
+#: none at all.
+#:
+#: claude-agent-sdk 0.2.148, read 2026-09-23: ``ClaudeAgentOptions.thinking:
+#: ThinkingConfig | None`` where ``ThinkingConfig`` includes
+#: ``ThinkingConfigDisabled = {"type": "disabled"}`` (types.py), and
+#: ``_internal/transport/subprocess_cli.py`` turns it into
+#: ``--thinking disabled`` on the CLI. Before this entry, ``none`` on this
+#: runtime was moved up to ``low`` and reported -- honest, and still a caller
+#: who asked for no thinking getting thinking. Measured the day it was found
+#: (RAGauge, 2026-09-22): one call at the default level spent 31,140 of its
+#: 34,274 output tokens thinking.
+THINKING_OFF: dict[Runtime, str] = {
+    Runtime.ANTHROPIC_SDK: "disabled",
+}
+
+#: The runtime option each kind of plan travels on.
+OPTION_EFFORT = "effort"
+OPTION_THINKING = "thinking"
+
 
 class ReasoningMetric(StrEnum):
     """Whether this run's reasoning-token count is a number, a silence, or a void.
@@ -290,11 +317,25 @@ class ReasoningPlan:
     disposition: ReasoningDisposition
     #: One sentence, for a receipt or a listing. Always present.
     note: str
+    #: Which runtime option carries :attr:`runtime_value`:
+    #: :data:`OPTION_EFFORT` for a rung, :data:`OPTION_THINKING` for ``none``
+    #: on a runtime in :data:`THINKING_OFF`. Last, with a default, so no
+    #: existing construction moves (2026-09-23).
+    option: str = OPTION_EFFORT
 
     @property
     def adjusted(self) -> bool:
         """Whether modelpass had to move off the requested rung."""
         return self.disposition is ReasoningDisposition.ADJUSTED
+
+    @property
+    def wire_value(self) -> str:
+        """What a receipt says was sent: the effort in the runtime's spelling,
+        or ``thinking=<value>`` when thinking was switched instead, so a bare
+        ``disabled`` is never mistaken for an effort level."""
+        if self.option == OPTION_EFFORT:
+            return self.runtime_value
+        return f"{self.option}={self.runtime_value}"
 
 
 def plan_reasoning(
@@ -332,6 +373,22 @@ def plan_reasoning(
         raise InvalidConnection(
             f"connection {name!r}: {runtime.value} has no effort vocabulary in "
             "modelpass"
+        )
+
+    if effort is Effort.NONE and runtime in THINKING_OFF:
+        switch = THINKING_OFF[runtime]
+        return ReasoningPlan(
+            requested=effort,
+            applied=effort,
+            runtime_value=switch,
+            disposition=ReasoningDisposition.EXACT,
+            option=OPTION_THINKING,
+            note=(
+                f"reasoning effort 'none' goes to {runtime.value} as "
+                f"thinking={{'type': {switch!r}}}, not as an effort level: "
+                "this runtime's effort ladder starts at 'low', and thinking is "
+                "switched off by its own option"
+            ),
         )
 
     if effort in available:

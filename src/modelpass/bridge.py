@@ -1171,7 +1171,7 @@ class Bridge:
             notes=(*receipt.notes, *notes),
             reasoning_requested=plan.requested.value,
             reasoning_applied=plan.applied.value,
-            reasoning_value=plan.runtime_value,
+            reasoning_value=plan.wire_value,
             effort_cache_continuity=continuity.capability.value,
             effort_cache_mechanism=(
                 continuity.mechanism.value if continuity.mechanism else None

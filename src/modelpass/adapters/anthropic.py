@@ -145,7 +145,7 @@ from ..preflight import (
     check_launch_args,
     env_names_to_scrub,
 )
-from ..reasoning import stated_reasoning
+from ..reasoning import OPTION_THINKING, ReasoningPlan, stated_reasoning
 from ..runtimes import Runtime
 from ..schema import build_structured_event
 from ..tools import ToolDef
@@ -1097,6 +1097,21 @@ def build_caller_tool_server(sdk: Any, tools: Sequence[ToolDef], name: str) -> A
 _CALLER_SERVER = CALLER_TOOL_SERVER
 
 
+def _reasoning_options(plan: ReasoningPlan) -> dict[str, Any]:
+    """The ClaudeAgentOptions a resolved reasoning plan sets. One place, both
+    paths (the stateless call and the session).
+
+    A rung goes on ``effort``. ``none`` goes on ``thinking`` as
+    ``{"type": "disabled"}`` (claude-agent-sdk 0.2.148 ``ThinkingConfigDisabled``,
+    sent as ``--thinking disabled``; read 2026-09-23) and ``effort`` is left
+    unset, because this runtime has no effort below ``low`` and sending one
+    beside thinking-off would be two statements about one dial.
+    """
+    if plan.option == OPTION_THINKING:
+        return {"thinking": {"type": plan.runtime_value}}
+    return {"effort": plan.runtime_value}
+
+
 def _tool_options(sdk: Any, request: RunRequest | SessionRequest) -> dict[str, Any]:
     """The options a tool-bearing run adds. Empty for a plain D7 chat call.
 
@@ -1506,7 +1521,7 @@ def session_options(
     # carries nothing here, so the standing default would reach no wire.
     _effort = stated_reasoning(request.connection)
     if _effort is not None:
-        options_kwargs["effort"] = _effort.runtime_value
+        options_kwargs.update(_reasoning_options(_effort))
 
     for key, value in request.options.items():
         reason = _SESSION_RESERVED_OPTIONS.get(key)
@@ -2400,7 +2415,7 @@ class AnthropicAdapter(Adapter):
         # carries nothing here, so the standing default would reach no wire.
         _effort = stated_reasoning(request.connection)
         if _effort is not None:
-            options_kwargs["effort"] = _effort.runtime_value
+            options_kwargs.update(_reasoning_options(_effort))
         if request.schema is not None:
             # The runtime's own mechanism (D13). ``output_format`` becomes
             # ``--json-schema <json>`` in the transport and the answer comes back

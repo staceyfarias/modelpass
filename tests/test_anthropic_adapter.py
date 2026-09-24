@@ -590,6 +590,36 @@ def launch_options(monkeypatch, request) -> dict:
     return sdk.options_kwargs
 
 
+def _reasoning_request(connection, level) -> RunRequest:
+    connection = replace(connection, reasoning=level)
+    return RunRequest(connection=connection, messages=(Message(Role.USER, "hi"),),
+                      plan=plan_launch(connection, {}))
+
+
+def test_reasoning_none_launches_with_thinking_disabled_and_no_effort(
+    monkeypatch, subscription_connection
+):
+    """2026-09-23: 'none' used to reach the wire as effort='low'."""
+    options = launch_options(
+        monkeypatch, _reasoning_request(subscription_connection, "none"))
+    assert options["thinking"] == {"type": "disabled"}
+    assert "effort" not in options
+
+
+def test_a_reasoning_rung_launches_as_effort_and_leaves_thinking_alone(
+    monkeypatch, subscription_connection
+):
+    options = launch_options(
+        monkeypatch, _reasoning_request(subscription_connection, "low"))
+    assert options["effort"] == "low"
+    assert "thinking" not in options
+
+
+def test_no_reasoning_stated_sets_neither_option(monkeypatch, subscription_request):
+    options = launch_options(monkeypatch, subscription_request)
+    assert "effort" not in options and "thinking" not in options
+
+
 def test_a_run_removes_every_builtin_tool_not_just_the_ones_we_listed(
     monkeypatch, subscription_request
 ):

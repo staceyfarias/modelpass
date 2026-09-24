@@ -78,13 +78,19 @@ def test_google_reports_its_own_upper_case_spelling():
 
 
 def test_a_rung_below_a_runtimes_floor_is_adjusted_and_reported():
-    """claude-agent-sdk's EffortLevel has no 'none' and no 'minimal'."""
-    plan = plan_reasoning("none", Runtime.ANTHROPIC_SDK, name="c")
+    """claude-agent-sdk's EffortLevel has no 'minimal'.
+
+    REWRITTEN 2026-09-23: this used 'none', which then moved up to 'low' the
+    same way. 'none' is now thinking switched off on this runtime (see
+    test_none_switches_thinking_off_on_the_claude_agent_runtime), so the
+    below-the-floor case is held on 'minimal', which still moves up.
+    """
+    plan = plan_reasoning("minimal", Runtime.ANTHROPIC_SDK, name="c")
     assert plan.disposition is ReasoningDisposition.ADJUSTED
     assert plan.applied is Effort.LOW
     assert plan.runtime_value == "low"
     assert "moved up" in plan.note
-    assert "'none'" in plan.note and "'low'" in plan.note
+    assert "'minimal'" in plan.note and "'low'" in plan.note
 
 
 def test_a_rung_above_a_runtimes_ceiling_is_adjusted_and_reported():
@@ -97,9 +103,46 @@ def test_a_rung_above_a_runtimes_ceiling_is_adjusted_and_reported():
 
 
 def test_the_note_lists_the_ladder_that_runtime_actually_has():
-    plan = plan_reasoning("none", Runtime.ANTHROPIC_SDK, name="c")
+    # REWRITTEN 2026-09-23: 'minimal', not 'none' -- see the test above.
+    plan = plan_reasoning("minimal", Runtime.ANTHROPIC_SDK, name="c")
     for rung in RUNTIME_EFFORTS[Runtime.ANTHROPIC_SDK]:
         assert repr(rung.value) in plan.note
+
+
+# --- 3a. 'none' is a switch where a runtime has one (2026-09-23) -----------------
+
+
+def test_none_switches_thinking_off_on_the_claude_agent_runtime():
+    """claude-agent-sdk 0.2.148: ThinkingConfigDisabled, sent as --thinking disabled."""
+    from modelpass.reasoning import OPTION_THINKING
+
+    plan = plan_reasoning("none", Runtime.ANTHROPIC_SDK, name="c")
+    assert plan.disposition is ReasoningDisposition.EXACT
+    assert plan.requested is Effort.NONE and plan.applied is Effort.NONE
+    assert plan.option == OPTION_THINKING
+    assert plan.runtime_value == "disabled"
+    assert plan.wire_value == "thinking=disabled"
+    assert "thinking={'type': 'disabled'}" in plan.note
+
+
+def test_a_rung_still_travels_as_effort_and_reads_as_itself():
+    from modelpass.reasoning import OPTION_EFFORT
+
+    plan = plan_reasoning("low", Runtime.ANTHROPIC_SDK, name="c")
+    assert plan.option == OPTION_EFFORT
+    assert plan.wire_value == "low"
+
+
+def test_minimal_is_not_rounded_down_to_thinking_off():
+    """Asking for some thinking never yields none: the switch is not a rung."""
+    plan = plan_reasoning("minimal", Runtime.ANTHROPIC_SDK, name="c")
+    assert plan.applied is Effort.LOW
+
+
+def test_none_on_a_runtime_with_no_switch_still_moves_and_says_so():
+    """anthropic-api has no entry in THINKING_OFF yet: unchanged behaviour."""
+    plan = plan_reasoning("none", Runtime.ANTHROPIC_API, name="c")
+    assert plan.adjusted and plan.applied is Effort.LOW
 
 
 # --- 4. refusals -----------------------------------------------------------------
@@ -390,7 +433,7 @@ def test_the_receipt_carries_the_level_on_an_agent_runtime(tmp_path):
     assert receipts[0].reasoning_value == "high"
 
 
-def test_the_receipt_shows_an_adjustment_rather_than_hiding_it(tmp_path):
+def _receipt_for(tmp_path, level):
     from modelpass.connections import Connection, CredentialRef
     from modelpass.testing import fake_bridge
     from modelpass.types import AuthMode, ReceiptEvent, TextDeltaEvent
@@ -400,17 +443,30 @@ def test_the_receipt_shows_an_adjustment_rather_than_hiding_it(tmp_path):
         runtime=Runtime.ANTHROPIC_SDK,
         auth_mode=AuthMode.SUBSCRIPTION,
         credential_ref=CredentialRef.native_login(),
-        reasoning="none",
+        reasoning=level,
     )
     bridge, *_ = fake_bridge(
         connections=[conn], script=[TextDeltaEvent(text="hi")], home=tmp_path / "home"
     )
-    receipt = next(
+    return next(
         e.receipt for e in bridge.chat(connection="c", message="x")
         if isinstance(e, ReceiptEvent)
     )
-    assert receipt.reasoning_requested == "none"
+
+
+def test_the_receipt_shows_an_adjustment_rather_than_hiding_it(tmp_path):
+    # REWRITTEN 2026-09-23: 'minimal', not 'none' -- 'none' now switches
+    # thinking off on this runtime instead of moving up to 'low'.
+    receipt = _receipt_for(tmp_path, "minimal")
+    assert receipt.reasoning_requested == "minimal"
     assert receipt.reasoning_applied == "low"  # this runtime's floor
+
+
+def test_the_receipt_says_thinking_was_switched_off(tmp_path):
+    receipt = _receipt_for(tmp_path, "none")
+    assert receipt.reasoning_requested == "none"
+    assert receipt.reasoning_applied == "none"
+    assert receipt.reasoning_value == "thinking=disabled"
 
 
 def test_a_connection_that_states_nothing_puts_nothing_on_the_receipt(tmp_path):
