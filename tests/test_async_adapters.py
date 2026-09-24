@@ -265,8 +265,11 @@ def test_arun_is_an_async_run_that_can_be_cancelled(case):
     first = run(go())
     assert first is not None
     # ``aclose()`` is the cancel on this face, as closing the iterator is on the
-    # other one.
-    assert adapter._cancelled.is_set()
+    # other one. It cancels *this run's* state: until 2026-09-24 this read a
+    # flag on the adapter, which every concurrent run shared -- the defect
+    # tests/test_concurrent_runs.py holds. The run's own cancel is the one the
+    # stream carries.
+    assert stream._cancel.__self__.cancelled
 
 
 def test_the_async_client_gets_the_connections_own_key_and_nothing_ambient(case):

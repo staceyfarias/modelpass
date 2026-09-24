@@ -5,6 +5,39 @@ work landed.
 
 ## Unreleased
 
+### Fixed
+
+- **Concurrent runs on one bridge no longer cancel each other** (2026-09-24).
+  A bridge keeps one adapter per runtime, and every built-in adapter kept one
+  run's cancel state on itself -- a cancelled flag, and on the agent runtimes
+  the live client or process. The bridge then cancelled the adapter after every
+  run that ended on its own terminal, and the watchdog cancelled the adapter
+  when a bound expired. So with several calls in flight, one finishing (or
+  timing out) cancelled whichever run had started last. On `anthropic-sdk` it
+  interrupted that run's client and the run ended `cancelled by caller`; on
+  `openai-sdk` it flagged, and could kill, the other run's `codex` process; on
+  the four API runtimes it set a flag the other run read at its next
+  tool-round boundary. Reported by a RAG evaluation harness: 95 of 200
+  subscription judge calls lost at 4-way concurrency, sequential calls never.
+
+  Now each run owns its cancel state, and every cancel the bridge, the
+  watchdog, `aclose()` or a session makes is aimed at one run through the
+  stream it returned (`RunStream.cancel()` / `AsyncRun.cancel()` in
+  `modelpass.adapters.base`). A run that ended on its own terminal is closed
+  and not cancelled. A session turn is cancelled through its own handle, so a
+  session's timeout no longer reaches stateless calls on the same runtime (on
+  `anthropic-sdk` it previously interrupted one of those instead of the turn).
+  `Adapter.cancel()` keeps its D10 meaning for a caller holding the adapter,
+  and now cancels every run that adapter has in flight. A third-party adapter
+  whose `run()` returns a plain generator is cancelled through
+  `Adapter.cancel()` exactly as before. `tests/test_concurrent_runs.py` holds
+  all of it, with no network.
+
+  Two existing tests read the removed per-adapter attributes and were changed:
+  the app-server pair in a commit of their own, before the fix, so their new
+  form was shown to pass on the old code; `test_async_adapters.py`'s aclose
+  test in the fix itself, because the attribute it read no longer exists.
+
 ### Added
 
 - **`reasoning: none` switches thinking off on `anthropic-sdk`** (2026-09-23).

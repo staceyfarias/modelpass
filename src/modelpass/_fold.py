@@ -84,6 +84,12 @@ class EventFold:
     #: and the adapter still needs cancelling.
     exhausted: bool
 
+    #: ``True`` once the adapter itself reported a terminal. The run is over on
+    #: the vendor's side, so the pump closes the stream and cancels nothing:
+    #: there is no run left to cancel, and on a shared adapter a cancel sent
+    #: anyway has, historically, landed on somebody else's.
+    vendor_ended: bool
+
     def __init__(
         self,
         *,
@@ -99,6 +105,7 @@ class EventFold:
         self.tracker = tracker
         self.deadline = deadline
         self.exhausted = False
+        self.vendor_ended = False
         self.stopped: TerminalEvent | None = None
         #: Last wins. A run may report the allowance several times; the most
         #: recent report is the one that describes where the plan stands now.
@@ -163,6 +170,7 @@ class EventFold:
             return out
 
         if isinstance(event, TerminalEvent):
+            self.vendor_ended = True
             # The adapter reports a status and, on the API runtimes, the two
             # typed facts behind it; the bridge owns the stamp and the verdict
             # computed from them.
@@ -489,10 +497,13 @@ class CallFold:
             # cancel. The clock keeps running across a failover: one call on two
             # connections is one call, and restarting it would let a bounded
             # call take twice its bound and still report that it honoured it.
+            # Run-scoped: the pump names the leg's run once it has one, so the
+            # bound cancels that run and never the adapter every concurrent
+            # call on this runtime shares.
             if self._failed_over_from is None:
-                self.deadline.start(self.leg.adapter)
+                self.deadline.start(self.leg.adapter, run_scoped=True)
             else:
-                self.deadline.bind(self.leg.adapter)
+                self.deadline.bind(self.leg.adapter, run_scoped=True)
         return self.fold.begin()
 
     def advance(self) -> tuple[list[AgentEvent], bool]:

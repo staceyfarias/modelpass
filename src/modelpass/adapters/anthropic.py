@@ -168,7 +168,15 @@ from ..types import (
     VendorEvent,
 )
 from ._mcp_result import mcp_result_payload
-from .base import Adapter, RunRequest, SessionHandle, SessionRequest
+from .base import (
+    Adapter,
+    InFlight,
+    RunCancel,
+    RunRequest,
+    RunStream,
+    SessionHandle,
+    SessionRequest,
+)
 
 __all__ = ["AnthropicAdapter", "AnthropicSessionHandle"]
 
@@ -1723,7 +1731,10 @@ class AnthropicSessionHandle:
         loop = self._ensure_loop()
         future = asyncio.run_coroutine_threadsafe(self._drive_turn(message, items), loop)
         self._streaming = True
-        return self._drain(items, future)
+        # The turn's own cancel is this session's interrupt. A bounded turn is
+        # cancelled through it, never through the adapter, which every session
+        # and stateless call on this runtime shares (2026-09-24).
+        return RunStream(self._drain(items, future), self._interrupt)
 
     def _drain(self, items: queue.Queue[Any], future: Any) -> Iterator[AgentEvent]:
         completed = False
@@ -1933,9 +1944,11 @@ class AnthropicAdapter(Adapter):
         claude_version: VersionFn | None = None,
         auth_status: AuthStatusFn | None = None,
     ) -> None:
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._client: Any = None
-        self._cancelled = threading.Event()
+        #: The stateless runs this adapter has in flight, each with its own
+        #: cancel state, loop and client (:class:`_SdkRun`). Nothing about one
+        #: run lives on the adapter itself: a bridge shares one adapter across
+        #: every concurrent call on this runtime.
+        self._runs = InFlight()
         self._claude_version = claude_version or _default_claude_version
         self._auth_status = auth_status or _default_auth_status
         # Keyed by binary path and held for the adapter's life. A bridge keeps
@@ -2378,7 +2391,6 @@ class AnthropicAdapter(Adapter):
         sdk = self._sdk()
         plan = request.plan
         check_launch_args(self.runtime, _contributed_args(request))
-        self._cancelled.clear()
 
         partial_text = bool(request.options.get("include_partial_messages", True))
         system_prompt, prompt = split_messages(request.messages)
@@ -2481,11 +2493,15 @@ class AnthropicAdapter(Adapter):
         # produced it. Owned by the run, not the adapter, so concurrent runs
         # cannot cross-contaminate each other's correlations.
         tool_names: dict[str, str] = {}
+        # This run's cancel state, loop and client -- the same rule as
+        # ``tool_names``, learned the hard way (2026-09-24): they lived on the
+        # adapter, and one run's teardown interrupted another run's client.
+        run = _SdkRun()
+        self._runs.add(run)
 
         async def drive() -> None:
-            self._loop = asyncio.get_running_loop()
             client = sdk.ClaudeSDKClient(options=sdk.ClaudeAgentOptions(**options_kwargs))
-            self._client = client
+            run.attach(asyncio.get_running_loop(), client)
             try:
                 # The scrub is only needed while the child is being spawned: the
                 # transport snapshots os.environ inside connect().
@@ -2502,10 +2518,9 @@ class AnthropicAdapter(Adapter):
                     ):
                         items.put(event)
             finally:
+                run.detach()
                 with contextlib.suppress(Exception):
                     await client.disconnect()
-                self._client = None
-                self._loop = None
 
         def worker() -> None:
             try:
@@ -2533,7 +2548,7 @@ class AnthropicAdapter(Adapter):
                         # classify_pump_failure: the vendor's own exception
                         # types become a reported run failure, everything else
                         # stays an exception.
-                        if saw_terminal or self._cancelled.is_set():
+                        if saw_terminal or run.cancelled:
                             break
                         failure = classify_pump_failure(item)
                         if failure is item:
@@ -2542,15 +2557,24 @@ class AnthropicAdapter(Adapter):
                     if isinstance(item, TerminalEvent):
                         saw_terminal = True
                     yield item
-                if self._cancelled.is_set() and not saw_terminal:
+                if run.cancelled and not saw_terminal:
                     yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
             finally:
-                self.cancel()
+                # Only this run, and only if it had not already ended: a run
+                # that delivered its ResultMessage is finishing on its own, and
+                # interrupting it has nothing to stop. An abandoned one is
+                # interrupted so its worker can end.
+                if not saw_terminal:
+                    run.cancel()
                 thread.join(timeout=10)
+                if thread.is_alive():
+                    # The floor, if a finishing run's disconnect is stuck.
+                    run.cancel()
+                self._runs.discard(run)
                 if prompt_dir is not None:
                     shutil.rmtree(prompt_dir, ignore_errors=True)
 
-        return generate()
+        return RunStream(generate(), run.cancel)
 
     # --- sessions (D14-D17) ----------------------------------------------------
 
@@ -2691,14 +2715,46 @@ class AnthropicAdapter(Adapter):
     # --- cancellation ----------------------------------------------------------
 
     def cancel(self) -> None:
-        """Best-effort cancellation (D10).
+        """Best-effort cancellation (D10) of every stateless run in flight here.
 
-        Claude Code advertises a graceful interrupt, so this asks for one and
-        falls back to the documented floor -- tearing down the transport, which
-        terminates the child process -- if the interrupt cannot be delivered.
+        A bridge does not call this: it cancels one run through the stream
+        :meth:`run` returned. What is left is a caller holding the adapter
+        itself, for whom "cancel" can only mean all of it. Sessions are not
+        touched -- a session turn is cancelled through its own handle.
         """
-        self._cancelled.set()
-        loop, client = self._loop, self._client
+        self._runs.cancel_all()
+
+
+class _SdkRun:
+    """One stateless run's cancel state, loop and client.
+
+    Claude Code advertises a graceful interrupt, so :meth:`cancel` asks for one
+    and falls back to the documented floor -- tearing down the transport, which
+    terminates the child process -- if the interrupt cannot be delivered.
+    """
+
+    def __init__(self) -> None:
+        self._state = RunCancel()
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._client: Any = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self._state.cancelled
+
+    def attach(self, loop: asyncio.AbstractEventLoop, client: Any) -> None:
+        with self._lock:
+            self._loop, self._client = loop, client
+
+    def detach(self) -> None:
+        with self._lock:
+            self._loop, self._client = None, None
+
+    def cancel(self) -> None:
+        self._state.cancel()
+        with self._lock:
+            loop, client = self._loop, self._client
         if loop is None or client is None or loop.is_closed():
             return
         try:

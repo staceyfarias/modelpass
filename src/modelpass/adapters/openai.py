@@ -344,6 +344,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import tomllib
 from collections.abc import Callable, Container, Iterator, Mapping
@@ -387,7 +388,7 @@ from ..types import (
     VendorEvent,
 )
 from ._mcp_result import flatten_mcp_result
-from .base import Adapter, RunRequest, SessionRequest
+from .base import Adapter, InFlight, RunRequest, RunStream, SessionRequest
 from .codex_appserver import (
     THREAD_ITEMS_LIST_METHOD,
     THREAD_LIST_METHOD,
@@ -2144,6 +2145,19 @@ class CodexSession:
     # --- turns -------------------------------------------------------------------
 
     def send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
+        """One turn, as :meth:`_send` streams it, cancellable on its own.
+
+        The turn's cancel terminates this session's own ``codex exec`` process
+        -- the D10 floor -- and never goes through the adapter, whose
+        ``cancel()`` reaches the stateless runs every caller on this runtime
+        shares (2026-09-24). A bounded turn is cancelled this way.
+        """
+        return RunStream(self._send(message, effort=effort), self._cancel_turn)
+
+    def _cancel_turn(self) -> None:
+        OpenAIAdapter._terminate(self._proc)
+
+    def _send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
         """Run one turn as its own ``codex exec`` process and stream its events.
 
         The same vocabulary and failure rules as :meth:`OpenAIAdapter.run`, with
@@ -2595,6 +2609,8 @@ class CodexAppServerSession:
         #: notifications are still coming and must not be folded into the next
         #: turn's usage; see :meth:`_drain`.
         self._stale_turns: set[str] = set()
+        #: The turn being streamed right now, for :meth:`_cancel_turn`.
+        self._live_turn: AppServerTurn | None = None
         self._turns = 0
         #: **Always present, even with no tools**, unlike the stateless path.
         #: ``thread/resume`` restores a thread's persisted ``dynamicTools`` and
@@ -2743,6 +2759,21 @@ class CodexAppServerSession:
     # --- turns -------------------------------------------------------------------
 
     def send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
+        """One turn, as :meth:`_send` streams it, cancellable on its own.
+
+        The turn's cancel is ``turn/interrupt`` on this session's live turn, the
+        same polite step :meth:`_abandon` takes, and never goes through the
+        adapter, whose ``cancel()`` reaches the stateless runs every caller on
+        this runtime shares (2026-09-24). A bounded turn is cancelled this way.
+        """
+        return RunStream(self._send(message, effort=effort), self._cancel_turn)
+
+    def _cancel_turn(self) -> None:
+        turn, client = self._live_turn, self._client
+        if turn is not None and client is not None:
+            interrupt_app_server_turn(client, turn.thread_id, turn.turn_id)
+
+    def _send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
         """Run one turn on this thread and stream normalized events.
 
         ``effort`` overrides the session's standing level for this turn and,
@@ -2790,6 +2821,7 @@ class CodexAppServerSession:
         turn = AppServerTurn()
         turn.thread_id = self._thread_id
         finished = False
+        self._live_turn = turn
         try:
             client = self._ensure_thread()
             while self._pending_events:
@@ -2827,6 +2859,7 @@ class CodexAppServerSession:
                 self._id = self._thread_id
             yield self._terminal(turn.status, turn.reason, turn.usage)
         finally:
+            self._live_turn = None
             if not finished:
                 self._abandon(turn)
 
@@ -2989,12 +3022,12 @@ class OpenAIAdapter(Adapter):
         self._account_read = account_read or _default_account_read
         self._mcp_list = mcp_list or _default_mcp_list
         self._codex_version = codex_version or _default_codex_version
-        self._proc: Any = None
-        self._cancelled = False
-        #: The live app-server client and turn, for :meth:`cancel`. Set for the
-        #: length of one ``run()`` on that transport and ``None`` otherwise.
-        self._client: AppServerClient | None = None
-        self._app_turn: AppServerTurn | None = None
+        #: The stateless runs in flight, each holding its own cancelled flag,
+        #: process and app-server client (:class:`_CodexRun`). They used to be
+        #: three fields on this adapter, which a bridge shares across every
+        #: concurrent call on the runtime -- so one run's teardown flagged, or
+        #: killed, another run (2026-09-24).
+        self._runs = InFlight()
         #: ``account/read`` answers, keyed by binary *and* codex home -- two
         #: profiles on one binary are two different accounts and must never
         #: share an entry. Values are ``(monotonic timestamp, answer)``; see
@@ -3526,8 +3559,16 @@ class OpenAIAdapter(Adapter):
 
         The transport is resolved **first**, before the binary lookup, because an
         unusable ``transport`` value is a refusal and not a run outcome: nothing
-        has been launched yet and nothing was spent finding out.
+        has been launched yet and nothing was spent finding out. Both happen on
+        the first ``next()``, as they always have; what is built here is only the
+        run's own cancel state, so the stream can be cancelled alone.
         """
+        run = _CodexRun()
+        self._runs.add(run)
+        return RunStream(self._run(request, run), run.cancel)
+
+    def _run(self, request: RunRequest, run: _CodexRun) -> Iterator[AgentEvent]:
+        """:meth:`run`'s body, holding this run's state rather than the adapter's."""
         transport = resolve_transport(request.options)
         binary = self._resolve_binary(request)
         if binary is None:
@@ -3542,7 +3583,7 @@ class OpenAIAdapter(Adapter):
             return
 
         if transport == TRANSPORT_APP_SERVER:
-            yield from self._run_app_server(request, binary)
+            yield from self._run_app_server(request, binary, run)
             return
 
         if request.tools:
@@ -3641,23 +3682,25 @@ class OpenAIAdapter(Adapter):
                 cwd = str(
                     request.options.get("cwd") or tempfile.mkdtemp(prefix="modelpass-codex-")
                 )
-                self._cancelled = False
                 proc = self._spawn(argv, dict(request.plan.env), cwd)
             except OSError as exc:
                 raise VendorRunFailed(
                     f"the codex CLI at {binary!r} could not be launched: {exc}"
                 ) from exc
-            self._proc = proc
+            run.attach_proc(proc)
             # After the handle is stored, so a cancel arriving mid-write still
             # finds a process to terminate.
             _send_prompt(proc, render_prompt(request.messages))
-            yield from self._stream_run(request, proc)
+            yield from self._stream_run(request, proc, run)
         finally:
             self._terminate(proc)
-            self._proc = None
+            run.detach()
+            self._runs.discard(run)
             _remove_schema_file(schema_file)
 
-    def _stream_run(self, request: RunRequest, proc: Any) -> Iterator[AgentEvent]:
+    def _stream_run(
+        self, request: RunRequest, proc: Any, run: _CodexRun
+    ) -> Iterator[AgentEvent]:
         """Drain the CLI's JSONL stream into normalized events."""
 
         outcome = _TurnOutcome()
@@ -3666,7 +3709,7 @@ class OpenAIAdapter(Adapter):
             yield from _drain_codex_jsonl(stdout, outcome)
             status, reason = outcome.status, outcome.reason
             returncode = proc.wait()
-            if self._cancelled:
+            if run.cancelled:
                 status = TerminalStatus.CANCELLED
                 reason = "run cancelled; the in-flight turn leaves no vendor-side record"
             elif returncode != 0 and status is TerminalStatus.OK:
@@ -3703,7 +3746,9 @@ class OpenAIAdapter(Adapter):
 
     # --- run: the app-server transport (S4) --------------------------------------
 
-    def _run_app_server(self, request: RunRequest, binary: str) -> Iterator[AgentEvent]:
+    def _run_app_server(
+        self, request: RunRequest, binary: str, run: _CodexRun
+    ) -> Iterator[AgentEvent]:
         """One stateless turn over ``codex app-server``: thread, turn, drain, close.
 
         The shape of this is dictated by one live correction (2026-08-31, plan of
@@ -3763,9 +3808,7 @@ class OpenAIAdapter(Adapter):
             config_overrides=() if request.native_tools else chat_tool_overrides(),
         )
         turn = AppServerTurn()
-        self._cancelled = False
-        self._client = client
-        self._app_turn = turn
+        run.attach_client(client, turn)
         try:
             client.start()
             started = self._start_thread(client, request, cwd)
@@ -3789,11 +3832,11 @@ class OpenAIAdapter(Adapter):
                 _turn_start_params(request, turn.thread_id, history_injected=injected),
             )
             yield from self._drain_app_server(
-                client, turn, dispatcher, cancelled=lambda: self._cancelled
+                client, turn, dispatcher, cancelled=lambda: run.cancelled
             )
 
             status, reason = turn.status, turn.reason
-            if self._cancelled:
+            if run.cancelled:
                 status = TerminalStatus.CANCELLED
                 reason = (
                     "run cancelled; turn/interrupt was attempted and the app-server "
@@ -3820,8 +3863,8 @@ class OpenAIAdapter(Adapter):
                 usage=turn.usage,
             )
         finally:
-            self._client = None
-            self._app_turn = None
+            run.detach()
+            self._runs.discard(run)
             client.close()
 
     def _start_thread(
@@ -4280,6 +4323,11 @@ class OpenAIAdapter(Adapter):
         process; no terminal event will arrive from the runtime, so ``run()``
         synthesizes the ``cancelled`` terminal.
 
+        **Every stateless run in flight on this adapter** (2026-09-24). A bridge
+        never calls this to end one run: it cancels through the stream
+        :meth:`run` returned, which reaches that run's own process or client
+        (:class:`_CodexRun`). What calls this is a caller holding the adapter.
+
         Stateless runs only. A session turn is cancelled by closing the iterator
         :meth:`CodexSession.send` returned, which is the same transport-level
         floor reached through the same ``finally``; one adapter instance backs
@@ -4295,18 +4343,7 @@ class OpenAIAdapter(Adapter):
         cancelled terminal is synthesized exactly as it is on exec. Nothing
         claims ``graceful_cancel`` on this runtime until modelpass's half is
         checked too."""
-        self._cancelled = True
-        client, self._client = self._client, None
-        turn, self._app_turn = self._app_turn, None
-        if client is not None:
-            interrupt_app_server_turn(
-                client,
-                turn.thread_id if turn is not None else None,
-                turn.turn_id if turn is not None else None,
-            )
-            client.close()
-        proc, self._proc = self._proc, None
-        self._terminate(proc)
+        self._runs.cancel_all()
 
     @staticmethod
     def _terminate(proc: Any) -> None:
@@ -4318,3 +4355,56 @@ class OpenAIAdapter(Adapter):
                 proc.wait(timeout=10)
         except OSError:
             pass
+
+
+class _CodexRun:
+    """One stateless run's cancel state: the flag, and what the run is blocked in.
+
+    Exactly the three things :meth:`OpenAIAdapter.cancel` used to keep on the
+    adapter -- ``_cancelled``, ``_proc`` and the app-server client and turn --
+    now owned by the run they describe. A cancel that arrives before the process
+    or client exists is kept, and delivered the moment it is attached, so no
+    cancel is lost in the gap between "started" and "interruptible".
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.cancelled = False
+        self._proc: Any = None
+        self._client: AppServerClient | None = None
+        self._turn: AppServerTurn | None = None
+
+    def attach_proc(self, proc: Any) -> None:
+        with self._lock:
+            self._proc = proc
+            late = self.cancelled
+        if late:
+            self.cancel()
+
+    def attach_client(self, client: AppServerClient, turn: AppServerTurn) -> None:
+        with self._lock:
+            self._client, self._turn = client, turn
+            late = self.cancelled
+        if late:
+            self.cancel()
+
+    def detach(self) -> None:
+        with self._lock:
+            self._proc = None
+            self._client = None
+            self._turn = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self.cancelled = True
+            client, self._client = self._client, None
+            turn, self._turn = self._turn, None
+            proc, self._proc = self._proc, None
+        if client is not None:
+            interrupt_app_server_turn(
+                client,
+                turn.thread_id if turn is not None else None,
+                turn.turn_id if turn is not None else None,
+            )
+            client.close()
+        OpenAIAdapter._terminate(proc)

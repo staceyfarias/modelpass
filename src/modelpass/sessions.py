@@ -85,6 +85,7 @@ from .adapters.base import (
     SessionHandle,
     SessionRequest,
     close_async_run,
+    run_canceller,
     threaded_run,
 )
 from .capabilities import Capability, CapabilityRegistry, Support
@@ -501,7 +502,7 @@ class Session:
             for event in fold.begin():
                 yield event
             if deadline is not None:
-                deadline.start(self._adapter)
+                deadline.start(self._adapter, run_scoped=True)
             # The handle is synchronous on both agent runtimes, so the turn runs
             # on a worker thread and the loop waits on a queue rather than on a
             # subprocess. ``send`` is called **on that thread**: on
@@ -520,6 +521,8 @@ class Session:
                 ),
                 name=self.connection,
             )
+            if deadline is not None:
+                deadline.bind_run(stream.cancel)
             async for event in stream:
                 for out in fold.feed(event):
                     yield out
@@ -755,7 +758,10 @@ class Session:
             for event in self._announce_effort(effort):
                 yield from fold.feed(event)
             if deadline is not None:
-                deadline.start(self._adapter)
+                # Run-scoped: one adapter backs every session and every
+                # stateless call on its runtime, so the bound cancels this turn
+                # and never the adapter (2026-09-24).
+                deadline.start(self._adapter, run_scoped=True)
             # **The kwarg goes only when there is something to say.**
             # ``SessionHandle`` is a public protocol, so an adapter written
             # against the older signature is a supported thing to have; passing
@@ -768,6 +774,8 @@ class Session:
                 if effort is not None
                 else self._handle.send(message)
             )
+            if deadline is not None:
+                deadline.bind_run(run_canceller(stream, self._adapter))
             for event in stream:
                 yield from fold.feed(event)
                 if fold.done:
@@ -789,8 +797,9 @@ class Session:
                 _close(stream)
                 if deadline is not None and deadline.fired is None:
                     # Cancelled once. The watchdog has already done it where the
-                    # bound fired, and it never closes the iterator itself.
-                    self._adapter.cancel()
+                    # bound fired, and it never closes the iterator itself. This
+                    # turn's cancel, not the shared adapter's.
+                    run_canceller(stream, self._adapter)()
 
         stopped = fold.finish()
         self._finish_turn(stopped, fold)

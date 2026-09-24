@@ -1601,7 +1601,12 @@ not by a 400 halfway through a run.
   and `validate`. Each call builds its own request, its own guard tracker and its
   own stream, and shares nothing mutable, so N workers on one bridge get N
   independent answers, receipts and usage figures. The connection store and the
-  run log are guarded by their own locks. Adapters may be shared.
+  run log are guarded by their own locks. Adapters may be shared: each run
+  keeps its own cancel state, and cancelling one run -- closing its iterator,
+  or its timeout expiring -- reaches that run and no other. (Before 2026-09-24
+  it did not: a run that finished could cancel another run in flight on the same
+  runtime, and a consumer worked around it with a bridge per thread. That
+  workaround is no longer needed.)
 * **A `Session` takes one caller at a time.** It holds a conversation, a token
   tracker for the whole conversation, and a vendor handle whose turns are
   ordered. A second caller arriving mid-turn gets `SessionBusy` — raised, not

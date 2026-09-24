@@ -123,7 +123,7 @@ from ..types import (
     VendorEvent,
 )
 from ._mcp_result import ainvoke_handler, flatten_mcp_result
-from .base import RunRequest, SessionHandle, SessionRequest, native_run
+from .base import RunCancel, RunRequest, RunStream, SessionHandle, SessionRequest, native_run
 from .openai_api import (
     OpenAIAPIAdapter,
     _bare_terminal,
@@ -828,7 +828,6 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
         """
         if self.wire(request) == "responses":
             return super().run(request)
-        self._cancelled.clear()
         if not (request.model or request.connection.model):
             raise PreflightFailed(
                 self.no_model_message.format(name=request.connection.name)
@@ -842,15 +841,22 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
                 f"the {_PACKAGE} client could not be constructed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-        return self._chat_loop(client, request)
+        # This run's own cancel state (2026-09-24). It used to be one flag on
+        # the adapter, cleared by every run() and set by every teardown, so
+        # one run ending stopped whichever other run reached a round boundary.
+        cancel = RunCancel()
+        self._runs.add(cancel)
+        return RunStream(self._chat_loop(client, request, cancel), cancel.cancel)
 
-    def _chat_loop(self, client: Any, request: RunRequest) -> Iterator[AgentEvent]:
+    def _chat_loop(
+        self, client: Any, request: RunRequest, cancel: RunCancel
+    ) -> Iterator[AgentEvent]:
         messages = messages_param(request)
         by_name = {tool.name: tool for tool in request.tools}
         final_text = ""
 
         while True:
-            if self._cancelled.is_set():
+            if cancel.is_set():
                 yield _bare_terminal(
                     TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
                 )
@@ -981,7 +987,6 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
         alternative wire is not a reimplementation of Responses, it *is* the
         Responses adapter, running against this connection's base URL.
         """
-        self._cancelled.clear()
         if self.wire(request) == "responses":
             return super().arun(request)
         if not (request.model or request.connection.model):
@@ -997,10 +1002,12 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
                 f"the {_PACKAGE} async client could not be constructed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-        return native_run(self, self._achat_loop(client, request))
+        cancel = RunCancel()
+        self._runs.add(cancel)
+        return native_run(self, self._achat_loop(client, request, cancel), cancel.cancel)
 
     async def _achat_loop(
-        self, client: Any, request: RunRequest
+        self, client: Any, request: RunRequest, cancel: RunCancel
     ) -> AsyncIterator[AgentEvent]:
         """:meth:`_chat_loop` with ``await`` where it blocks. Same rounds, same events."""
         messages = messages_param(request)
@@ -1008,7 +1015,7 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
         final_text = ""
 
         while True:
-            if self._cancelled.is_set():
+            if cancel.is_set():
                 yield _bare_terminal(
                     TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
                 )

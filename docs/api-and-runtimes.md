@@ -52,7 +52,10 @@ Both doors — `Bridge.chat()` and `Session.send()` — return an
   caller holding an iterator has already passed the auth check, and the receipt
   event is that guarantee's evidence.
 * **Closing the iterator cancels the run**, best-effort, with a floor of
-  terminating the runtime process (D10).
+  terminating the runtime process (D10). **That run, and no other**: a run that
+  ends on its own terminal is not cancelled at all, and a cancel never goes
+  through the adapter, which every concurrent call on the runtime shares (see
+  §1.5b, "Cancellation is per run").
 * `schema=` adds exactly one `StructuredOutputEvent` immediately before the
   terminal. `tools=` / `mcp_servers=` add `ToolCallEvent` / `ToolResultEvent`,
   which are **observations** — the runtime executed them; you never answer one.
@@ -449,12 +452,13 @@ consumer reviews asked for the same missing sentence in three different ways.
 | `total` | the whole run's wall clock, failover legs included — one call, one clock |
 | `first_token` | the wait for the first event that is **not** the receipt |
 
-Mechanically it is a timer thread that calls the adapter's own `cancel()` and
-nothing else. That shape is taken from the two consumers who had already built it
+Mechanically it is a timer thread that cancels **the run** and nothing else --
+through the stream's own `cancel()` where the adapter returns one, and the
+adapter's `cancel()` only for an adapter that predates run-scoped cancellation. That shape is taken from the two consumers who had already built it
 (a retrieval service and a desktop agent app, each with a threading watchdog
 around a bounded call), including the part they learned the hard way: **the watchdog must not close the iterator**,
 because a generator closed from one thread while another is executing it raises
-`ValueError`. The watchdog cancels the adapter; the consuming thread, unblocked,
+`ValueError`. The watchdog cancels the run; the consuming thread, unblocked,
 does the closing. A clock checked *between* events would never fire on the case
 that matters, which is a runtime that came up and then said nothing — the hang
 a batch scraping tool works around today with `multiprocessing` and
@@ -475,6 +479,27 @@ two consumers matching these classes **by name across the MRO** keep working.
 
 A connection may carry `timeoutSeconds` as a default. A call that names its own
 bound replaces that default rather than being clamped by it.
+
+**Cancellation is per run** (2026-09-24). A bridge keeps one adapter per runtime,
+and one `Bridge` may be shared across threads, so one adapter carries every
+concurrent call on its runtime. Every cancel the bridge makes -- a closed
+iterator, `aclose()`, a guard stop, a vendor failure, an expired bound -- is
+aimed at one run through the stream that run returned (`RunStream.cancel()`,
+`AsyncRun.cancel()` in `modelpass.adapters.base`), and each built-in adapter
+keeps that run's cancel flag, client and process on the run rather than on
+itself. A run that ended on its own terminal is closed and not cancelled: there
+is nothing left to stop. A session turn is cancelled through its own handle.
+`Adapter.cancel()` remains for a caller holding the adapter, and on the built-in
+adapters it cancels every run that adapter has in flight.
+
+Until then, each adapter held one run's state and the bridge cancelled the
+adapter after every run that ended, so under concurrency a finished run cancelled
+whichever run had started last: `anthropic-sdk` interrupted that run's client,
+`openai-sdk` flagged (and could kill) its process, and the four API runtimes set
+a flag every other run read at its next tool-round boundary. A RAG evaluation
+harness lost 95 of 200 subscription judge calls to `cancelled by caller` at
+4-way concurrency. `tests/test_concurrent_runs.py` holds it, on every runtime,
+with no network.
 
 **The verdict.** Every terminal event and every error carries
 `retryable: Retryable` (`YES` / `NO` / `UNKNOWN`) plus `retry_after` where the
@@ -549,8 +574,8 @@ over their `arun()`.
 **Where the two faces legitimately differ.**
 
 * **Cancellation is `aclose()`**, where the sync contract is closing the iterator
-  (D10). It calls the adapter's `cancel()` and joins the worker thread where one
-  was used, with a bounded wait — bounded because a runtime that ignores its cancel
+  (D10). It cancels that run -- never the shared adapter -- and joins the worker
+  thread where one was used, with a bounded wait — bounded because a runtime that ignores its cancel
   must not be able to hang the loop that asked. Abandoning an async iterator without
   closing it is best effort: the run is cancelled when the object is collected, at a
   moment nobody controls. `tests/test_async_cancel.py` is where all of that is
@@ -565,7 +590,7 @@ over their `arun()`.
   API runtimes it is a
   credential lookup and a URL check, so it runs inline.
 * **A timed-out call still ends cleanly.** The 1.12 timer thread is unchanged and
-  cancels the adapter from off-loop; the teardown then joins the worker without
+  cancels the run from off-loop; the teardown then joins the worker without
   blocking the loop doing the joining.
 
 **`Adapter.arun(request)`** is concrete on the base class. The default drives

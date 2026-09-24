@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 
 from .adapters.base import Adapter
 from .types import Timeout
@@ -40,12 +41,26 @@ class Deadline:
     One deadline spans the whole call, failover included -- ``total`` means the
     run's wall clock, not a leg's -- so the adapter it points at is rebound when
     a second leg starts.
+
+    **It cancels one run, not an adapter** (2026-09-24). One adapter serves
+    every concurrent call on its runtime, so ``adapter.cancel()`` from here used
+    to reach whichever run had started last -- a timed-out call cancelled a
+    healthy neighbour and was itself left running. A caller that can name the
+    run starts the clock with ``run_scoped=True`` and then hands over that run's
+    own cancel with :meth:`bind_run`; a bound that fires in between is held and
+    delivered at the bind rather than spent on the adapter.
     """
 
     def __init__(self, timeout: Timeout) -> None:
         self._timeout = timeout
         self._lock = threading.Lock()
         self._adapter: Adapter | None = None
+        #: The run's own cancel, once the caller has a run to name.
+        self._run_cancel: Callable[[], None] | None = None
+        #: Whether this deadline cancels runs rather than adapters.
+        self._run_scoped = False
+        #: A bound fired before the run existed, and its cancel is owed.
+        self._owed = False
         self._timer: threading.Timer | None = None
         self._fired: str | None = None
         self._first_seen = False
@@ -54,17 +69,29 @@ class Deadline:
 
     # --- what the bridge drives it with ---------------------------------------
 
-    def start(self, adapter: Adapter) -> None:
-        """Begin the clock, aimed at this leg's adapter."""
+    def start(self, adapter: Adapter, *, run_scoped: bool = False) -> None:
+        """Begin the clock, aimed at this leg's adapter -- or, run-scoped, its run."""
         with self._lock:
             self._adapter = adapter
+            self._run_scoped = run_scoped
+            self._run_cancel = None
             self._started = time.monotonic()
             self._schedule()
 
-    def bind(self, adapter: Adapter) -> None:
+    def bind(self, adapter: Adapter, *, run_scoped: bool = False) -> None:
         """Aim at a second leg's adapter without restarting the clock."""
         with self._lock:
             self._adapter = adapter
+            self._run_scoped = run_scoped
+            self._run_cancel = None
+
+    def bind_run(self, cancel: Callable[[], None]) -> None:
+        """Aim at the run now in flight. Delivers a cancel the bound already owes."""
+        with self._lock:
+            self._run_cancel = cancel
+            owed, self._owed = self._owed, False
+        if owed:
+            cancel()
 
     def saw_event(self) -> None:
         """Record the first non-receipt event, retiring the first-token bound."""
@@ -133,9 +160,18 @@ class Deadline:
             if self._fired is not None or self._stopped:
                 return
             self._fired = which
-            adapter = self._adapter
+            target: Callable[[], None] | None
+            if self._run_cancel is not None:
+                target = self._run_cancel
+            elif self._run_scoped:
+                # No run to name yet. Never the adapter: that would cancel every
+                # other call sharing it. The bind delivers it instead.
+                self._owed = True
+                target = None
+            else:
+                target = self._adapter.cancel if self._adapter is not None else None
         # Outside the lock, deliberately: ``cancel()`` on a real adapter
         # terminates a process or closes a transport, and holding a lock across
         # somebody else's teardown is how a watchdog becomes the hang.
-        if adapter is not None:
-            adapter.cancel()
+        if target is not None:
+            target()

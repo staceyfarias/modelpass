@@ -86,6 +86,7 @@ import asyncio
 import queue
 import threading
 import time
+import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Protocol, runtime_checkable
@@ -101,11 +102,16 @@ from ..types import AgentEvent, Message, Sampling, SessionInfo, SessionKind, Tex
 __all__ = [
     "Adapter",
     "AsyncRun",
+    "InFlight",
+    "RunCancel",
     "RunRequest",
+    "RunStream",
     "SessionHandle",
     "SessionRequest",
+    "cancel_run",
     "close_async_run",
     "native_run",
+    "run_canceller",
     "threaded_run",
 ]
 
@@ -881,14 +887,158 @@ class Adapter(abc.ABC):
         )
 
     def cancel(self) -> None:
-        """Best-effort cancellation (D10).
+        """Best-effort cancellation (D10) of **every** run in flight on this adapter.
 
         The documented floor is "terminate the process". Closing the iterator
         returned by :meth:`run` is the transport-level equivalent and is what the
         bridge does; runtimes with a graceful interrupt override this and are
         marked ``graceful_cancel`` in the capability registry.
+
+        **One adapter serves every call on its runtime** (a bridge keeps one per
+        runtime, and R7 says it may be shared across threads), so this method
+        cannot know which of several concurrent runs a caller means, and the
+        bridge no longer calls it to end one run. A run is cancelled through the
+        stream :meth:`run` returned: an adapter whose runs can be told apart
+        returns a :class:`RunStream`, whose ``cancel()`` reaches that run alone
+        (:func:`cancel_run`). This method remains for a caller holding the
+        adapter itself, and on the built-in adapters it cancels all of their
+        in-flight runs -- which, for a caller who started one, is that one.
+
+        Until 2026-09-24 the built-in adapters kept one run's cancel state on
+        the instance and the bridge called this after every run that ended, so
+        under concurrency a finished run cancelled whichever run had started
+        last (reported by a RAG evaluation harness: 95 of 200 judge calls lost
+        to ``cancelled by caller``). ``tests/test_concurrent_runs.py`` holds it.
         """
         return None
+
+
+class RunCancel:
+    """One run's cancel state, owned by that run and by nothing else.
+
+    The minimum every adapter needs: a flag the run checks, and optionally a
+    hook that interrupts whatever the run is blocked in (a vendor client, a
+    child process). The hook is registered by the run once it has something to
+    interrupt, and a cancel that arrives first is delivered the moment it does,
+    so a cancel can never land between "started" and "interruptible" and be
+    lost.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._hooks: list[Callable[[], None]] = []
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def is_set(self) -> bool:
+        """``threading.Event`` spelling, so a run's checks read as they did."""
+        return self._event.is_set()
+
+    def on_cancel(self, hook: Callable[[], None]) -> None:
+        """Run ``hook`` when this run is cancelled -- now, if it already was."""
+        with self._lock:
+            if not self._event.is_set():
+                self._hooks.append(hook)
+                return
+        hook()
+
+    def cancel(self) -> None:
+        """Set the flag and fire the hooks. Safe from any thread, and repeatable."""
+        with self._lock:
+            self._event.set()
+            hooks = list(self._hooks)
+        # Outside the lock: a hook interrupts a vendor client or kills a process,
+        # and holding a lock across somebody else's teardown is how a cancel
+        # becomes the hang.
+        for hook in hooks:
+            try:
+                hook()
+            except Exception:
+                continue
+
+
+class InFlight:
+    """The runs an adapter currently has in flight, for :meth:`Adapter.cancel`.
+
+    Weakly held: a run whose stream was dropped without ever being started never
+    reaches the ``finally`` that would remove it, and must not be kept alive --
+    or cancelled later -- because this set remembered it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._runs: weakref.WeakSet[Any] = weakref.WeakSet()
+
+    def add(self, run: Any) -> None:
+        with self._lock:
+            self._runs.add(run)
+
+    def discard(self, run: Any) -> None:
+        with self._lock:
+            self._runs.discard(run)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._runs)
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            runs = list(self._runs)
+        for run in runs:
+            run.cancel()
+
+
+class RunStream(Iterator[AgentEvent]):
+    """One run's event stream, carrying the cancel for that run alone.
+
+    What an adapter's :meth:`Adapter.run` returns when it can tell its runs
+    apart. Iterating and ``close()`` behave exactly as the wrapped generator's
+    do; ``cancel()`` is the addition, and it is safe to call from another thread
+    -- the watchdog's -- where ``close()`` is not (a generator closed while
+    another thread is executing it raises ``ValueError``).
+    """
+
+    def __init__(self, events: Iterator[AgentEvent], cancel: Callable[[], None]) -> None:
+        self._events = events
+        self._cancel = cancel
+
+    def __iter__(self) -> RunStream:
+        return self
+
+    def __next__(self) -> AgentEvent:
+        return next(self._events)
+
+    def close(self) -> None:
+        close = getattr(self._events, "close", None)
+        if callable(close):
+            close()
+
+    def cancel(self) -> None:
+        self._cancel()
+
+
+def run_canceller(stream: Any, adapter: Adapter) -> Callable[[], None]:
+    """The cancel that reaches this stream's run, and no other.
+
+    A stream that carries its own ``cancel()`` (:class:`RunStream`,
+    :class:`AsyncRun`) answers for itself. A plain generator from an adapter
+    that predates run-scoped cancellation falls back to :meth:`Adapter.cancel`,
+    which is exactly what the bridge called before -- correct for an adapter
+    that carries one run at a time, and no worse than it was for one that does
+    not.
+    """
+    cancel = getattr(stream, "cancel", None)
+    if callable(cancel):
+        return cancel
+    return adapter.cancel
+
+
+def cancel_run(stream: Any, adapter: Adapter) -> None:
+    """Cancel the run behind ``stream`` -- see :func:`run_canceller`."""
+    run_canceller(stream, adapter)()
 
 
 class AsyncRun:
@@ -911,6 +1061,14 @@ class AsyncRun:
     async def aclose(self, *, cancel: bool = True) -> None:
         raise NotImplementedError
 
+    def cancel(self) -> None:
+        """Cancel this run and no other, without closing it (see :class:`RunStream`).
+
+        Synchronous and safe from any thread, because the watchdog calls it
+        from a timer thread while the loop is blocked awaiting the next event.
+        """
+        raise NotImplementedError
+
 
 class _NativeRun(AsyncRun):
     """An adapter's own async generator, wearing the :class:`AsyncRun` contract.
@@ -920,20 +1078,29 @@ class _NativeRun(AsyncRun):
     borrowed.
     """
 
-    def __init__(self, adapter: Adapter, events: AsyncIterator[AgentEvent]) -> None:
+    def __init__(
+        self,
+        adapter: Adapter,
+        events: AsyncIterator[AgentEvent],
+        cancel: Callable[[], None] | None = None,
+    ) -> None:
         self._adapter = adapter
         self._events = events
+        self._cancel = cancel if cancel is not None else adapter.cancel
         self._closed = False
 
     async def __anext__(self) -> AgentEvent:
         return await self._events.__anext__()
+
+    def cancel(self) -> None:
+        self._cancel()
 
     async def aclose(self, *, cancel: bool = True) -> None:
         if self._closed:
             return
         self._closed = True
         if cancel:
-            self._adapter.cancel()
+            self._cancel()
         closer = getattr(self._events, "aclose", None)
         if callable(closer):
             await closer()
@@ -963,9 +1130,18 @@ async def close_async_run(
         adapter.cancel()
 
 
-def native_run(adapter: Adapter, events: AsyncIterator[AgentEvent]) -> AsyncRun:
-    """An adapter's own async stream, as the object :meth:`Adapter.arun` promises."""
-    return _NativeRun(adapter, events)
+def native_run(
+    adapter: Adapter,
+    events: AsyncIterator[AgentEvent],
+    cancel: Callable[[], None] | None = None,
+) -> AsyncRun:
+    """An adapter's own async stream, as the object :meth:`Adapter.arun` promises.
+
+    ``cancel`` is the run's own cancel (a :class:`RunCancel`'s). Without one the
+    run falls back to :meth:`Adapter.cancel`, which on a shared adapter reaches
+    every run it has in flight.
+    """
+    return _NativeRun(adapter, events, cancel)
 
 
 def threaded_run(
@@ -987,10 +1163,43 @@ def threaded_run(
 _DONE = object()
 
 
+class _InnerRun:
+    """The sync stream a :class:`_ThreadedRun`'s worker is driving, once it exists.
+
+    ``start()`` runs on the worker, so the stream appears some time after the
+    caller could already want it cancelled; a cancel that arrives first is held
+    and delivered the moment it does. Its own object, rather than fields on the
+    :class:`_ThreadedRun`, so the worker holds no reference to the run that
+    started it (see :meth:`_ThreadedRun._start`).
+    """
+
+    def __init__(self, adapter: Adapter) -> None:
+        self._adapter = adapter
+        self._lock = threading.Lock()
+        self._stream: Iterator[AgentEvent] | None = None
+        self._pending = False
+
+    def started(self, stream: Iterator[AgentEvent]) -> None:
+        with self._lock:
+            self._stream = stream
+            pending, self._pending = self._pending, False
+        if pending:
+            cancel_run(stream, self._adapter)
+
+    def cancel(self) -> None:
+        with self._lock:
+            stream = self._stream
+            if stream is None:
+                self._pending = True
+                return
+        cancel_run(stream, self._adapter)
+
+
 def _drive(
     start: Callable[[], Iterator[AgentEvent]],
     out: queue.Queue[Any],
     stop: threading.Event,
+    inner: _InnerRun | None = None,
 ) -> None:
     """One run, on one worker thread, feeding one bounded queue.
 
@@ -1013,6 +1222,8 @@ def _drive(
     stream: Iterator[AgentEvent] | None = None
     try:
         stream = start()
+        if inner is not None:
+            inner.started(stream)
         for event in stream:
             if stop.is_set():
                 break
@@ -1071,6 +1282,9 @@ class _ThreadedRun(AsyncRun):
         self._adapter = adapter
         self._start_stream = start
         self._name = name
+        #: The run the worker is driving, so a cancel reaches that run rather
+        #: than every run on a shared adapter.
+        self._inner = _InnerRun(adapter)
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=self.MAX_PENDING)
         self._stop = threading.Event()
         self._started = False
@@ -1113,8 +1327,11 @@ class _ThreadedRun(AsyncRun):
         # already cancelled, and a second cancel would terminate a process the
         # runtime may by then have replaced.
         if cancel:
-            self._adapter.cancel()
+            self._inner.cancel()
         await asyncio.to_thread(self._drain_and_join)
+
+    def cancel(self) -> None:
+        self._inner.cancel()
 
     def __del__(self) -> None:  # pragma: no cover - timing depends on the collector
         """A consumer who walked away without ``aclose()`` still stops the worker.
@@ -1129,7 +1346,7 @@ class _ThreadedRun(AsyncRun):
         if self._started and not self._finished:
             self._stop.set()
             try:
-                self._adapter.cancel()
+                self._inner.cancel()
             except Exception:
                 return
 
@@ -1144,7 +1361,7 @@ class _ThreadedRun(AsyncRun):
         # three things the worker needs and nothing else.
         self._thread = threading.Thread(
             target=_drive,
-            args=(self._start_stream, self._queue, self._stop),
+            args=(self._start_stream, self._queue, self._stop, self._inner),
             name=f"modelpass-arun-{self._name}",
             daemon=True,
         )

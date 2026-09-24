@@ -100,7 +100,6 @@ import importlib
 import importlib.util
 import inspect
 import json
-import threading
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, ClassVar
@@ -150,7 +149,16 @@ from ..types import (
     VendorEvent,
 )
 from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
-from .base import Adapter, RunRequest, SessionHandle, SessionRequest, native_run
+from .base import (
+    Adapter,
+    InFlight,
+    RunCancel,
+    RunRequest,
+    RunStream,
+    SessionHandle,
+    SessionRequest,
+    native_run,
+)
 
 __all__ = ["SDK_VERSION_READ", "OpenAIAPIAdapter", "token_usage"]
 
@@ -839,7 +847,9 @@ class OpenAIAPIAdapter(Adapter):
         self._async_client_factory = async_client_factory or _default_async_client
         self._env = env
         self._secrets = secrets
-        self._cancelled = threading.Event()
+        #: The runs in flight, each with its own cancel state. Nothing about one
+        #: run lives on the adapter: a bridge shares it across concurrent calls.
+        self._runs = InFlight()
 
     def bind_resolution(
         self, *, env: Mapping[str, str] | None, secrets: Any = None
@@ -1057,7 +1067,6 @@ class OpenAIAPIAdapter(Adapter):
         that no longer resolves, and a run with no model anywhere. Neither is a
         vendor failure, so neither is a terminal event.
         """
-        self._cancelled.clear()
         if not (request.model or request.connection.model):
             raise PreflightFailed(
                 self.no_model_message.format(name=request.connection.name)
@@ -1070,15 +1079,20 @@ class OpenAIAPIAdapter(Adapter):
             raise VendorRunFailed(
                 f"the {_PACKAGE} client could not be constructed: {type(exc).__name__}: {exc}"
             ) from exc
-        return self._loop(client, request)
+        # This run's own cancel state (2026-09-24). It used to be one flag on
+        # the adapter, cleared by every run() and set by every teardown, so
+        # one run ending stopped whichever other run reached a round boundary.
+        cancel = RunCancel()
+        self._runs.add(cancel)
+        return RunStream(self._loop(client, request, cancel), cancel.cancel)
 
-    def _loop(self, client: Any, request: RunRequest) -> Iterator[AgentEvent]:
+    def _loop(self, client: Any, request: RunRequest, cancel: RunCancel) -> Iterator[AgentEvent]:
         items = input_items(request)
         by_name = {tool.name: tool for tool in request.tools}
         final_text = ""
 
         while True:
-            if self._cancelled.is_set():
+            if cancel.is_set():
                 yield _bare_terminal(
                     TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
                 )
@@ -1167,7 +1181,6 @@ class OpenAIAPIAdapter(Adapter):
         loop that called ``achat``. :meth:`run` is unchanged and is not
         re-implemented over this.
         """
-        self._cancelled.clear()
         if not (request.model or request.connection.model):
             raise PreflightFailed(
                 self.no_model_message.format(name=request.connection.name)
@@ -1181,9 +1194,13 @@ class OpenAIAPIAdapter(Adapter):
                 f"the {_PACKAGE} async client could not be constructed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-        return native_run(self, self.aloop(client, request))
+        cancel = RunCancel()
+        self._runs.add(cancel)
+        return native_run(self, self.aloop(client, request, cancel), cancel.cancel)
 
-    async def aloop(self, client: Any, request: RunRequest) -> AsyncIterator[AgentEvent]:
+    async def aloop(
+        self, client: Any, request: RunRequest, cancel: RunCancel
+    ) -> AsyncIterator[AgentEvent]:
         """:meth:`_loop` with ``await`` where it blocks. Same rounds, same events.
 
         Public-ish rather than underscored because ``openai-compatible``
@@ -1195,7 +1212,7 @@ class OpenAIAPIAdapter(Adapter):
         final_text = ""
 
         while True:
-            if self._cancelled.is_set():
+            if cancel.is_set():
                 yield _bare_terminal(
                     TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
                 )
@@ -1300,8 +1317,12 @@ class OpenAIAPIAdapter(Adapter):
         documents. This flag is the graceful half: a loop that is between rounds
         stops there and reports ``cancelled`` rather than spending another round
         first.
+
+        **Every run in flight on this adapter.** A bridge cancels one run through
+        the stream :meth:`run` returned, never through this method; what calls
+        this is a caller holding the adapter, for whom there is no other meaning.
         """
-        self._cancelled.set()
+        self._runs.cancel_all()
 
     # --- sessions: refused, and the refusal says what to use instead ------------
 

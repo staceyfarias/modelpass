@@ -82,7 +82,13 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from ._deadline import Deadline
 from ._fold import CallFold
 from .adapters import load_adapter
-from .adapters.base import Adapter, RunRequest, SessionRequest, close_async_run
+from .adapters.base import (
+    Adapter,
+    RunRequest,
+    SessionRequest,
+    close_async_run,
+    run_canceller,
+)
 from .capabilities import Capability, CapabilityRegistry, Support, runtime_auth_modes
 from .connections import (
     Connection,
@@ -492,6 +498,13 @@ class Bridge:
     independent answers, receipts and usage figures. The connection store and
     the run log are guarded by their own locks. Adapters may be shared, and the
     fakes in :mod:`modelpass.testing` follow the same rules the real ones do.
+
+    **Cancellation is per run** (2026-09-24). One adapter carries every
+    concurrent call on its runtime, so the bridge never cancels an adapter to
+    end one run: it cancels through the run's own stream, and not at all once
+    the vendor has ended the run with its own terminal. Until then a finished
+    run cancelled whichever run had started last -- the defect
+    ``tests/test_concurrent_runs.py`` holds.
 
     A :class:`~modelpass.sessions.Session` is the exception and takes **one
     caller at a time**: it holds a conversation, a tracker for that whole
@@ -2991,6 +3004,9 @@ class Bridge:
             # a run failure like any other and must not escape the
             # classification below.
             stream = leg.adapter.run(leg.request)
+            if fold.deadline is not None:
+                # The watchdog cancels this run and nothing else (see Deadline).
+                fold.deadline.bind_run(run_canceller(stream, leg.adapter))
             for event in stream:
                 yield from fold.feed(event)
                 if fold.done:
@@ -3016,14 +3032,26 @@ class Bridge:
                     # executing it raises ``ValueError`` -- the failure a
                     # consumer's own watchdog comment names.
                     _close(stream)
-                # **Cancelled once.** The timeout path has already called
-                # ``cancel()`` from the timer thread; calling it again here
-                # would terminate a second process on a runtime that had
-                # already started a new one, and would make the "cancelled
-                # exactly once" test a consumer's cancellation contract rests
-                # on pass for the wrong reason.
-                if fold.deadline is None or fold.deadline.fired is None:
-                    leg.adapter.cancel()
+                    # **Cancelled once, and only this run.** The timeout path
+                    # has already cancelled from the timer thread; calling it
+                    # again here would terminate a second process on a runtime
+                    # that had already started a new one, and would make the
+                    # "cancelled exactly once" test a consumer's cancellation
+                    # contract rests on pass for the wrong reason.
+                    #
+                    # **Not at all after the vendor's own terminal** (2026-09-24).
+                    # That run is over; closing the stream is its whole teardown.
+                    # This line used to call ``leg.adapter.cancel()`` after every
+                    # normal finish, and the adapter is shared by every
+                    # concurrent call on its runtime -- so a finished run
+                    # cancelled whichever other run had started last.
+                    #
+                    # No stream means ``run()`` raised: there is no run of ours
+                    # to cancel, and the adapter is somebody else's too.
+                    if not fold.vendor_ended and (
+                        fold.deadline is None or fold.deadline.fired is None
+                    ):
+                        run_canceller(stream, leg.adapter)()
 
     async def _astream(self, plan: _CallPlan) -> AsyncIterator[AgentEvent]:
         """The async face: the same fold, pumped with ``async for``.
@@ -3095,6 +3123,8 @@ class Bridge:
         stream: AsyncIterator[AgentEvent] | None = None
         try:
             stream = leg.adapter.arun(leg.request)
+            if fold.deadline is not None:
+                fold.deadline.bind_run(run_canceller(stream, leg.adapter))
             async for event in stream:
                 for out in fold.feed(event):
                     yield out
@@ -3112,14 +3142,13 @@ class Bridge:
                 raise error from exc
         finally:
             if not fold.exhausted:
-                # **Cancelled once**, as on the sync face: where the bound has
-                # already fired, the timer thread has already called
-                # ``cancel()``, and the teardown below must not call it again.
-                cancel = fold.deadline is None or fold.deadline.fired is None
+                # **Cancelled once, only this run, and not after the vendor's
+                # own terminal**, as on the sync face.
+                cancel = not fold.vendor_ended and (
+                    fold.deadline is None or fold.deadline.fired is None
+                )
                 if stream is not None:
                     await close_async_run(stream, leg.adapter, cancel=cancel)
-                elif cancel:
-                    leg.adapter.cancel()
 
     def _record_run(
         self,
