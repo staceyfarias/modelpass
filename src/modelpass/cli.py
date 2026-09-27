@@ -1382,6 +1382,8 @@ _SUBSCRIPTION_TERMS_URL: dict[str, str] = {
         "https://support.claude.com/en/articles/"
         "15036540-use-the-claude-agent-sdk-with-your-claude-plan"
     ),
+    # Verified to load in a browser 2026-09-27 (published/effective 2026-01-01).
+    "openai": "https://openai.com/policies/terms-of-use/",
 }
 
 _VENDOR_DISPLAY: dict[str, str] = {

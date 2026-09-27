@@ -35,6 +35,9 @@ variables from every launch so a run can never silently land on metered billing.
 * The Codex CLI and SDK are published by OpenAI for exactly this: local,
   programmatic, ChatGPT-authenticated use. Token-based accounting for that
   allowance has applied since 2026-04.
+* The [Terms of Use](https://openai.com/policies/terms-of-use/) (published and
+  effective 2026-01-01; confirmed to load 2026-09-27) say: *"You may not share your
+  account credentials or make your account available to anyone else."*
 * Our 2026-08-15 verification **found no prohibition** on personal programmatic use
   of Codex under ChatGPT auth. OpenAI's guidance *prefers* API keys for automation
   and CI — steering language, not a stated ban.

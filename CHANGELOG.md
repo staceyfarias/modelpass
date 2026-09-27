@@ -44,20 +44,29 @@ work landed.
   receipt `modelpass connect`, `check` and `verify` print gains a `terms` line on
   subscription connections only: subscription use is governed by the vendor's
   current terms, with Anthropic's Help Center page on using the Agent SDK with a
-  Claude plan printed beneath it, unwrapped so it can be copied. OpenAI and
-  Google get the same line without a link, because no page of theirs was
-  re-verified for this change. API-key receipts are unchanged.
-  `tests/test_cli.py` holds all three cases.
+  Claude plan printed beneath it, unwrapped so it can be copied. OpenAI's
+  receipt carries its Terms of Use (https://openai.com/policies/terms-of-use/,
+  confirmed to load 2026-09-27) the same way. Google gets the same line without
+  a link. API-key receipts are unchanged. `tests/test_cli.py` holds the linked,
+  unlinked and API-key cases.
 
 - **README: vendor terms come first** (2026-09-27). "Boundary and compliance"
   now opens by saying each vendor's current terms, not modelpass, decide whether
   a subscription may be used with a tool, that modelpass is for your own tools
-  under your own login, and that a distributed tool should default to API keys:
+  under your own login, links each vendor's terms (Anthropic's Agent SDK pages,
+  OpenAI's Terms of Use, Google's Antigravity terms), and says that a distributed
+  tool should default to API keys:
   Anthropic's Agent SDK docs say third-party developers may not offer claude.ai
   login or rate limits unless approved. "Runtime-level passthrough only" no
   longer rests its case on the Agent SDK credit, whose status reports conflict;
   it points at Anthropic's pages instead. "Who it is for" and the subscription
   pitch no longer present distributed tools on users' plans as the headline.
+
+- **Legal pages** (2026-09-27). `docs/legal/anthropic.md` names the Help Center
+  page for what it is, using the Agent SDK with a Claude plan, rather than "the
+  Agent SDK credit article", and notes that reports on the separate credit's
+  status conflict. `docs/legal/openai.md` quotes the Terms of Use's
+  no-sharing sentence.
 
 ### Added
 

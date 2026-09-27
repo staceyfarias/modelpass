@@ -43,9 +43,11 @@ From the [Claude Code legal and compliance page](https://code.claude.com/docs/en
   may do so without prior notice." Server-side enforcement exists: consumer OAuth
   tokens error on direct API requests outside Claude Code.
 
-The [Agent SDK credit support article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
+The Help Center article on [using the Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
 explicitly lists **"third-party apps that authenticate with your Claude subscription
 through the Agent SDK"** as a use covered by the plan's monthly Agent SDK credit.
+*(Note, 2026-09-27: reports on the status of that separate credit conflict, and this
+reading has not been re-verified against the current article. Read it yourself.)*
 
 ## What that means for modelpass use — our reading, hedged
 
@@ -75,8 +77,9 @@ merely un-prohibited.
 | [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms) | Team / Enterprise / API |
 | [Usage Policy](https://www.anthropic.com/legal/aup) | All use |
 | [Claude Code: legal and compliance](https://code.claude.com/docs/en/legal-and-compliance) | Authentication and credential use |
-| [Agent SDK credit article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) | What the plan's credit covers |
+| [Help Center: use the Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) | Agent SDK use on a plan, and how it is billed |
 
 **These documents change.** The authentication section above was added in a 2026-02
-update; the Agent SDK credit is a 2026-06 addition. Re-read them before building
+update; the separate Agent SDK credit was announced for 2026-06, and reports on its
+status since conflict. Re-read them before building
 anything that depends on this page.

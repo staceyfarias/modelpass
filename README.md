@@ -1837,9 +1837,11 @@ a given tool is decided by each vendor's current terms, not by modelpass. Check 
 before you configure a subscription connection: for Anthropic, the
 [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview) and the Help
 Center's [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan);
-for OpenAI and Google, their own current terms and plan help pages (the per-vendor
-pages [below](#the-vendors-written-positions-summarized) point to the ones this project
-has read). modelpass is intended for your own personal tools and projects, under your
+for OpenAI, its [Terms of Use](https://openai.com/policies/terms-of-use/), which say
+you may not share your account credentials or make your account available to anyone
+else; for Google, the [Antigravity terms](https://antigravity.google/terms). The
+per-vendor pages [below](#the-vendors-written-positions-summarized) point to the other
+pages this project has read. modelpass is intended for your own personal tools and projects, under your
 own login. If you **distribute** a tool built on modelpass, note that Anthropic's Agent
 SDK docs say third-party developers may not offer claude.ai login or rate limits for
 their products unless previously approved. Make API keys your tool's default, and treat

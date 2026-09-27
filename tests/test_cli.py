@@ -117,7 +117,22 @@ def test_a_subscription_receipt_points_at_the_vendor_terms(cli, store):
     assert url_line.strip().startswith("https://")  # whole, so it can be copied
 
 
-def test_a_subscription_receipt_without_a_known_page_names_the_vendor_unlinked(cli, store):
+def test_an_openai_subscription_receipt_links_the_terms_of_use_whole(cli, store):
+    code, out, _ = cli(["connect", "openai", "--yes"])
+    assert code == 0
+    assert "terms        subscription use is governed by OpenAI's current terms" in out
+    url_line = next(line for line in out.splitlines() if "openai.com/policies" in line)
+    assert url_line.strip() == "https://openai.com/policies/terms-of-use/"
+
+
+def test_a_subscription_receipt_without_a_known_page_names_the_vendor_unlinked(
+    cli, store, monkeypatch
+):
+    # Google's subscription runtime is gated at connect time, so the unlinked
+    # case is held by taking OpenAI's page away instead.
+    from modelpass import cli as cli_module
+
+    monkeypatch.delitem(cli_module._SUBSCRIPTION_TERMS_URL, "openai")
     code, out, _ = cli(["connect", "openai", "--yes"])
     assert code == 0
     assert "governed by OpenAI's current terms; check them" in out
