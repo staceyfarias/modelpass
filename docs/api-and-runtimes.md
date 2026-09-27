@@ -1941,10 +1941,14 @@ know which one a version verdict is about.
 The legal position, hedged and dated 2026-08-16, is
 [legal/anthropic.md](legal/anthropic.md): the prohibition targets a developer
 mediating access through *other people's* consumer credentials, while the
-Agent SDK credit article explicitly lists third-party apps authenticating with
-your own subscription through the Agent SDK as covered. This is the strongest
-footing of any vendor here — the permitted shape is written down affirmatively,
-not merely un-prohibited.
+Help Center article on using the Agent SDK with your Claude plan explicitly
+lists third-party apps authenticating with your own subscription through the
+Agent SDK as covered. This is the strongest footing of any vendor here — the
+permitted shape is written down affirmatively, not merely un-prohibited. One
+caveat for anyone *distributing* a tool: the Agent SDK overview says third-party
+developers may not offer claude.ai login or rate limits in their products unless
+Anthropic has approved it, so a distributed tool should default to API keys (see
+the README's "Boundary and compliance").
 
 **Design of the integration.** modelpass drives the Python `claude-agent-sdk`,
 which owns its own subprocess. Three things are load-bearing:
