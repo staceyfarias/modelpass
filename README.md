@@ -48,13 +48,14 @@ metered bill for work your subscription would happily have done.
 
 That is the half modelpass started as, and it is still the half nothing else does. It
 drives the agent runtimes the vendors already ship — the Claude Agent SDK, the Codex
-CLI — under **your own login**, so a tool can plug into whichever subscription its user
-actually has, and the same code reaches a key when they have one instead.
+CLI — under **your own login**, so your own tools can use the subscription you have,
+and the same code reaches a key when that is what a connection names.
 
 It is not a trick, and it is not scraping anything. The vendors ship first-party
 facilities for exactly this. What nobody ships is the *pluggability*: one calling
-convention that works whether the person running your tool has a Claude plan or a
-ChatGPT plan.
+convention that works whether the connection behind it is a Claude plan, a ChatGPT
+plan or a key. Whether a given plan may be used with a given tool is still the
+vendor's call; see [Boundary and compliance](#boundary-and-compliance).
 
 ### Who it is for
 
@@ -64,10 +65,13 @@ out of all proportion to the value, and where you already have a subscription si
 right there.
 
 **Tools you give to other people.** This is the audience that shaped the design. If you
-distribute a local tool — a plugin, a CLI, a desktop app — the typical user has a
-subscription and *no appetite whatsoever* for setting up API billing. Asking them for a
-key is where your install numbers go to die. Letting them point your tool at the plan
-they already pay for is a different proposition entirely.
+distribute a local tool — a plugin, a CLI, a desktop app — its users run it under their
+own accounts, and the same code reaches whichever connection each of them sets up. Be
+careful with what that implies for subscriptions: Anthropic's Agent SDK docs currently
+say a third-party product may not offer claude.ai login or rate limits unless Anthropic
+has approved it. So a distributed tool should default to API keys, and leave a
+subscription connection as something each user opts into, under their own vendor's
+terms. See [Boundary and compliance](#boundary-and-compliance).
 
 That second audience is also the one that cannot absorb a surprise. Somebody running
 your tool must never wake up to a metered bill they did not agree to. Most of what
@@ -1828,6 +1832,20 @@ output names whichever of the two you actually typed.
 
 ## Boundary and compliance
 
+**Vendor terms come first, and they change.** Whether a subscription may be used with
+a given tool is decided by each vendor's current terms, not by modelpass. Check them
+before you configure a subscription connection: for Anthropic, the
+[Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview) and the Help
+Center's [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan);
+for OpenAI and Google, their own current terms and plan help pages (the per-vendor
+pages [below](#the-vendors-written-positions-summarized) point to the ones this project
+has read). modelpass is intended for your own personal tools and projects, under your
+own login. If you **distribute** a tool built on modelpass, note that Anthropic's Agent
+SDK docs say third-party developers may not offer claude.ai login or rate limits for
+their products unless previously approved. Make API keys your tool's default, and treat
+a subscription connection as each user's own choice, made under their vendor's terms.
+None of this is legal advice.
+
 **Intended use:** personal development, local tooling, and workflows running under the
 developer's own authenticated account — or, for a distributed tool, under *its user's*
 own account.
@@ -1866,7 +1884,12 @@ There are two ways to reach a subscription from code:
 * Token extraction is the pattern behind community-reported account blocks, and at
   least one vendor's terms now name a token-level tool as their worked example of a
   breach.
-* Runtime-level use is explicitly covered — Anthropic's Agent SDK credit exists for it.
+* Runtime-level use is the shape Anthropic itself describes: the
+  [Agent SDK docs](https://code.claude.com/docs/en/agent-sdk/overview) and the Help
+  Center's [Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
+  page both cover driving the Agent SDK, and neither describes lifting its token. How
+  that usage is billed against a plan has been changing, so read the current pages
+  rather than any summary of them, this one included.
 
 **modelpass is not that pattern.** Token-extraction tools lift the subscription's
 OAuth token and impersonate the vendor's own app against the vendor's API — which is
@@ -1902,9 +1925,9 @@ a vendor does to it — as your own responsibility. modelpass is provided AS IS 
 ### A note on freshness
 
 **Every provider fact in this repository is dated, and this space moves fast.** Within
-the last six months: Google replaced its entire CLI (June 2026), Anthropic introduced
-the Agent SDK credit (June 2026), and OpenAI moved Codex to token-based accounting
-(April 2026). Auth precedence is exactly the kind of thing that changes in a point
+the last six months: Google replaced its entire CLI (June 2026), Anthropic announced
+a separate Agent SDK credit for June 2026 (reports on its status since conflict), and
+OpenAI moved Codex to token-based accounting (April 2026). Auth precedence is exactly the kind of thing that changes in a point
 release — which is the argument for the scrub in the first place.
 
 **Re-verify before implementing against any dated claim here**, including the compliance

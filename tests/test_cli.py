@@ -104,6 +104,35 @@ def test_the_receipt_is_printed_before_anything_is_written(cli, store):
     assert out.index("status       OK") < out.index("Wrote 'claude-sub'")
 
 
+def test_a_subscription_receipt_points_at_the_vendor_terms(cli, store):
+    """Whether a plan may be used with a tool is the vendor's call, not modelpass's."""
+    code, out, _ = cli(["connect", "anthropic", "--yes"])
+    assert code == 0
+    assert "terms        subscription use is governed by Anthropic's current terms" in out
+    assert (
+        "https://support.claude.com/en/articles/"
+        "15036540-use-the-claude-agent-sdk-with-your-claude-plan"
+    ) in out
+    url_line = next(line for line in out.splitlines() if "support.claude.com" in line)
+    assert url_line.strip().startswith("https://")  # whole, so it can be copied
+
+
+def test_a_subscription_receipt_without_a_known_page_names_the_vendor_unlinked(cli, store):
+    code, out, _ = cli(["connect", "openai", "--yes"])
+    assert code == 0
+    assert "governed by OpenAI's current terms; check them" in out
+    assert "https://" not in out
+
+
+def test_an_api_key_receipt_carries_no_subscription_terms_line(cli, store):
+    code, out, _ = cli(
+        ["connect", "anthropic", "--name", "claude-api", "--api-key-env", "MY_KEY", "--yes"],
+        env={"MY_KEY": SECRET},
+    )
+    assert code == 0
+    assert "terms " not in out
+
+
 def test_a_failed_preflight_writes_nothing(cli, store):
     adapter = FakeAdapter([], ok=False, problem="no Claude Code login found")
     code, out, _ = cli(["connect", "anthropic", "--yes"], adapter=adapter)

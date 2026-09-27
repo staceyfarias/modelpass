@@ -38,6 +38,27 @@ work landed.
   form was shown to pass on the old code; `test_async_adapters.py`'s aclose
   test in the fix itself, because the attribute it read no longer exists.
 
+### Changed
+
+- **A subscription receipt says the vendor's terms decide** (2026-09-27). The
+  receipt `modelpass connect`, `check` and `verify` print gains a `terms` line on
+  subscription connections only: subscription use is governed by the vendor's
+  current terms, with Anthropic's Help Center page on using the Agent SDK with a
+  Claude plan printed beneath it, unwrapped so it can be copied. OpenAI and
+  Google get the same line without a link, because no page of theirs was
+  re-verified for this change. API-key receipts are unchanged.
+  `tests/test_cli.py` holds all three cases.
+
+- **README: vendor terms come first** (2026-09-27). "Boundary and compliance"
+  now opens by saying each vendor's current terms, not modelpass, decide whether
+  a subscription may be used with a tool, that modelpass is for your own tools
+  under your own login, and that a distributed tool should default to API keys:
+  Anthropic's Agent SDK docs say third-party developers may not offer claude.ai
+  login or rate limits unless approved. "Runtime-level passthrough only" no
+  longer rests its case on the Agent SDK credit, whose status reports conflict;
+  it points at Anthropic's pages instead. "Who it is for" and the subscription
+  pitch no longer present distributed tools on users' plans as the headline.
+
 ### Added
 
 - **`reasoning: none` switches thinking off on `anthropic-sdk`** (2026-09-23).

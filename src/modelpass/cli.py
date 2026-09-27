@@ -1346,6 +1346,14 @@ def _print_receipt(receipt: Receipt, out: IO[str]) -> None:
         print(f"  configDir    {receipt.config_dir}", file=out)
     for directive in receipt.directives:
         print(f"  directive    {directive.name} = {directive.value}", file=out)
+    terms = _subscription_terms_note(receipt)
+    if terms is not None:
+        text, url = terms
+        _print_field("terms", text, out)
+        if url:
+            # On its own line and never wrapped: a URL split across two lines
+            # cannot be copied.
+            print(f"  {'':<13}{url}", file=out)
     for note in receipt.notes:
         _print_field("note", note, out)
     guard_note = receipt.guard_note
@@ -1364,6 +1372,39 @@ def _print_receipt(receipt: Receipt, out: IO[str]) -> None:
         print("  status       OK", file=out)
     else:
         print(f"  status       FAILED -- {receipt.problem or 'unknown reason'}", file=out)
+
+
+#: Where each vendor states what its plans may be used with. Only pages this
+#: project has confirmed exist are linked; a vendor with no entry gets the same
+#: line without a link rather than a guessed URL.
+_SUBSCRIPTION_TERMS_URL: dict[str, str] = {
+    "anthropic": (
+        "https://support.claude.com/en/articles/"
+        "15036540-use-the-claude-agent-sdk-with-your-claude-plan"
+    ),
+}
+
+_VENDOR_DISPLAY: dict[str, str] = {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "google": "Google",
+}
+
+
+def _subscription_terms_note(receipt: Receipt) -> tuple[str, str | None] | None:
+    """One line on a subscription receipt: the vendor's terms decide, not modelpass.
+
+    Returns the sentence and, where one is known, the vendor page to check.
+    Printed for subscription billing only. An API key is billed under the
+    vendor's API terms, which is not the question a user configuring a
+    subscription connection needs pointed out.
+    """
+    if receipt.requested_auth_mode is not AuthMode.SUBSCRIPTION:
+        return None
+    vendor = VENDOR_OF.get(receipt.runtime, "")
+    name = _VENDOR_DISPLAY.get(vendor, "the vendor")
+    text = f"subscription use is governed by {name}'s current terms; check them"
+    return text, _SUBSCRIPTION_TERMS_URL.get(vendor)
 
 
 def _prompt(question: str) -> bool:
