@@ -384,10 +384,12 @@ def _scrubbed_process_env(plan: PreflightPlan) -> Iterator[tuple[str, ...]]:
     Yields the names actually removed, so a caller (or a test) can assert on the
     guarantee rather than take it on trust.
     """
-    live_names = env_names_to_scrub(plan.runtime, os.environ, preserve=plan.kept)
-    remove = sorted(set(live_names) | set(plan.scrubbed))
-
     with _ENV_LOCK:
+        # Decided under the lock (2026-09-28): computed before it, a run waiting
+        # on another run's spawn read that run's already-scrubbed environment,
+        # found nothing to remove, and spawned after the key was restored.
+        live_names = env_names_to_scrub(plan.runtime, os.environ, preserve=plan.kept)
+        remove = sorted(set(live_names) | set(plan.scrubbed))
         saved: dict[str, str] = {}
         try:
             for name in remove:

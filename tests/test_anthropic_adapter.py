@@ -2643,3 +2643,52 @@ def test_the_bridge_lists_the_sessions_in_a_folder(
 
     assert [info.id for info in listed] == ["sess-1"]
     assert sdk.list_calls == [(str(tmp_path / "work"), False)]
+
+
+def test_a_scrub_waiting_on_another_run_still_removes_the_key(
+    monkeypatch, subscription_connection
+):
+    """Concurrent subscription runs (found 2026-09-28, RAGauge TEST 1).
+
+    Run A holds the scrub while it spawns, so the key is out of os.environ.
+    Run B arrives meanwhile. If B decides *what to remove* before it holds the
+    lock, it looks at A's scrubbed environment, finds no key, removes nothing,
+    and spawns after A has put the key back: the runtime reports
+    apiKeySource='ANTHROPIC_API_KEY' and the run is refused (9 of 16 judge
+    calls in that run). The decision must be made under the lock, against the
+    environment as it is when B's own spawn happens.
+    """
+    import threading
+
+    from modelpass.adapters import anthropic as module
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-concurrent")
+    plan = plan_launch(subscription_connection, {})  # plan saw no key
+    assert plan.scrubbed == ()
+
+    calls = []
+    b_decided = threading.Event()
+    real = module.env_names_to_scrub
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:  # run B deciding what to remove
+            b_decided.set()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, "env_names_to_scrub", spy)
+    seen_by_b = {}
+
+    def run_b():
+        with scrubbed_process_env(plan):
+            seen_by_b["key_present"] = "ANTHROPIC_API_KEY" in os.environ
+
+    with scrubbed_process_env(plan):  # run A, mid-spawn
+        b = threading.Thread(target=run_b)
+        b.start()
+        # A buggy scrub decides before taking the lock; give it the chance.
+        b_decided.wait(timeout=0.5)
+    b.join(timeout=5)
+
+    assert seen_by_b == {"key_present": False}
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-concurrent"
