@@ -374,6 +374,19 @@ _TABLE: dict[Runtime, tuple[SamplingRules, tuple[tuple[str, dict[str, Any]], ...
                 )
                 for token in ("o1", "o3", "o4")
             ),
+            # GPT-6 refuses a temperature outright (2026-09-29, gpt-6.1-sol:
+            # "Unsupported parameter: 'temperature' is not supported with this
+            # model", a 400, so unbilled). Same row as the o-series: no
+            # sampling controls, an output ceiling and an effort dial. Its
+            # effort ladder is unprobed, so no ``efforts`` set is claimed; the
+            # runtime ladder is the floor, as for any unprobed model.
+            (
+                "gpt-6",
+                {
+                    "accepted": frozenset({"max_output_tokens", "reasoning_effort"}),
+                    "reasoning_parameter": "reasoning.effort",
+                },
+            ),
             # GPT-5 accepts temperature and only the default value of it. A
             # downstream agent host sets temperature=1.0 unconditionally and
             # warns that top_p and top_k are ignored.

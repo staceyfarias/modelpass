@@ -754,3 +754,16 @@ def test_the_adapter_class_still_reports_an_unknown_option_key():
     assert AnthropicAPIAdapter.unknown_option_keys(
         {"max_output_tokens": 1, "temprature": 2}
     ) == ("temprature",)
+
+
+def test_gpt6_refuses_temperature_like_the_o_series():
+    """2026-09-29: gpt-6.1-sol answered a temperature with HTTP 400 'Unsupported
+    parameter: temperature is not supported with this model'. Unknown to the
+    table it got runtime defaults and was sent one. GPT-6 is now a row: no
+    sampling controls, an output ceiling and an effort dial, as the o-series."""
+    for model in ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"):
+        plan = plan_sampling(Sampling(temperature=0.0, max_output_tokens=100),
+                             Runtime.OPENAI_API, model)
+        assert "temperature" not in plan.applied, model
+        assert plan.applied.get("max_output_tokens") == 100
+    assert rules_for(Runtime.OPENAI_API, "gpt-6.1-sol").reasoning_parameter == "reasoning.effort"
