@@ -354,6 +354,41 @@ def _as_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+# --- the runtime binary ----------------------------------------------------------
+
+
+def _runnable_on_windows(path: str) -> str:
+    """The binary Windows can actually launch for a resolved ``claude`` path.
+
+    claude-agent-sdk 0.2.161 ships no bundled binary, so the runtime is found on
+    PATH, where npm installs an extensionless shell shim beside ``claude.cmd``
+    (2026-09-29). Windows cannot execute the shim: ``claude auth status`` came
+    back empty and every subscription preflight failed. On Windows an
+    extensionless path is replaced by its twin, ``.exe`` first, then ``.cmd``;
+    anywhere else, and for a path that already has an extension, it is kept.
+    """
+    if os.name != "nt":
+        return path
+    root, ext = os.path.splitext(path)
+    if ext:
+        return path
+    for suffix in (".exe", ".cmd"):
+        if os.path.isfile(root + suffix):
+            return root + suffix
+    return path
+
+
+def _with_runnable_cli(sdk: Any, options_kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Launch options that name the binary modelpass itself resolved and
+    checked, so the runtime the preflight verified is the one that runs."""
+    kwargs = dict(options_kwargs)
+    if "cli_path" not in kwargs:
+        path, _ = AnthropicAdapter._cli_status(sdk)
+        if path is not None:
+            kwargs["cli_path"] = path
+    return kwargs
+
+
 # --- environment enforcement ---------------------------------------------------
 
 
@@ -1818,7 +1853,8 @@ class AnthropicSessionHandle:
         """
         if self._client is not None:
             return self._client
-        options = self._sdk.ClaudeAgentOptions(**self._options_kwargs)
+        options = self._sdk.ClaudeAgentOptions(
+            **_with_runnable_cli(self._sdk, self._options_kwargs))
         client = self._sdk.ClaudeSDKClient(options=options)
         with _scrubbed_process_env(self._request.plan):
             await client.connect(None)
@@ -1994,11 +2030,12 @@ class AnthropicAdapter(Adapter):
             )
 
             transport = SubprocessCLITransport(prompt="", options=sdk.ClaudeAgentOptions())
-            return transport._find_cli(), None
+            return _runnable_on_windows(transport._find_cli()), None
         except Exception as exc:
             native = shutil.which("claude") or shutil.which("claude.exe")
             if native:
-                return native, f"bundled binary unavailable, using native install ({exc})"
+                return (_runnable_on_windows(native),
+                        f"bundled binary unavailable, using native install ({exc})")
             return None, f"Claude Code binary not found: {exc}"
 
     def _cli_version(self, binary: str, env: Mapping[str, str]) -> str | None:
@@ -2502,7 +2539,8 @@ class AnthropicAdapter(Adapter):
         self._runs.add(run)
 
         async def drive() -> None:
-            client = sdk.ClaudeSDKClient(options=sdk.ClaudeAgentOptions(**options_kwargs))
+            client = sdk.ClaudeSDKClient(options=sdk.ClaudeAgentOptions(
+                **_with_runnable_cli(sdk, options_kwargs)))
             run.attach(asyncio.get_running_loop(), client)
             try:
                 # The scrub is only needed while the child is being spawned: the

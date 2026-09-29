@@ -2692,3 +2692,23 @@ def test_a_scrub_waiting_on_another_run_still_removes_the_key(
 
     assert seen_by_b == {"key_present": False}
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-concurrent"
+
+
+def test_an_extensionless_windows_entry_point_resolves_to_its_runnable_twin(tmp_path, monkeypatch):
+    """2026-09-29: claude-agent-sdk 0.2.161 ships no bundled binary, so the
+    runtime is found on PATH, where npm installs an extensionless shell shim
+    beside claude.cmd. Windows cannot run the shim: 'claude auth status'
+    silently returned nothing and every subscription preflight failed. On
+    Windows the runnable twin (.exe first, then .cmd) is used instead."""
+    from modelpass.adapters import anthropic as module
+
+    shim = tmp_path / "claude"
+    shim.write_text("#!/bin/sh\n", encoding="utf-8")
+    (tmp_path / "claude.cmd").write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr(module.os, "name", "nt")
+    assert module._runnable_on_windows(str(shim)) == str(tmp_path / "claude.cmd")
+    (tmp_path / "claude.exe").write_bytes(b"MZ")
+    assert module._runnable_on_windows(str(shim)) == str(tmp_path / "claude.exe")
+    assert module._runnable_on_windows(str(tmp_path / "claude.cmd")) == str(tmp_path / "claude.cmd")
+    monkeypatch.setattr(module.os, "name", "posix")
+    assert module._runnable_on_windows(str(shim)) == str(shim)

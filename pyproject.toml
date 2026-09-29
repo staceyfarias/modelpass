@@ -33,7 +33,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-anthropic = ["claude-agent-sdk"]
+anthropic = ["claude-agent-sdk>=0.2.159"]
 openai = ["openai-codex"]
 # The Messages API client for the `anthropic-api` runtime (ticket 1.6). Pinned
 # below 1.0 because the adapter was written and verified against 0.97.0 and the
