@@ -2716,3 +2716,63 @@ def test_an_extensionless_windows_entry_point_resolves_to_its_runnable_twin(tmp_
     assert module._runnable_on_windows(str(tmp_path / "claude.cmd")) == str(tmp_path / "claude.cmd")
     monkeypatch.setattr(module.os, "name", "posix")
     assert module._runnable_on_windows(str(shim)) == str(shim)
+
+
+# --- a stateless run carries only what the caller sent (2026-09-29) ------------
+# Traced live against Claude Code 2.1.281 under a subscription login: a plain
+# one-shot call launched in the CALLER's working directory, with the account's
+# claude.ai connectors (and their tools), 18 skills, the project's auto-memory
+# folder and the agents-md plugin reading that directory -- 7,282 tokens of
+# context around a ten-word message. RAGauge's certified judges ran that way.
+# With the four switches below the same call carried 460 tokens and no tools,
+# connectors, skills or memory. Each switch was shown necessary by ablation.
+
+
+def test_a_plain_run_loads_no_mcp_server_the_caller_did_not_pass(
+    monkeypatch, subscription_request
+):
+    """Without this the account's claude.ai connectors join every call."""
+    options = launch_options(monkeypatch, subscription_request)
+    assert options["strict_mcp_config"] is True
+    assert options["mcp_servers"] == {}
+
+
+def test_a_plain_run_starts_in_an_empty_modelpass_directory(
+    monkeypatch, subscription_request
+):
+    """Never the caller's cwd: its AGENTS.md and project memory would join."""
+    options = launch_options(monkeypatch, subscription_request)
+    cwd = Path(options["cwd"])
+    assert cwd.is_dir()
+    assert cwd.resolve() != Path(os.getcwd()).resolve()
+    assert list(cwd.iterdir()) == []
+
+
+def test_a_plain_run_switches_off_auto_memory_and_skills(
+    monkeypatch, subscription_request
+):
+    options = launch_options(monkeypatch, subscription_request)
+    assert options["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert "disable-slash-commands" in options["extra_args"]
+    assert options["extra_args"]["disable-slash-commands"] is None
+
+
+def test_caller_options_add_to_the_isolation_rather_than_erase_it(
+    monkeypatch, request_factory
+):
+    """A caller's env and extra_args merge in; the isolation switches stay."""
+    options = launch_options(monkeypatch, request_factory(options={
+        "env": {"MY_VAR": "x"},
+        "extra_args": {"some-flag": "v"},
+    }))
+    assert options["env"]["MY_VAR"] == "x"
+    assert options["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert options["extra_args"]["some-flag"] == "v"
+    assert "disable-slash-commands" in options["extra_args"]
+
+
+def test_a_caller_may_name_its_own_working_directory(
+    monkeypatch, request_factory, tmp_path
+):
+    options = launch_options(monkeypatch, request_factory(options={"cwd": str(tmp_path)}))
+    assert options["cwd"] == str(tmp_path)

@@ -202,6 +202,61 @@ _IDENTITY_CACHE_TTL_SECONDS = 60.0
 #: the environment (verification doc, "Sessions").
 _SKIP_HISTORY_ENV = "CLAUDE_CODE_SKIP_PROMPT_HISTORY"
 
+#: Claude Code's auto-memory: without this a run attaches the working
+#: directory's project memory folder to the prompt (2026-09-29, 2.1.281).
+_DISABLE_AUTO_MEMORY_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+
+_RUN_SCRATCH: str | None = None
+_RUN_SCRATCH_LOCK = threading.Lock()
+
+
+def run_scratch_folder() -> str:
+    """One empty modelpass-owned working directory for stateless runs.
+
+    Shared by every run in the process and never written to by modelpass: a
+    stateless run keeps no transcript (``CLAUDE_CODE_SKIP_PROMPT_HISTORY``) and
+    no memory, so there is nothing to separate between calls, and one folder
+    avoids leaving a directory behind per call. Recreated if something removed
+    it.
+    """
+    global _RUN_SCRATCH
+    with _RUN_SCRATCH_LOCK:
+        if _RUN_SCRATCH is None or not os.path.isdir(_RUN_SCRATCH):
+            _RUN_SCRATCH = tempfile.mkdtemp(prefix="modelpass-run-")
+        return _RUN_SCRATCH
+
+
+def isolation_options() -> dict[str, Any]:
+    """What keeps a stateless run to exactly what the caller sent.
+
+    Traced live 2026-09-29 (Claude Code 2.1.281, subscription login): a plain
+    call with only ``tools=[]`` and ``setting_sources=[]`` still launched in the
+    CALLER's working directory and carried the account's claude.ai connectors
+    and their tools, every installed skill, the directory's auto-memory folder
+    and the agents-md plugin reading it -- 7,282 tokens around a ten-word
+    message. RAGauge's evaluation judges ran that way, so a judge "certified"
+    as a model was that model plus whatever the account and the caller's
+    repository happened to hold. With these four the same call carried 460
+    tokens, no tools, connectors, skills or memory; ablation showed each one
+    necessary for its part:
+
+    * ``strict_mcp_config`` with no servers: only servers passed here load, so
+      the claude.ai connectors do not;
+    * an empty modelpass-owned ``cwd``: no repository instructions or project
+      files from wherever the caller happens to run;
+    * ``CLAUDE_CODE_DISABLE_AUTO_MEMORY``: no memory folder at all;
+    * ``--disable-slash-commands``: no skills.
+
+    ``--bare`` would do most of this in one flag, but it refuses OAuth, and a
+    subscription connection is OAuth by definition.
+    """
+    return {
+        "strict_mcp_config": True,
+        "mcp_servers": {},
+        "cwd": run_scratch_folder(),
+        "extra_args": {"disable-slash-commands": None},
+    }
+
 #: ``ResultMessage.terminal_reason`` values that mean "this turn was cancelled".
 _CANCELLED_REASONS = frozenset({"aborted_streaming", "aborted_tools"})
 
@@ -2436,8 +2491,10 @@ class AnthropicAdapter(Adapter):
 
         additions = _explicit_env_additions(plan)
         additions[_SKIP_HISTORY_ENV] = "1"
+        additions[_DISABLE_AUTO_MEMORY_ENV] = "1"
 
         options_kwargs: dict[str, Any] = {
+            **isolation_options(),
             "system_prompt": system_prompt,
             "model": request.model,
             "env": additions,
@@ -2488,6 +2545,13 @@ class AnthropicAdapter(Adapter):
                 merged = dict(value) if isinstance(value, Mapping) else {}
                 merged.update(options_kwargs["env"])
                 options_kwargs["env"] = merged
+                continue
+            if key == "extra_args":
+                # Merged for the same reason as env: a caller's flag joins the
+                # isolation switches, it does not quietly remove them.
+                merged_args = dict(value) if isinstance(value, Mapping) else {}
+                merged_args.update(options_kwargs["extra_args"])
+                options_kwargs["extra_args"] = merged_args
                 continue
             options_kwargs[key] = value
 
