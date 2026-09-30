@@ -1298,12 +1298,20 @@ def test_a_genuinely_missing_file_keeps_the_wording_it_always_had(
     assert "no Claude Code login found" in receipt.problem
 
 
-# --- expired-but-refreshable: verified, not assumed -----------------------------
+# --- expired-but-refreshable: the runtime refreshes on use ---------------------
+#
+# Evidence (2026-09-30, Windows, Claude Code 2.1.x): with ``expiresAt`` in the
+# past, repeated ``claude auth status`` runs reported ``loggedIn: true`` and never
+# rewrote ``.credentials.json``; a one-shot ``claude -p`` model call refreshed it
+# at once (new ``expiresAt`` eight hours out, new mtime). So ``auth status`` is
+# not a refresh trigger, and a token still expired after it is not evidence of a
+# dead refresh token -- refusing on that basis refused every run whose access
+# token had simply lapsed.
 
 
 def _preflight_adapter(monkeypatch, *, auth_status):
-    """A subscription adapter wired to a fake CLI, for the refresh-verification
-    tests below. No subprocess ever runs: both probes are injected."""
+    """A subscription adapter wired to a fake CLI, for the refresh tests below.
+    No subprocess ever runs: both probes are injected."""
     from modelpass.adapters import anthropic as module
 
     adapter = module.AnthropicAdapter(
@@ -1320,67 +1328,46 @@ def _preflight_adapter(monkeypatch, *, auth_status):
     return adapter, module
 
 
-def test_an_expired_but_refreshable_login_is_verified_and_passes_once_refreshed(
-    monkeypatch, subscription_connection
+def _profile_request(subscription_connection, root):
+    connection = replace(subscription_connection, config_dir=str(root))
+    return RunRequest(connection=connection, messages=(), plan=plan_launch(connection, {}))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="defect: preflight re-probes 'claude auth status', which does not refresh, "
+    "and then refuses the still-expired token",
+)
+def test_an_expired_access_token_with_a_refresh_token_proceeds(
+    monkeypatch, subscription_connection, tmp_path
 ):
-    """The real-world failure this guards: 'ok=True' on a login whose refresh
-    silently failed lets a run start and then die on the first token, because
-    Claude Code can report 'logged in' without ever clearing a dead
-    refresh_token. Preflight now re-checks after one CLI probe rather than
-    trusting the passive note that used to be the whole answer.
+    """Expired access token, refresh token present: the run goes ahead.
+
+    The receipt is subscription (billing unchanged), says the token is past its
+    expiry and that the runtime refreshes it on first use, and preflight never
+    re-runs ``auth status`` hoping for a refresh it does not perform. The
+    credential file is left exactly as it was -- preflight claims no refresh.
     """
-    adapter, module = _preflight_adapter(
-        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True, "subscriptionType": "pro"}
-    )
-    answers = iter(
-        [
-            module.CredentialStatus(
-                source="test", present=True, expired=True, refreshable=True,
-                expires_at=time.time() - 10,
-            ),
-            module.CredentialStatus(
-                source="test", present=True, expired=False, refreshable=True,
-                expires_at=time.time() + 3600, subscription_type="pro",
-            ),
-        ]
-    )
-    monkeypatch.setattr(module, "read_credential_status", lambda env=None: next(answers))
+    calls: list[str] = []
 
-    plan = plan_launch(subscription_connection, {})
-    receipt = adapter.preflight(
-        RunRequest(connection=subscription_connection, messages=(), plan=plan)
-    )
+    def auth_status(binary, env):
+        calls.append(env.get("CLAUDE_CONFIG_DIR"))
+        return {"loggedIn": True, "subscriptionType": "max"}
 
-    assert receipt.ok
-    assert "was refreshed during preflight" in " ".join(receipt.notes)
-    assert receipt.plan_name == "pro"
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=auth_status)
+    _write_credentials(tmp_path, expires_at=time.time() - 600, refresh="r")
+    before = (tmp_path / ".credentials.json").read_bytes()
 
+    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
 
-def test_a_permanently_failed_refresh_fails_closed_and_says_to_log_in_again(
-    monkeypatch, subscription_connection
-):
-    """Codex/Claude both record a permanent refresh failure without logging the
-    account out (dead refresh_token, revoked grant) -- so a stored token still
-    showing 'expired' after the forced re-probe is exactly that failure, and
-    the receipt must not let the run proceed to a metered fallback or a
-    mid-run auth error."""
-    adapter, module = _preflight_adapter(
-        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
-    )
-    still_expired = module.CredentialStatus(
-        source="test", present=True, expired=True, refreshable=True,
-        expires_at=time.time() - 10,
-    )
-    monkeypatch.setattr(module, "read_credential_status", lambda env=None: still_expired)
-
-    plan = plan_launch(subscription_connection, {})
-    receipt = adapter.preflight(
-        RunRequest(connection=subscription_connection, messages=(), plan=plan)
-    )
-
-    assert not receipt.ok
-    assert "could not be refreshed" in receipt.problem
-    assert "claude /login" in receipt.problem
+    assert receipt.ok, receipt.problem
+    assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
+    joined = " ".join(receipt.notes)
+    assert "past its expiry" in joined
+    assert "refresh" in joined and "first use" in joined
+    assert "was refreshed during preflight" not in joined
+    assert calls == [str(tmp_path)]
+    assert (tmp_path / ".credentials.json").read_bytes() == before
 
 
 # --- macOS ---------------------------------------------------------------------
