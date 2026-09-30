@@ -158,6 +158,16 @@ class _Stdin:
         self.closed = True
 
 
+#: What an unscripted method answers when ``{}`` would be a shape the real child
+#: never sends. ``config/read`` always carries a ``config`` object (the
+#: protocol's ``ConfigReadResponse``, codex-cli 0.151.0); an empty one is a user
+#: with nothing configured, which is the neutral case every other test assumes.
+#: A test about configured servers scripts ``config/read`` itself.
+_UNSCRIPTED_ANSWERS: dict[str, tuple[Any, list[dict]]] = {
+    "config/read": ({"config": {}}, []),
+}
+
+
 class ScriptedAppServer:
     """A ``codex app-server`` child that answers requests from a script.
 
@@ -215,7 +225,9 @@ class ScriptedAppServer:
             return
         if "id" not in message:
             return  # a notification from the client
-        result, notifications = self.script.get(method, ({}, []))
+        result, notifications = self.script.get(
+            method, _UNSCRIPTED_ANSWERS.get(method, ({}, []))
+        )
         self.send({"id": message["id"], "result": result})
         if any(_is_server_request(n) for n in notifications):
             threading.Thread(
