@@ -50,6 +50,7 @@ from modelpass.adapters.openai import (
     inject_items_params,
     interrupt_app_server_turn,
     isolation_overrides,
+    isolation_thread_config,
     render_prompt,
     resolve_transport,
 )
@@ -1803,3 +1804,195 @@ def test_an_adapter_with_no_opinion_is_the_default():
     for capability in Capability:
         assert adapter.support_for(capability, {"transport": "app-server"}) is None
 
+
+# --- isolation of a stateless run (2026-09-29) --------------------------------------
+#
+# Traced live on codex-cli 0.151.0: a plain ten-word chat() consumed 16,212 input
+# tokens because the app-server child loaded the user's whole Codex setup --
+# every installed skill, four MCP servers (two from config.toml, two from
+# plugins), the approval-rules prose, the multi-agent prose and the user's
+# personality. The expected values below come from that design, not from what
+# the code emits: each override is the one whose key path the installed binary
+# confirmed (feature readback or a typed error naming the key), and a configured
+# MCP server is switched off for the thread by name because -c and the
+# per-thread config both merge rather than clear.
+
+#: The isolation launch, spelled out. A change here is a change to what a
+#: stateless call carries, so it must be made on purpose, with evidence.
+EXPECTED_ISOLATION = [
+    "-c", "features.plugins=false",
+    "-c", "skills.include_instructions=false",
+    "-c", "include_permissions_instructions=false",
+    "-c", "include_apps_instructions=false",
+    "-c", "include_collaboration_mode_instructions=false",
+    "-c", "include_environment_context=false",
+    "-c", "project_doc_max_bytes=0",
+    "-c", 'personality="none"',
+    "-c",
+    'features.multi_agent_v2={enabled=false,root_agent_usage_hint_text="",'
+    'multi_agent_mode_hint_text=""}',
+    "-c", "tools.update_plan.enabled=false",
+    "-c", "tools.experimental_request_user_input.enabled=false",
+    "-c", "features.multi_agent=false",
+    "-c", "features.goals=false",
+    "-c", "features.tool_suggest=false",
+    "-c", "features.skill_search=false",
+    "-c", "features.memories=false",
+    "-c", "features.hooks=false",
+    "-c", "notify=[]",
+]
+
+#: A ``config/read`` answer with two configured servers and one the user
+#: already switched off -- the shape the live child sent, other fields elided.
+CONFIGURED = {
+    "config": {
+        "model": "gpt-5.6-sol",
+        "mcp_servers": {
+            "amt": {"command": "python", "enabled": True},
+            "node_repl": {"command": "node_repl.exe"},
+            "dormant": {"command": "x", "enabled": False},
+        },
+    }
+}
+
+SWITCHED_OFF = {"amt": {"enabled": False}, "node_repl": {"enabled": False}}
+
+
+def _isolation_script(config_read: Any = CONFIGURED) -> dict:
+    return {**script_for(), "config/read": (config_read, [])}
+
+
+def test_isolation_overrides_are_exactly_the_verified_set():
+    assert isolation_overrides() == EXPECTED_ISOLATION
+
+
+def test_a_plain_run_launches_with_the_isolation_overrides():
+    server = ScriptedAppServer(_isolation_script())
+    adapter, spawn = adapter_for(server)
+    list(adapter.run(request_for()))
+    assert spawn.argv == [
+        "C:/codex/codex.exe",
+        "app-server",
+        *chat_tool_overrides(),
+        *EXPECTED_ISOLATION,
+        "--listen",
+        "stdio://",
+    ]
+
+
+def test_configured_mcp_servers_are_switched_off_on_the_thread():
+    """Every configured server not already off, by name, for this thread only."""
+    server = ScriptedAppServer(_isolation_script())
+    adapter, _ = adapter_for(server)
+    events = list(adapter.run(request_for()))
+    assert server.params_of("thread/start")["config"] == {"mcp_servers": SWITCHED_OFF}
+    assert events[-1].status is TerminalStatus.OK
+
+
+def test_config_is_read_in_the_threads_own_folder_before_the_thread_exists():
+    """A project layer for that folder can add servers; the read must see it."""
+    server = ScriptedAppServer(_isolation_script())
+    adapter, _ = adapter_for(server)
+    list(adapter.run(request_for()))
+    methods = server.methods
+    assert methods.index("config/read") < methods.index("thread/start")
+    assert server.params_of("config/read") == {
+        "cwd": server.params_of("thread/start")["cwd"]
+    }
+
+
+def test_nothing_configured_means_no_config_on_the_thread():
+    server = ScriptedAppServer(_isolation_script({"config": {"mcp_servers": {}}}))
+    adapter, _ = adapter_for(server)
+    list(adapter.run(request_for()))
+    assert "config" not in server.params_of("thread/start")
+
+
+class _RefusingConfigRead(ScriptedAppServer):
+    """A child that will not say what it has configured."""
+
+    def on_write(self, text: str) -> None:
+        message = json.loads(text)
+        if message.get("method") == "config/read":
+            self.received.append(message)
+            self.send({"id": message["id"], "error": {"code": -32601, "message": "nope"}})
+            return
+        super().on_write(text)
+
+
+@pytest.mark.parametrize(
+    "config_read",
+    [None, {}, {"config": {"mcp_servers": ["amt"]}}, {"config": {"mcp_servers": {"": {}}}}],
+    ids=["refused", "no-config", "servers-not-a-table", "unnamed-server"],
+)
+def test_a_run_that_cannot_be_isolated_fails_closed_before_any_thread(config_read):
+    server = (
+        _RefusingConfigRead(script_for())
+        if config_read is None
+        else ScriptedAppServer(_isolation_script(config_read))
+    )
+    adapter, _ = adapter_for(server)
+    with pytest.raises(VendorRunFailed, match="could not be isolated"):
+        list(adapter.run(request_for()))
+    assert "thread/start" not in server.methods
+    assert "turn/start" not in server.methods
+
+
+def test_the_option_surface_is_the_one_isolation_was_checked_against():
+    """A new option must be weighed against isolation before it can exist."""
+    assert OpenAIAdapter.option_keys == frozenset(
+        {"allow_configured_mcp_servers", "codex_bin", "codex_home", "cwd",
+         "native_tools", "transport"}
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"native_tools": True},
+        {"allow_configured_mcp_servers": True},
+        {"cwd": "C:/work/repo"},
+        {"codex_home": "C:/somewhere/else"},
+        {"codex_bin": "C:/codex/codex.exe"},
+        {"transport": TRANSPORT_APP_SERVER},
+        {"native_tools": True, "allow_configured_mcp_servers": True, "cwd": "C:/w"},
+    ],
+    ids=["native_tools", "allow_configured", "cwd", "codex_home", "codex_bin",
+         "explicit-app-server", "all-together"],
+)
+def test_a_caller_option_cannot_undo_isolation(options):
+    """Every stateless app-server option, alone and together, keeps both halves."""
+    server = ScriptedAppServer(_isolation_script())
+    adapter, spawn = adapter_for(server)
+    list(adapter.run(request_for(options=options)))
+    argv = spawn.argv
+    start = argv.index(EXPECTED_ISOLATION[1]) - 1
+    assert argv[start:start + len(EXPECTED_ISOLATION)] == EXPECTED_ISOLATION
+    assert argv[-2:] == ["--listen", "stdio://"]
+    assert server.params_of("thread/start")["config"] == {"mcp_servers": SWITCHED_OFF}
+
+
+def test_the_exec_opt_out_says_it_is_not_isolated():
+    """Opting out of the default must not be a silent way around isolation."""
+    server = ScriptedAppServer(script_for())
+    adapter, _ = adapter_for(server)
+    adapter._login_status = lambda binary, env: "Logged in using ChatGPT"
+    adapter._codex_version = lambda binary, env: "codex-cli 0.151.0"
+
+    app_server = adapter.preflight(request_for())
+    exec_run = adapter.preflight(request_for(options={"transport": TRANSPORT_EXEC}))
+
+    assert any("NOT isolated" in note for note in exec_run.notes)
+    assert not any("NOT isolated" in note for note in app_server.notes)
+
+
+def test_isolation_thread_config_reads_only_the_mcp_servers():
+    assert isolation_thread_config(CONFIGURED) == {"mcp_servers": SWITCHED_OFF}
+    assert isolation_thread_config({"config": {}}) == {}
+    assert isolation_thread_config({"config": {"mcp_servers": None}}) == {}
+    assert isolation_thread_config(
+        {"config": {"mcp_servers": {"off": {"enabled": False}}}}
+    ) == {}
+    for bad in (None, [], {"config": None}, {"config": {"mcp_servers": "amt"}}):
+        with pytest.raises(ValueError):
+            isolation_thread_config(bad)

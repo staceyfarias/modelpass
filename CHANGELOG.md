@@ -7,6 +7,22 @@ work landed.
 
 ### Fixed
 
+- **A stateless Codex call carries only what the caller sent** (2026-09-29).
+  On the default `app-server` transport a plain ten-word `chat()` on a ChatGPT
+  subscription consumed 16,212 input tokens: the child loaded every installed
+  skill, the user's configured and plugin MCP servers, the approval-rules and
+  multi-agent prose, and the user's `personality`. It now launches with
+  `isolation_overrides()` (skills, plugins, permission/apps/collaboration
+  prose, environment context, the repository `AGENTS.md` chain, personality,
+  memories, hooks and `notify` off) and switches each configured MCP server
+  off for the thread by name, asked of the child with `config/read`; a child
+  that cannot answer ends the run before any thread is started. The same call
+  now carries 5,490 tokens, 2,327 with a system prompt. `native_tools` still
+  restores only Codex's own toolbelt. Not covered: `$CODEX_HOME/AGENTS.md`
+  (read unconditionally, still disclosed), Codex's own tools that the model
+  catalog forces on, the `exec` opt-out (whose receipt now says it is not
+  isolated), and sessions.
+
 - **Concurrent runs on one bridge no longer cancel each other** (2026-09-24).
   A bridge keeps one adapter per runtime, and every built-in adapter kept one
   run's cancel state on itself -- a cancelled flag, and on the agent runtimes

@@ -413,6 +413,7 @@ from .codex_appserver import (
 )
 
 __all__ = [
+    "CONFIG_READ_METHOD",
     "DEFAULT_TRANSPORT",
     "INJECT_ITEMS_METHOD",
     "TRANSPORTS",
@@ -432,6 +433,8 @@ __all__ = [
     "interrupt_app_server_turn",
     "is_missing_thread",
     "is_quota_exhausted",
+    "isolation_overrides",
+    "isolation_thread_config",
     "map_codex_event",
     "mcp_config_args",
     "read_configured_cli_path",
@@ -938,7 +941,9 @@ def inject_items_params(thread_id: str, messages: tuple[Message, ...]) -> dict[s
     return {"threadId": thread_id, "items": app_server_history_items(messages)}
 
 
-def _thread_start_params(request: RunRequest, cwd: str) -> dict[str, Any]:
+def _thread_start_params(
+    request: RunRequest, cwd: str, config: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     """``ThreadStartParams`` for one stateless call.
 
     Field names are the vendor's own. ``cwd``, ``model``, ``baseInstructions``
@@ -960,8 +965,13 @@ def _thread_start_params(request: RunRequest, cwd: str) -> dict[str, Any]:
     entirely** when there are none rather than sent as ``[]`` --
     :func:`~modelpass.adapters.codex_appserver.dynamic_tools_param` records why the
     two are not the same statement.
+
+    ``config`` is :func:`isolation_thread_config`'s answer and is likewise
+    omitted when empty (nothing configured to switch off).
     """
     params: dict[str, Any] = {"cwd": cwd}
+    if config:
+        params["config"] = dict(config)
     if any(directive.name == "--ephemeral" for directive in request.plan.directives):
         params["ephemeral"] = True
     instructions = app_server_base_instructions(request.messages)
@@ -2065,6 +2075,147 @@ def chat_tool_overrides() -> list[str]:
     return args
 
 
+#: The ``-c`` overrides that keep a **stateless** app-server run to what the
+#: caller sent: no skills, no plugins (and the MCP servers and instructions they
+#: bring), no approval/permission prose, no apps or collaboration-mode prose, no
+#: environment context, no repository ``AGENTS.md`` chain, no user personality,
+#: no memories, no hooks, no ``notify`` program, no multi-agent hint prose, and
+#: none of the planning / ask-the-user tools a judge has no use for.
+#:
+#: Evidence, codex-cli 0.151.0, 2026-09-29. Every feature key was read back with
+#: ``codex features list -c <override>`` (each flips to ``false``); every other
+#: key path answered a bad value with a typed error naming it (``expected a
+#: boolean`` / ``usize`` / ``sequence`` / ``one of none, friendly, pragmatic``),
+#: so none of them is a silently-ignored no-op. ``codex debug prompt-input``
+#: (token-free) showed what each removes from the model-visible input:
+#:
+#: ==============================================  ===============================
+#: ``-c`` override                                 What it removed
+#: ==============================================  ===============================
+#: ``features.plugins=false``                      plugin MCP servers (``cua_repl``,
+#:                                                 ``job-search``), plugin prose
+#: ``skills.include_instructions=false``           the whole skills list (19.5k
+#:                                                 chars; the "skill descriptions
+#:                                                 were shortened" warning)
+#: ``include_permissions_instructions=false``      escalation / approved-prefix
+#:                                                 prose (9k chars)
+#: ``include_apps_instructions=false``             apps prose
+#: ``include_collaboration_mode_instructions``     collaboration-mode prose
+#: ``include_environment_context=false``           cwd / shell / date / timezone
+#: ``project_doc_max_bytes=0``                     ``AGENTS.md`` from the cwd up to
+#:                                                 the project root (a sentinel file
+#:                                                 vanished; not the global one)
+#: ``personality="none"``                          the user's ``personality`` (383
+#:                                                 tokens live)
+#: ``features.multi_agent_v2={enabled=false,...}`` the ``/root`` team and
+#:                                                 ``multi_agent_mode`` prose that
+#:                                                 the model catalog forces on for
+#:                                                 some models; ``enabled=false``
+#:                                                 keeps the feature itself off
+#: ``tools.update_plan.enabled=false``             ~300 prompt tokens of tools,
+#: ``tools.experimental_request_user_input...``    measured live together
+#: ``features.multi_agent/goals/tool_suggest/``    feature tools; no prompt change
+#: ``skill_search/memories/hooks=false``           on gpt-5.6-sol, kept because a
+#:                                                 user config can turn them on
+#: ``notify=[]``                                   the user's turn-ended program
+#: ==============================================  ===============================
+#:
+#: The **config-layer** MCP servers are the one thing ``-c`` cannot switch off
+#: without their names (``mcp_servers={}`` merges rather than clears, re-checked
+#: live), so they are enumerated with ``config/read`` on the launched child and
+#: disabled per thread -- :func:`isolation_thread_config`.
+_ISOLATION_OVERRIDES: tuple[tuple[str, str], ...] = (
+    ("features.plugins", "false"),
+    ("skills.include_instructions", "false"),
+    ("include_permissions_instructions", "false"),
+    ("include_apps_instructions", "false"),
+    ("include_collaboration_mode_instructions", "false"),
+    ("include_environment_context", "false"),
+    ("project_doc_max_bytes", "0"),
+    ("personality", '"none"'),
+    (
+        "features.multi_agent_v2",
+        '{enabled=false,root_agent_usage_hint_text="",multi_agent_mode_hint_text=""}',
+    ),
+    ("tools.update_plan.enabled", "false"),
+    ("tools.experimental_request_user_input.enabled", "false"),
+    ("features.multi_agent", "false"),
+    ("features.goals", "false"),
+    ("features.tool_suggest", "false"),
+    ("features.skill_search", "false"),
+    ("features.memories", "false"),
+    ("features.hooks", "false"),
+    ("notify", "[]"),
+)
+
+
+def isolation_overrides() -> list[str]:
+    """``-c`` arguments that keep a stateless app-server run to what the caller sent.
+
+    The Codex counterpart of the Anthropic adapter's ``isolation_options``
+    (2026-09-29). Traced live the same night: a plain ten-word
+    :meth:`~modelpass.Bridge.chat` on a ChatGPT subscription consumed **16,212**
+    input tokens, because the child loaded the user's whole Codex setup -- every
+    installed skill, four MCP servers (two from ``config.toml``, two from
+    plugins), the approval-rules prose, the multi-agent team prose and the user's
+    ``personality``. An evaluation judge certified "as" a model was that model
+    plus whatever this account happened to have installed.
+
+    Independent of :func:`chat_tool_overrides` and of ``native_tools``: a caller
+    who asks for Codex's own toolbelt has not asked for the user's skills, MCP
+    servers or ``AGENTS.md``. :data:`_ISOLATION_OVERRIDES` carries the evidence
+    per key.
+    """
+    args: list[str] = []
+    for key, value in _ISOLATION_OVERRIDES:
+        args.extend(["-c", f"{key}={value}"])
+    return args
+
+
+#: The app-server method that answers with the child's *effective* config --
+#: the user's ``config.toml``, any project layer for the given ``cwd``, and the
+#: launch's own ``-c`` overrides, merged. Driven live 2026-09-29 (codex-cli
+#: 0.151.0): with ``features.plugins=false`` its ``mcp_servers`` held exactly the
+#: two ``config.toml`` servers and neither plugin one.
+CONFIG_READ_METHOD = "config/read"
+
+
+def isolation_thread_config(config_read: Any) -> dict[str, Any]:
+    """``ThreadStartParams.config`` that switches off every configured MCP server.
+
+    ``config_read`` is the ``config/read`` answer. Every entry of its
+    ``config.mcp_servers`` that is not already ``enabled = false`` gets
+    ``{"enabled": false}`` for this thread only -- nothing is written to the
+    user's config. Driven live 2026-09-29: a thread started with this config
+    emitted no ``mcpServer/startupStatus/updated`` at all, where the same launch
+    without it started both servers. The per-thread field *merges* like ``-c``
+    does (``{"mcp_servers": {}}`` left both running), which is why the names are
+    needed.
+
+    Returns ``{}`` when nothing is configured, so the caller can omit the key.
+    Raises ``ValueError`` when the answer is not the documented shape -- the run
+    fails closed rather than going ahead with servers it promised to remove.
+    """
+    if not isinstance(config_read, Mapping):
+        raise ValueError("config/read did not answer with an object")
+    config = config_read.get("config")
+    if not isinstance(config, Mapping):
+        raise ValueError("config/read answered without a 'config' object")
+    servers = config.get("mcp_servers")
+    if servers is None:
+        return {}
+    if not isinstance(servers, Mapping):
+        raise ValueError("config/read's 'mcp_servers' is not a table")
+    disabled: dict[str, Any] = {}
+    for name, entry in servers.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("config/read listed an MCP server with no usable name")
+        if isinstance(entry, Mapping) and entry.get("enabled") is False:
+            continue
+        disabled[name] = {"enabled": False}
+    return {"mcp_servers": disabled} if disabled else {}
+
+
 #: Codex's own words for "that thread is not on this disk", captured live on
 #: 2026-08-30 against codex-cli 0.151.0 by resuming a UUID that was never a
 #: thread: exit code 1, empty stdout, and
@@ -2975,6 +3126,19 @@ class CodexAppServerSession:
             client.close()
 
 
+#: Named on every exec receipt: the stateless isolation of 2026-09-29
+#: (:func:`isolation_overrides`, :func:`isolation_thread_config`) is built on the
+#: app-server transport, and ``options={'transport': 'exec'}`` must not be a
+#: silent way around it.
+_EXEC_NOT_ISOLATED_NOTE = (
+    "this run is NOT isolated from the user's Codex setup: the exec transport "
+    "does not switch off configured and plugin MCP servers, installed skills, "
+    "plugins, the user's personality or repository instruction files the way the "
+    "app-server default does for a stateless call -- drop "
+    "options={'transport': 'exec'} for a run that carries only what was sent"
+)
+
+
 class OpenAIAdapter(Adapter):
     """Drives the Codex runtime under a ChatGPT subscription login."""
 
@@ -3146,6 +3310,7 @@ class OpenAIAdapter(Adapter):
                 "text arrives whole rather than in deltas, and tools= is refused -- "
                 "and per-run mcp_servers= works, which is the one thing the default "
                 "cannot do",
+                _EXEC_NOT_ISOLATED_NOTE,
             )
         return (
             "codex transport: app-server ('codex app-server --listen stdio://', "
@@ -3805,13 +3970,21 @@ class OpenAIAdapter(Adapter):
             # _ensure_client. Driven live 2026-08-31: this removed 5,621
             # prompt tokens from a bare call (15,890 -> 10,269) and the
             # caller's own dynamicTools kept working across it.
-            config_overrides=() if request.native_tools else chat_tool_overrides(),
+            #
+            # Then isolation (2026-09-29), always -- native_tools opts back
+            # into Codex's own toolbelt, not into the user's skills, plugins,
+            # MCP servers or AGENTS.md. See isolation_overrides.
+            config_overrides=(
+                *(() if request.native_tools else chat_tool_overrides()),
+                *isolation_overrides(),
+            ),
         )
         turn = AppServerTurn()
         run.attach_client(client, turn)
         try:
             client.start()
-            started = self._start_thread(client, request, cwd)
+            isolation = self._isolation_thread_config(client, cwd)
+            started = self._start_thread(client, request, cwd, isolation)
             turn.thread_id = _started_thread_id(started)
             # The round trip this runtime alone makes possible: the level was
             # sent on turn/start, and thread/start answers with the level the
@@ -3867,8 +4040,38 @@ class OpenAIAdapter(Adapter):
             self._runs.discard(run)
             client.close()
 
+    def _isolation_thread_config(
+        self, client: AppServerClient, cwd: str
+    ) -> dict[str, Any]:
+        """Which configured MCP servers this thread must switch off, asked of the child.
+
+        ``config/read`` runs on the child that will host the thread, with the
+        thread's own ``cwd``, so the answer includes a project config layer and
+        the launch's ``-c`` overrides exactly as the thread will see them -- no
+        second process, and no reading ``config.toml`` by hand and hoping it is
+        the whole story.
+
+        **Fails closed.** A refusal or an answer of the wrong shape ends the run
+        before ``thread/start``: no thread, no turn, nothing spent. Running on
+        with the user's servers attached would be the silent version of the
+        defect this exists to fix.
+        """
+        try:
+            answer = client.request(CONFIG_READ_METHOD, {"cwd": cwd})
+            return isolation_thread_config(answer)
+        except (AppServerRequestFailed, ValueError) as exc:
+            raise VendorRunFailed(
+                "codex app-server could not report its configured MCP servers "
+                f"({CONFIG_READ_METHOD}: {exc}), so this run could not be isolated "
+                "from them; no thread was started and nothing was spent"
+            ) from exc
+
     def _start_thread(
-        self, client: AppServerClient, request: RunRequest, cwd: str
+        self,
+        client: AppServerClient,
+        request: RunRequest,
+        cwd: str,
+        isolation: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         """``thread/start``, with a tool-bearing refusal made legible.
 
@@ -3882,7 +4085,9 @@ class OpenAIAdapter(Adapter):
         of their tool names collided with Codex's own.
         """
         try:
-            return client.request("thread/start", _thread_start_params(request, cwd))
+            return client.request(
+                "thread/start", _thread_start_params(request, cwd, isolation)
+            )
         except AppServerRequestFailed as exc:
             if not request.tools:
                 raise
