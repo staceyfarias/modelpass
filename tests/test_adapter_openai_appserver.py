@@ -49,6 +49,7 @@ from modelpass.adapters.openai import (
     chat_tool_overrides,
     inject_items_params,
     interrupt_app_server_turn,
+    isolation_overrides,
     render_prompt,
     resolve_transport,
 )
@@ -446,6 +447,11 @@ def test_the_app_server_launch_carries_the_chat_tool_overrides():
     the launch was between S4 and D23 -- and that gap is the defect D23
     repairs, not a property worth preserving. The overrides go where
     ``app_server_argv`` puts them: after the subcommand, before ``--listen``.
+
+    Corrected 2026-09-29: the four-plus-toolbelt argv this asserted was the
+    unisolated launch -- the user's skills, plugins, MCP servers and
+    personality all rode along -- so it pinned the defect rather than a
+    property. The isolation overrides follow the toolbelt ones.
     """
     server = ScriptedAppServer(script_for())
     adapter, spawn = adapter_for(server)
@@ -454,6 +460,7 @@ def test_the_app_server_launch_carries_the_chat_tool_overrides():
         "C:/codex/codex.exe",
         "app-server",
         *chat_tool_overrides(),
+        *isolation_overrides(),
         "--listen",
         "stdio://",
     ]
@@ -467,11 +474,17 @@ def test_native_tools_opts_back_into_the_runtimes_own_toolbelt():
     is in ``option_keys``, because an option the adapter reads but does not
     declare gets a "will be ignored" note stamped on the receipt of the one
     call that honours it.
+
+    Corrected 2026-09-29: the bare argv asserted here meant "native tools"
+    also brought back the user's skills, plugins and MCP servers, which nobody
+    asked for. The option restores Codex's own toolbelt and nothing else.
     """
     server = ScriptedAppServer(script_for())
     adapter, spawn = adapter_for(server)
     list(adapter.run(request_for(options={"native_tools": True})))
-    assert spawn.argv == ["C:/codex/codex.exe", "app-server", "--listen", "stdio://"]
+    assert spawn.argv == [
+        "C:/codex/codex.exe", "app-server", *isolation_overrides(), "--listen", "stdio://"
+    ]
     assert "native_tools" in OpenAIAdapter.option_keys
     assert OpenAIAdapter.unknown_option_keys({"native_tools": True}) == ()
 
@@ -503,8 +516,10 @@ def test_a_turn_streams_the_captured_answer_and_ends_ok():
     adapter, _ = adapter_for(server)
     events = list(adapter.run(request_for()))
 
-    assert server.methods[:3] == ["initialize", "initialized", "thread/start"]
-    assert server.methods[3] == "turn/start"
+    # config/read sits between the handshake and the thread: it is how the run
+    # learns which configured MCP servers to switch off (isolation, 2026-09-29).
+    assert server.methods[:4] == ["initialize", "initialized", "config/read", "thread/start"]
+    assert server.methods[4] == "turn/start"
     text = "".join(e.text for e in events if e.type == "text_delta")
     assert text == "-13.7 LUFS integrated, true peak -1.2 dBTP"
     terminal = events[-1]
@@ -773,7 +788,9 @@ def test_history_becomes_one_inject_items_call_in_order(tmp_path):
 
     assert server.methods.count(INJECT_ITEMS_METHOD) == 1
     order = [m for m in server.methods if m != "initialized"]
-    assert order == ["initialize", "thread/start", INJECT_ITEMS_METHOD, "turn/start"]
+    assert order == [
+        "initialize", "config/read", "thread/start", INJECT_ITEMS_METHOD, "turn/start"
+    ]
 
     params = server.params_of(INJECT_ITEMS_METHOD)
     assert params["threadId"] == INJECT_THREAD_ID
@@ -1558,11 +1575,14 @@ def test_the_tool_loop_runs_end_to_end_through_bridge_chat(tmp_path):
     # runtime's own toolbelt is off on the command line and the caller's own
     # tools still reach the wire and still run. Driven live 2026-08-31 as well
     # -- toolbelt off, `dynamicTools` registered, handler invoked, answer
-    # correct -- so this is the offline half of a fact, not a guess.
+    # correct -- so this is the offline half of a fact, not a guess. Isolation
+    # (2026-09-29) rides after the toolbelt switches and leaves the caller's
+    # tools alone.
     assert spawn.argv == [
         "C:/codex/codex.exe",
         "app-server",
         *chat_tool_overrides(),
+        *isolation_overrides(),
         "--listen",
         "stdio://",
     ]
@@ -1782,3 +1802,4 @@ def test_an_adapter_with_no_opinion_is_the_default():
     adapter = AnthropicAdapter()
     for capability in Capability:
         assert adapter.support_for(capability, {"transport": "app-server"}) is None
+
