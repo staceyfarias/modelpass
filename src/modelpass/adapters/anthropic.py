@@ -300,7 +300,16 @@ class CredentialStatus:
     present: bool = False
     expires_at: float | None = None
     expired: bool = False
+    #: A refresh token is present *and* not known to have expired. Claude Code
+    #: refreshes an expired access token on its first real use with this.
     refreshable: bool = True
+    #: ``refreshTokenExpiresAt`` when the file records it (newer Claude Code
+    #: writes it beside ``expiresAt``); ``None`` where it is absent.
+    refresh_expires_at: float | None = None
+    #: The refresh token is present but its recorded expiry has passed, so no
+    #: refresh can succeed. Kept apart from "no refresh token at all" because
+    #: the two want different sentences, not a different instruction.
+    refresh_expired: bool = False
     subscription_type: str | None = None
     rate_limit_tier: str | None = None
     detail: str | None = None
@@ -382,20 +391,23 @@ def read_credential_status(env: Mapping[str, str] | None = None) -> CredentialSt
             source=source, present=True, detail="no claudeAiOauth entry in credential file"
         )
 
-    expires_raw = oauth.get("expiresAt")
-    expires_at: float | None = None
+    expires_at = _epoch_seconds(oauth.get("expiresAt"))
     # A zero or negative expiry is not a date. Claude Code writes ``0`` into
     # this field when it blanks the tokens, so reading it as a timestamp puts
     # the expiry at the epoch and every check downstream reports a login that
     # "expired in 1970" -- an artefact of the field being cleared, stated as a
     # fact about a token that was never there. No expiry recorded is `None`.
-    if isinstance(expires_raw, (int, float)) and expires_raw > 0:
-        # The file stores milliseconds; tolerate seconds from an older layout.
-        expires_at = float(expires_raw) / 1000.0 if expires_raw > 1e11 else float(expires_raw)
+    # (``_epoch_seconds`` returns ``None`` for it.)
+    refresh_expires_at = _epoch_seconds(oauth.get("refreshTokenExpiresAt"))
 
+    now = time.time()
     # Presence/length only -- the value itself is never read out of this scope.
-    refreshable = bool(str(oauth.get("refreshToken") or ""))
-    expired = expires_at is not None and expires_at <= time.time()
+    has_refresh_token = bool(str(oauth.get("refreshToken") or ""))
+    refresh_expired = (
+        has_refresh_token and refresh_expires_at is not None and refresh_expires_at <= now
+    )
+    refreshable = has_refresh_token and not refresh_expired
+    expired = expires_at is not None and expires_at <= now
     present = bool(str(oauth.get("accessToken") or ""))
 
     return CredentialStatus(
@@ -404,11 +416,24 @@ def read_credential_status(env: Mapping[str, str] | None = None) -> CredentialSt
         expires_at=expires_at,
         expired=expired,
         refreshable=refreshable,
+        refresh_expires_at=refresh_expires_at,
+        refresh_expired=refresh_expired,
         subscription_type=_as_str(oauth.get("subscriptionType")),
         rate_limit_tier=_as_str(oauth.get("rateLimitTier")),
         detail=None if present else "credential file holds no access token",
         logged_out=not present,
     )
+
+
+def _epoch_seconds(raw: Any) -> float | None:
+    """A credential-file timestamp as epoch seconds; ``None`` if it is not a date.
+
+    The file stores milliseconds; seconds from an older layout are tolerated.
+    Zero, negative, boolean and non-numeric values are not dates.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        return None
+    return float(raw) / 1000.0 if raw > 1e11 else float(raw)
 
 
 def _as_str(value: Any) -> str | None:
@@ -2123,22 +2148,6 @@ class AnthropicAdapter(Adapter):
         super().invalidate_identity_cache()
         self._identity_cache.clear()
 
-    def _force_auth_status(
-        self, binary: str, env: Mapping[str, str]
-    ) -> Mapping[str, Any] | None:
-        """Bypass the identity cache for a fresh ``claude auth status`` answer.
-
-        Used only once a stored login's access token is found expired: the
-        answer already cached for this preflight predates that discovery, and
-        a ``claude`` invocation is Claude Code's own trigger for the proactive
-        refresh it performs lazily on any command that needs a valid token. A
-        cached "yes, logged in" from up to a minute ago says nothing about
-        whether that refresh just succeeded or failed.
-        """
-        key = (binary, env.get("CLAUDE_CONFIG_DIR"))
-        self._identity_cache.pop(key, None)
-        return self._cached_auth_status(binary, env)
-
     def _ttl_env(self, sdk: Any, plan: PreflightPlan) -> dict[str, str]:
         """Pin the session prefix's cache TTL, but only where the CLI reads it.
 
@@ -2202,9 +2211,7 @@ class AnthropicAdapter(Adapter):
         profile = _account_profile_from_auth_status(
             self._cached_auth_status(cli_path, plan.env)
         )
-        return self._subscription_receipt(
-            request, notes, account_profile=profile, cli_path=cli_path
-        )
+        return self._subscription_receipt(request, notes, account_profile=profile)
 
     def _api_key_receipt(self, request: RunRequest, notes: list[str]) -> Receipt:
         plan = request.plan
@@ -2232,7 +2239,6 @@ class AnthropicAdapter(Adapter):
         notes: list[str],
         *,
         account_profile: AccountProfile | None = None,
-        cli_path: str | None = None,
     ) -> Receipt:
         """Confirm a usable subscription login, or fail closed.
 
@@ -2321,57 +2327,44 @@ class AnthropicAdapter(Adapter):
                 account_profile=account_profile,
                 ok=False,
                 problem=(
-                    f"the Claude Code login expired {when} and carries no refresh token, "
-                    "so a modelpass-spawned runtime cannot authenticate. Re-run "
-                    "'claude /login' (or 'claude setup-token') to refresh it"
+                    (
+                        f"the Claude Code login's access token expired {when} and could "
+                        "not be refreshed: its refresh token expired "
+                        f"{_format_expiry(status.refresh_expires_at)}. Re-run "
+                        "'claude /login' (or 'claude setup-token') to log in again"
+                    )
+                    if status.refresh_expired
+                    else (
+                        f"the Claude Code login expired {when} and carries no refresh "
+                        "token, so a modelpass-spawned runtime cannot authenticate. "
+                        "Re-run 'claude /login' (or 'claude setup-token') to refresh it"
+                    )
                 ),
                 notes=tuple(notes),
             )
 
         if status.expired:
-            # usable is True here, so a refresh token is present. Rather than
-            # trusting "the runtime will refresh it on use", spend one cheap
-            # CLI probe to find out whether it already did: a ``claude``
-            # invocation is Claude Code's own trigger for the proactive
-            # refresh it performs lazily, and a permanently-failed refresh
-            # (dead refresh_token, revoked grant) leaves the account looking
-            # "logged in" without ever clearing the stored tokens -- exactly
-            # the failure a passive note would miss.
-            if cli_path is not None:
-                fresh_profile = _account_profile_from_auth_status(
-                    self._force_auth_status(cli_path, plan.env)
-                )
-                if fresh_profile is not None:
-                    account_profile = fresh_profile
-                status = read_credential_status(plan.env)
-                if status.expired:
-                    when = _format_expiry(status.expires_at)
-                    return Receipt.from_plan(
-                        plan,
-                        detected_auth_mode=None,
-                        credential_source=status.source,
-                        account=account_profile.email if account_profile else None,
-                        plan_name=(
-                            account_profile.subscription_type
-                            if account_profile and account_profile.subscription_type
-                            else status.subscription_type
-                        ),
-                        account_profile=account_profile,
-                        ok=False,
-                        problem=(
-                            f"the Claude Code login's access token expired {when} and "
-                            "could not be refreshed (re-checked via 'claude auth "
-                            "status'); the stored refresh token may be revoked or "
-                            "invalid. Re-run 'claude /login' (or 'claude setup-token') "
-                            "to log in again"
-                        ),
-                        notes=tuple(notes),
-                    )
-                notes.append("access token had expired and was refreshed during preflight")
-            else:
-                notes.append(
-                    "access token is past its expiry; the runtime will refresh it on use"
-                )
+            # usable is True here, so a refresh token is present and not known
+            # to have expired. Preflight does not try to refresh it: ``claude
+            # auth status`` does not refresh (observed 2026-09-30: repeated runs
+            # past ``expiresAt`` reported loggedIn and never rewrote the file),
+            # while a real model call does, at once -- and the run about to
+            # start is exactly such a call, under the same config directory and
+            # the same scrubbed environment. A refresh that fails there leaves
+            # the runtime without a valid token, and an authentication failure
+            # ends the run as an error, never OK: the 401 result shape observed
+            # live maps to ``TerminalStatus.ERROR`` (``_terminal_status``), and a
+            # CLI that exits instead fails the run the same way. (Not yet
+            # observed live: what a *failed* refresh looks like.) The
+            # init-message ``apiKeySource`` check still refuses any fallback to
+            # a metered key, so proceeding cannot turn into a silent success or
+            # a billed one.
+            when = _format_expiry(status.expires_at)
+            notes.append(
+                f"access token is past its expiry ({when}); Claude Code refreshes it "
+                "with the stored refresh token on first use -- a failed refresh ends "
+                "the run as an authentication error"
+            )
         if status.detail:
             notes.append(status.detail)
         if status.rate_limit_tier:

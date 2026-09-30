@@ -7,6 +7,21 @@ work landed.
 
 ### Fixed
 
+- **A lapsed Claude access token no longer refuses a subscription run**
+  (2026-09-30). When `.credentials.json` showed an expired access token with a
+  refresh token, preflight re-ran `claude auth status` expecting it to refresh,
+  re-read the file, and refused the run as "could not be refreshed". `auth
+  status` does not refresh (observed: loggedIn reported, file never rewritten);
+  a real model call does, at once. So every subscription run was refused
+  whenever the short-lived token had lapsed and nothing else had used Claude
+  Code since, on a valid login. Preflight now lets it through with a receipt
+  note that the runtime refreshes on first use; a refresh that fails ends the
+  run as an authentication error, and the `apiKeySource` check still refuses
+  any metered fallback. New: `refreshTokenExpiresAt` is read
+  (`CredentialStatus.refresh_expires_at`, `refresh_expired`), and a login whose
+  refresh token has itself expired is refused before the run with a message
+  naming that expiry.
+
 - **A stateless Codex call carries only what the caller sent** (2026-09-29).
   On the default `app-server` transport a plain ten-word `chat()` on a ChatGPT
   subscription consumed 16,212 input tokens: the child loaded every installed

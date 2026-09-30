@@ -1139,20 +1139,21 @@ def test_non_init_messages_are_ignored_by_the_cross_check():
 # --- credential detection ------------------------------------------------------
 
 
-def _write_credentials(tmp_path, *, expires_at: float, refresh: str) -> dict[str, str]:
+def _write_credentials(
+    tmp_path, *, expires_at: float, refresh: str, refresh_expires_at: float | None = None
+) -> dict[str, str]:
+    oauth: dict[str, Any] = {
+        "accessToken": "not-a-real-token",
+        "refreshToken": refresh,
+        "expiresAt": int(expires_at * 1000),
+        "subscriptionType": "pro",
+        "rateLimitTier": "default_claude_ai",
+    }
+    if refresh_expires_at is not None:
+        # Newer Claude Code writes this beside expiresAt, also in milliseconds.
+        oauth["refreshTokenExpiresAt"] = int(refresh_expires_at * 1000)
     (tmp_path / ".credentials.json").write_text(
-        json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "not-a-real-token",
-                    "refreshToken": refresh,
-                    "expiresAt": int(expires_at * 1000),
-                    "subscriptionType": "pro",
-                    "rateLimitTier": "default_claude_ai",
-                }
-            }
-        ),
-        encoding="utf-8",
+        json.dumps({"claudeAiOauth": oauth}), encoding="utf-8"
     )
     return {"CLAUDE_CONFIG_DIR": str(tmp_path)}
 
@@ -1333,11 +1334,6 @@ def _profile_request(subscription_connection, root):
     return RunRequest(connection=connection, messages=(), plan=plan_launch(connection, {}))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="defect: preflight re-probes 'claude auth status', which does not refresh, "
-    "and then refuses the still-expired token",
-)
 def test_an_expired_access_token_with_a_refresh_token_proceeds(
     monkeypatch, subscription_connection, tmp_path
 ):
@@ -1368,6 +1364,128 @@ def test_an_expired_access_token_with_a_refresh_token_proceeds(
     assert "was refreshed during preflight" not in joined
     assert calls == [str(tmp_path)]
     assert (tmp_path / ".credentials.json").read_bytes() == before
+
+
+def test_an_expired_access_token_with_a_live_dated_refresh_token_proceeds(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """The shape of the real file: refreshTokenExpiresAt recorded and in the future."""
+    adapter, _ = _preflight_adapter(
+        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
+    )
+    _write_credentials(
+        tmp_path,
+        expires_at=time.time() - 600,
+        refresh="r",
+        refresh_expires_at=time.time() + 30 * 86400,
+    )
+
+    status = read_credential_status({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+    assert status.expired and status.refreshable and not status.refresh_expired
+    assert status.usable
+
+    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
+    assert receipt.ok, receipt.problem
+    assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
+
+
+def test_an_expired_access_token_whose_refresh_token_also_expired_is_refused(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """No refresh can succeed, so the run must not start: refuse and say to log in.
+
+    The refusal names the refresh token's expiry rather than claiming there is
+    no refresh token -- the file plainly holds one.
+    """
+    adapter, _ = _preflight_adapter(
+        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
+    )
+    _write_credentials(
+        tmp_path,
+        expires_at=time.time() - 600,
+        refresh="r",
+        refresh_expires_at=time.time() - 60,
+    )
+
+    status = read_credential_status({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+    assert status.refresh_expired and not status.refreshable and not status.usable
+
+    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
+    assert not receipt.ok
+    assert receipt.detected_auth_mode is None
+    assert "could not be refreshed" in receipt.problem
+    assert "refresh token expired" in receipt.problem
+    assert "no refresh token" not in receipt.problem
+    assert "claude /login" in receipt.problem
+
+
+def test_an_expired_refresh_token_does_not_block_a_still_valid_access_token(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """The access token authenticates on its own until it lapses; nothing to refresh yet."""
+    adapter, _ = _preflight_adapter(
+        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
+    )
+    _write_credentials(
+        tmp_path,
+        expires_at=time.time() + 3600,
+        refresh="r",
+        refresh_expires_at=time.time() - 60,
+    )
+    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
+    assert receipt.ok, receipt.problem
+
+
+def test_a_failed_refresh_during_the_run_ends_it_as_an_error_not_a_success():
+    """Preflight lets an expired-but-refreshable token through, so a refresh that
+    then fails must surface as a run failure. What reaches the stream is an
+    authentication failure; the 401 shape observed live maps to ERROR even
+    though its subtype says 'success'."""
+    msg = ResultMessage(
+        subtype="success",
+        is_error=True,
+        api_error_status=401,
+        result="Failed to authenticate. API Error: 401 OAuth token has expired.",
+    )
+    terminal = map_message(msg)[-1]
+    assert terminal.status is TerminalStatus.ERROR
+    assert "401" in terminal.reason
+
+
+def test_a_login_that_has_not_expired_is_unchanged(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """Not expired: ok, one auth-status probe, no expiry note."""
+    calls: list[str] = []
+
+    def auth_status(binary, env):
+        calls.append(env.get("CLAUDE_CONFIG_DIR"))
+        return {"loggedIn": True}
+
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=auth_status)
+    _write_credentials(
+        tmp_path,
+        expires_at=time.time() + 3600,
+        refresh="r",
+        refresh_expires_at=time.time() + 30 * 86400,
+    )
+    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
+    assert receipt.ok, receipt.problem
+    assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
+    assert "past its expiry" not in " ".join(receipt.notes)
+    assert calls == [str(tmp_path)]
+
+
+def test_an_expired_login_without_a_refresh_token_keeps_its_refusal(
+    monkeypatch, subscription_connection, tmp_path
+):
+    adapter, _ = _preflight_adapter(
+        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
+    )
+    _write_credentials(tmp_path, expires_at=time.time() - 600, refresh="")
+    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
+    assert not receipt.ok
+    assert "carries no refresh token" in receipt.problem
 
 
 # --- macOS ---------------------------------------------------------------------
