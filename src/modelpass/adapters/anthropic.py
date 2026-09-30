@@ -226,6 +226,12 @@ def run_scratch_folder() -> str:
         return _RUN_SCRATCH
 
 
+#: Caller options a stateless run refuses, because any of them would undo
+#: :func:`isolation_options` or the settings lock without anyone noticing.
+_ISOLATION_KEYS = frozenset({"strict_mcp_config", "mcp_servers",
+                             "setting_sources", "tools", "allowed_tools"})
+
+
 def isolation_options() -> dict[str, Any]:
     """What keeps a stateless run to exactly what the caller sent.
 
@@ -2537,6 +2543,17 @@ class AnthropicAdapter(Adapter):
         for key, value in request.options.items():
             if key == "include_partial_messages":
                 continue
+            if key in _ISOLATION_KEYS:
+                # Refused, not applied: each of these would silently undo the
+                # isolation that keeps a run to what the caller sent (Fable QA,
+                # 2026-09-29). Tools and MCP servers have their own request
+                # fields, which keep strict config; cwd stays open (a caller
+                # may name the folder its work is in).
+                raise CapabilityNotSupported(
+                    Runtime.ANTHROPIC_SDK.value, key,
+                    f"options[{key!r}] would remove a stateless run's isolation "
+                    "(account connectors, skills, settings); pass tools and MCP "
+                    "servers through the request's own fields instead")
             if key == "env":
                 # Caller levers may travel alongside the connection's explicit
                 # account selection, but may not replace it. This mirrors the

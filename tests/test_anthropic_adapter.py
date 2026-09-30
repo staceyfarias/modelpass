@@ -2776,3 +2776,18 @@ def test_a_caller_may_name_its_own_working_directory(
 ):
     options = launch_options(monkeypatch, request_factory(options={"cwd": str(tmp_path)}))
     assert options["cwd"] == str(tmp_path)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("strict_mcp_config", False),
+    ("mcp_servers", {"x": {"type": "stdio", "command": "x"}}),
+    ("setting_sources", ["user"]),
+    ("tools", ["Bash"]),
+    ("allowed_tools", ["Bash"]),
+])
+def test_a_caller_option_cannot_silently_undo_isolation(
+    monkeypatch, request_factory, key, value
+):
+    """Fable QA 2026-09-29: these used to be applied as given."""
+    with pytest.raises(CapabilityNotSupported):
+        launch_options(monkeypatch, request_factory(options={key: value}))
