@@ -638,7 +638,11 @@ def test_a_plain_chat_run_asks_for_no_tools_and_one_turn(monkeypatch, subscripti
     options = launch_options(monkeypatch, subscription_request)
     assert options["max_turns"] == 1
     assert options["allowed_tools"] == []
-    assert "mcp_servers" not in options
+    # No MCP server at all -- which is "an empty server set under strict
+    # config", not "no MCP option". Leaving the option out let Claude Code load
+    # the account's claude.ai connectors into every plain call (traced
+    # 2026-09-29); this assertion used to pin that absence.
+    assert options.get("mcp_servers", {}) == {}
 
 
 def test_a_run_passes_the_connections_claude_config_dir_to_the_sdk(
