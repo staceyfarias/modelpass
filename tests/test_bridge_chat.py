@@ -115,7 +115,7 @@ def test_the_stamp_follows_the_detected_mode_not_the_declared_one(
     assert terminal.auth_mode is AuthMode.API_KEY
 
 
-def test_a_pinned_account_identity_is_verified_before_a_run(
+def test_setup_verifies_a_pinned_account_identity(
     subscription_connection, bridge_factory
 ):
     connection = replace(
@@ -133,12 +133,12 @@ def test_a_pinned_account_identity_is_verified_before_a_run(
         )
     )
     bridge, _ = bridge_factory(connection, adapter)
-    receipt = bridge.preflight(connection.name)
+    receipt = bridge.preflight(connection.name, verify_identity=True)
     assert receipt.ok is True
     assert receipt.identity_verified is True
 
 
-def test_account_drift_fails_closed_before_model_traffic(
+def test_setup_reports_account_drift_as_a_mismatch(
     subscription_connection, bridge_factory
 ):
     connection = replace(
@@ -157,14 +157,14 @@ def test_account_drift_fails_closed_before_model_traffic(
         )
     )
     bridge, _ = bridge_factory(connection, adapter)
-    receipt = bridge.preflight(connection.name)
+    receipt = bridge.preflight(connection.name, verify_identity=True)
     assert receipt.ok is False
     assert receipt.identity_verified is False
     assert "ACCOUNT IDENTITY MISMATCH" in (receipt.problem or "")
     assert adapter.requests == []
 
 
-def test_a_pinned_account_whose_probe_says_nothing_fails_closed_with_advice(
+def test_setup_with_a_pinned_account_whose_probe_says_nothing_fails_with_advice(
     subscription_connection, bridge_factory
 ):
     """A pin nobody can check is not a pass -- but the text must say how to fix it."""
@@ -173,13 +173,65 @@ def test_a_pinned_account_whose_probe_says_nothing_fails_closed_with_advice(
         account_binding=AccountBinding(email="work@example.com"),
     )
     bridge, adapter = bridge_factory(connection, FakeAdapter(account_profile=None))
-    receipt = bridge.preflight(connection.name)
+    receipt = bridge.preflight(connection.name, verify_identity=True)
     assert receipt.ok is False
     assert receipt.identity_verified is False
     problem = receipt.problem or ""
     assert "returned nothing" in problem
     assert f"modelpass verify {connection.name}" in problem
     assert adapter.requests == []
+
+
+def test_a_run_on_a_pinned_connection_never_probes_identity(
+    subscription_connection, bridge_factory
+):
+    """Owner decision 2026-10-01: a run does not ask who is logged in.
+
+    The adapter would report a different account than the pin, and the run goes
+    ahead anyway -- with the pinned account named on the receipt as recorded.
+    """
+    connection = replace(
+        subscription_connection,
+        account_binding=AccountBinding(email="work@example.com"),
+    )
+    adapter = FakeAdapter(
+        [TextDeltaEvent(text="x")],
+        account_profile=AccountProfile(
+            vendor="anthropic", source="test", email="personal@example.com"
+        ),
+    )
+    bridge, _ = bridge_factory(connection, adapter)
+    events = list(bridge.chat(connection=connection.name, message="hi"))
+    assert events[-1].status is TerminalStatus.OK
+    assert adapter.identity_probes == []
+    receipt = bridge.preflight(connection.name)
+    assert receipt.ok is True
+    assert receipt.identity_verified is None
+    assert receipt.account == (
+        "work@example.com (recorded at verify, not re-checked at run time)"
+    )
+
+
+def test_a_probe_that_would_return_nothing_cannot_refuse_a_pinned_run(
+    subscription_connection, bridge_factory
+):
+    """The 2026-10-01 RAGauge failure: four workers, one empty probe, 97 refusals."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    connection = replace(
+        subscription_connection,
+        account_binding=AccountBinding(email="work@example.com"),
+    )
+    adapter = FakeAdapter([TextDeltaEvent(text="x")], account_profile=None)
+    bridge, _ = bridge_factory(connection, adapter)
+
+    def one(_):
+        return list(bridge.chat(connection=connection.name, message="hi"))[-1].status
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        statuses = list(pool.map(one, range(8)))
+    assert statuses == [TerminalStatus.OK] * 8
+    assert adapter.identity_probes == []
 
 
 def test_the_unpinned_note_is_emitted_once_per_receipt(
@@ -191,7 +243,7 @@ def test_the_unpinned_note_is_emitted_once_per_receipt(
     unpinned = [n for n in receipt.notes if "not pinned" in n]
     assert len(unpinned) == 1
 
-    twice = Bridge._with_identity_verification(subscription_connection, receipt)
+    twice = Bridge._with_recorded_identity(subscription_connection, receipt)
     assert [n for n in twice.notes if "not pinned" in n] == unpinned
 
 

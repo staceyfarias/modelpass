@@ -215,9 +215,19 @@ works there as it does elsewhere. When the Keychain refuses a write (locked, an 
 session, a password out of sync) Claude Code falls back to a plaintext
 `.credentials.json` under the same directory, and modelpass reads that file exactly as it
 does on Linux. modelpass never inspects Keychain contents; when there is no file, the
-receipt says so and the token-free `claude auth status` probe — run inside the selected
-directory — is what answers *which account is logged in*. A profile whose
-`claude auth status` reports no login fails closed before any tokens are spent.
+receipt says so, and `modelpass check` / `verify` (setup time) use the token-free
+`claude auth status` probe — run inside the selected directory — to answer *which account
+is logged in*.
+
+**Identity is verified at setup, not on each run.** Which login belongs to which
+connection is decided once, by `modelpass connect`, `verify`, `check` and the bench page,
+which read and pin the account (email, organization, plan). A run — plain, async, session
+or failover — treats a subscription login like an API key: it reads the connection's own
+credential file (no subprocess, no network), runs if there is a valid access token or an
+expired one with a refresh token, and otherwise fails with an error naming the connection
+and the `claude /login` (or `codex login`) command for that config directory. It never
+asks the vendor who is logged in and never falls back to another connection. Run receipts
+still show the pinned account, labelled `(recorded at verify, not re-checked at run time)`.
 
 Codex uses the same abstraction with `CODEX_HOME`. OpenAI documents that all Codex
 state lives beneath this root, including `config.toml` and `auth.json`. The one-time

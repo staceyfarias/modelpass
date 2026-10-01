@@ -812,7 +812,7 @@ def _verify(name: str, bridge: Bridge, out: IO[str]) -> int:
     # accounts and run this must not be handed a minute-old probe.
     bridge.refresh_identity(connection)
     candidate = replace(connection, account_binding=None)
-    receipt = bridge.preflight(candidate)
+    receipt = bridge.preflight(candidate, verify_identity=True)
     _print_receipt(receipt, out)
     if not receipt.ok:
         return EXIT_FAILED

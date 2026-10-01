@@ -2088,6 +2088,8 @@ class AnthropicAdapter(Adapter):
         self._identity_cache: dict[
             tuple[str, str | None], tuple[float, Mapping[str, Any] | None]
         ] = {}
+        self._identity_locks: dict[tuple[str, str | None], threading.Lock] = {}
+        self._identity_locks_guard = threading.Lock()
 
     # --- availability ----------------------------------------------------------
 
@@ -2135,13 +2137,22 @@ class AnthropicAdapter(Adapter):
     ) -> Mapping[str, Any] | None:
         """``claude auth status`` for one (binary, config directory), briefly cached."""
         key = (binary, env.get("CLAUDE_CONFIG_DIR"))
-        now = time.monotonic()
-        hit = self._identity_cache.get(key)
-        if hit is not None and now - hit[0] < _IDENTITY_CACHE_TTL_SECONDS:
-            return hit[1]
-        answer = self._auth_status(binary, env)
-        self._identity_cache[key] = (now, answer)
-        return answer
+        # One probe at a time per key, so concurrent callers share one answer
+        # instead of each spawning their own; and an empty answer is never
+        # kept, so one failed probe cannot be served for the next minute.
+        with self._identity_lock(key):
+            now = time.monotonic()
+            hit = self._identity_cache.get(key)
+            if hit is not None and now - hit[0] < _IDENTITY_CACHE_TTL_SECONDS:
+                return hit[1]
+            answer = self._auth_status(binary, env)
+            if answer:
+                self._identity_cache[key] = (now, answer)
+            return answer
+
+    def _identity_lock(self, key: tuple[str, str | None]) -> threading.Lock:
+        with self._identity_locks_guard:
+            return self._identity_locks.setdefault(key, threading.Lock())
 
     def invalidate_identity_cache(self) -> None:
         """Force the next preflight to re-probe. See :meth:`Adapter.invalidate_identity_cache`."""
@@ -2168,7 +2179,24 @@ class AnthropicAdapter(Adapter):
     # --- preflight -------------------------------------------------------------
 
     def preflight(self, request: RunRequest) -> Receipt:
-        """Report which auth mode this run would actually use, and why."""
+        """Report which auth mode this run would actually use, and why.
+
+        The run-time check (owner decision, 2026-10-01): it reads the
+        connection's own credential store and nothing else -- no ``claude auth
+        status`` subprocess, no account comparison. Which login belongs to which
+        connection is decided at setup; a run treats a subscription login like
+        an API key. :meth:`identity_preflight` is the setup-time variant.
+        """
+        return self._preflight(request, probe_identity=False)
+
+    def identity_preflight(self, request: RunRequest) -> Receipt:
+        """:meth:`preflight` plus the live ``claude auth status`` account read.
+
+        For ``modelpass connect`` / ``verify`` / ``check`` and the bench only.
+        """
+        return self._preflight(request, probe_identity=True)
+
+    def _preflight(self, request: RunRequest, *, probe_identity: bool) -> Receipt:
         plan = request.plan
         connection = request.connection
         check_launch_args(self.runtime, _contributed_args(request))
@@ -2208,10 +2236,16 @@ class AnthropicAdapter(Adapter):
 
         if connection.auth_mode is AuthMode.API_KEY:
             return self._api_key_receipt(request, notes)
-        profile = _account_profile_from_auth_status(
-            self._cached_auth_status(cli_path, plan.env)
+        profile = (
+            _account_profile_from_auth_status(
+                self._cached_auth_status(cli_path, plan.env)
+            )
+            if probe_identity
+            else None
         )
-        return self._subscription_receipt(request, notes, account_profile=profile)
+        return self._subscription_receipt(
+            request, notes, account_profile=profile, probed=probe_identity
+        )
 
     def _api_key_receipt(self, request: RunRequest, notes: list[str]) -> Receipt:
         plan = request.plan
@@ -2239,6 +2273,7 @@ class AnthropicAdapter(Adapter):
         notes: list[str],
         *,
         account_profile: AccountProfile | None = None,
+        probed: bool = True,
     ) -> Receipt:
         """Confirm a usable subscription login, or fail closed.
 
@@ -2270,7 +2305,7 @@ class AnthropicAdapter(Adapter):
                     ),
                     notes=tuple(notes),
                 )
-            if account_profile is None:
+            if probed and account_profile is None:
                 notes.append(
                     "identity could not be confirmed: 'claude auth status' returned "
                     "nothing and modelpass does not inspect Keychain contents"

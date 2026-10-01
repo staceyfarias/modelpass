@@ -1915,17 +1915,28 @@ is the optional isolation boundary. `Account` aliases `Connection`, so older cal
 and files remain source-compatible; `Bridge.accounts()` and `Bridge.account(id)` expose
 the higher-level terminology directly.
 
-**Account identity.** Preflight runs the documented, token-free `claude auth status`
-JSON command inside the selected `CLAUDE_CONFIG_DIR`. Its non-secret identity fields
+**Account identity (setup time only, owner decision 2026-10-01).** `Bridge.preflight(
+connection, verify_identity=True)` — what `modelpass connect`, `verify`, `check` and the
+Bench use, through `Adapter.identity_preflight` — runs the documented, token-free `claude
+auth status` JSON command inside the selected `CLAUDE_CONFIG_DIR` and compares it with the
+pin. Every run path (`chat`, `achat`, sessions, failover, and `preflight()` by default)
+uses `Adapter.preflight`, which reads the connection's credential file only: no probe, no
+comparison, and the receipt's `account` reads `<pinned account> (recorded at verify, not
+re-checked at run time)`. Missing or unrefreshable credentials fail with a message naming
+the config directory and the `claude /login` command; an expired access token with a
+refresh token proceeds. On macOS with no credential file the run path proceeds on the
+Keychain's word (it cannot be inspected); the `loggedIn: false` refusal below applies to
+the setup-time check. The probe's non-secret identity fields
 become `Receipt.account_profile`: login state and method, API provider, email,
 organization ID/name, and subscription type. The adapter normalizes an explicit
 allow-list rather than retaining the vendor payload, so tokens and future unknown fields
 cannot enter a receipt, CLI rendering, run log, or Bench page.
 
-The probe is a subprocess costing seconds, and every `run`, `chat` and session open goes
-through a preflight that wants its answer, so each adapter caches it for 60 seconds keyed
+The probe is a subprocess costing seconds, so each adapter caches a *successful* answer for
+60 seconds (an empty or failed answer is never cached) keyed
 by *(binary, config directory)* — never by binary alone, since two profiles on one binary
-are two different accounts. The same applies to Codex's `account/read`, whose probe
+are two different accounts — with probes serialized per key so concurrent callers share
+one answer. The same applies to Codex's `account/read`, whose probe
 starts a whole app-server. `Bridge.refresh_identity(connection)` drops that cache;
 `modelpass verify` and the Bench's Verify button call it first, because re-reading the live
 identity is their entire job. `Adapter.invalidate_identity_cache()` is the adapter-side
@@ -2001,8 +2012,9 @@ and unresolved `auto` on the mistaken belief that only `auth.json` moved with th
 directory. See OpenAI's [authentication storage documentation](https://learn.chatgpt.com/docs/auth)
 and [advanced configuration documentation](https://learn.chatgpt.com/docs/config-file/config-advanced).
 
-**Account identity.** After `codex login status` confirms the billing mode, preflight
-uses the supported app-server `account/read` request inside the selected `CODEX_HOME`.
+**Account identity (setup time only).** After `codex login status` confirms the billing
+mode, the setup-time `identity_preflight` (never a run) uses the supported app-server
+`account/read` request inside the selected `CODEX_HOME`.
 Codex reports account type, email, and ChatGPT plan type; those fields become the
 normalized `Receipt.account_profile`. Tokens and the rest of the app-server payload are
 not retained. `account/rateLimits/read` is a separate surface and is not presented as

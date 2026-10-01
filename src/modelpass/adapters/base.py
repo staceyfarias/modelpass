@@ -604,6 +604,16 @@ class Adapter(abc.ABC):
         consistent across adapters.
         """
 
+    def identity_preflight(self, request: RunRequest) -> Receipt:
+        """:meth:`preflight` plus a live read of which account is logged in.
+
+        The setup-time variant (``connect`` / ``verify`` / ``check`` / the
+        bench). :meth:`preflight` is what a run does and must never probe
+        identity (owner decision, 2026-10-01). An adapter with no identity probe
+        has nothing to add, hence the default.
+        """
+        return self.preflight(request)
+
     def invalidate_identity_cache(self) -> None:
         """Drop any cached answer about *which account* this runtime is logged into.
 

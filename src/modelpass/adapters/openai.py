@@ -3199,19 +3199,29 @@ class OpenAIAdapter(Adapter):
         self._identity_cache: dict[
             tuple[str, str], tuple[float, Mapping[str, Any] | None]
         ] = {}
+        self._identity_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._identity_locks_guard = threading.Lock()
 
     def _cached_account_read(
         self, binary: str, env: dict[str, str], home: Path
     ) -> Mapping[str, Any] | None:
         """``account/read`` for one (binary, codex home), briefly cached."""
         key = (binary, str(home))
-        now = time.monotonic()
-        hit = self._identity_cache.get(key)
-        if hit is not None and now - hit[0] < _IDENTITY_CACHE_TTL_SECONDS:
-            return hit[1]
-        answer = self._account_read(binary, env)
-        self._identity_cache[key] = (now, answer)
-        return answer
+        # Serialized per key and never caches an empty answer; see
+        # AnthropicAdapter._cached_auth_status.
+        with self._identity_lock(key):
+            now = time.monotonic()
+            hit = self._identity_cache.get(key)
+            if hit is not None and now - hit[0] < _IDENTITY_CACHE_TTL_SECONDS:
+                return hit[1]
+            answer = self._account_read(binary, env)
+            if answer:
+                self._identity_cache[key] = (now, answer)
+            return answer
+
+    def _identity_lock(self, key: tuple[str, str]) -> threading.Lock:
+        with self._identity_locks_guard:
+            return self._identity_locks.setdefault(key, threading.Lock())
 
     def invalidate_identity_cache(self) -> None:
         """Force the next preflight to re-probe. See :meth:`Adapter.invalidate_identity_cache`."""
@@ -3404,6 +3414,18 @@ class OpenAIAdapter(Adapter):
         return True, None, (*notes, "access token had expired and was refreshed during preflight")
 
     def preflight(self, request: RunRequest) -> Receipt:
+        """The run-time check: Codex's own login state, no account read.
+
+        Owner decision, 2026-10-01: a run does not ask "who is logged in".
+        :meth:`identity_preflight` is the setup-time variant that does.
+        """
+        return self._preflight(request, probe_identity=False)
+
+    def identity_preflight(self, request: RunRequest) -> Receipt:
+        """:meth:`preflight` plus the live ``account/read``, for setup commands."""
+        return self._preflight(request, probe_identity=True)
+
+    def _preflight(self, request: RunRequest, *, probe_identity: bool) -> Receipt:
         plan = request.plan
         home = self._codex_home_for(request)
         model_fields = self._model_fields(request, home)
@@ -3485,7 +3507,7 @@ class OpenAIAdapter(Adapter):
             )
 
         account_profile = None
-        if detected is not None:
+        if detected is not None and probe_identity:
             account_profile = _account_profile_from_account_read(
                 self._cached_account_read(binary, dict(plan.env), home)
             )

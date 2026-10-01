@@ -44,6 +44,7 @@ from modelpass.errors import (
     CapabilityNotSupported,
     InvalidSession,
     SessionNotFound,
+    SubpassError,
     VendorRunFailed,
 )
 from modelpass.guards import GuardTracker
@@ -1362,7 +1363,7 @@ def test_an_expired_access_token_with_a_refresh_token_proceeds(
     assert "past its expiry" in joined
     assert "refresh" in joined and "first use" in joined
     assert "was refreshed during preflight" not in joined
-    assert calls == [str(tmp_path)]
+    assert calls == []  # a run never asks `claude auth status` (2026-10-01)
     assert (tmp_path / ".credentials.json").read_bytes() == before
 
 
@@ -1455,7 +1456,7 @@ def test_a_failed_refresh_during_the_run_ends_it_as_an_error_not_a_success():
 def test_a_login_that_has_not_expired_is_unchanged(
     monkeypatch, subscription_connection, tmp_path
 ):
-    """Not expired: ok, one auth-status probe, no expiry note."""
+    """Not expired: ok, no expiry note, and no auth-status probe on the run path."""
     calls: list[str] = []
 
     def auth_status(binary, env):
@@ -1473,7 +1474,7 @@ def test_a_login_that_has_not_expired_is_unchanged(
     assert receipt.ok, receipt.problem
     assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
     assert "past its expiry" not in " ".join(receipt.notes)
-    assert calls == [str(tmp_path)]
+    assert calls == []
 
 
 def test_an_expired_login_without_a_refresh_token_keeps_its_refusal(
@@ -1497,7 +1498,7 @@ def test_an_expired_login_without_a_refresh_token_keeps_its_refusal(
 # only way this machine can reach them at all.
 
 
-def _darwin_preflight(monkeypatch, request, *, auth_status):
+def _darwin_preflight(monkeypatch, request, *, auth_status, identity=True):
     from modelpass.adapters import anthropic as module
 
     adapter = AnthropicAdapter(auth_status=lambda binary, env: auth_status)
@@ -1506,7 +1507,7 @@ def _darwin_preflight(monkeypatch, request, *, auth_status):
     monkeypatch.setattr(adapter, "_sdk", lambda: FakeSdk())
     monkeypatch.setattr(adapter, "_cli_status", lambda sdk: ("claude", None))
     monkeypatch.setattr(adapter, "_cli_version", lambda binary, env: "2.1.242")
-    return adapter.preflight(request)
+    return (adapter.identity_preflight if identity else adapter.preflight)(request)
 
 
 def _isolated_request(request_factory, root):
@@ -2896,3 +2897,113 @@ def test_a_caller_option_cannot_silently_undo_isolation(
     """Fable QA 2026-09-29: these used to be applied as given."""
     with pytest.raises(CapabilityNotSupported):
         launch_options(monkeypatch, request_factory(options={key: value}))
+
+
+# --- run time asks no identity question (owner decision, 2026-10-01) -------------
+
+
+def _no_probe(binary, env):
+    raise AssertionError("claude auth status must not run on the run path")
+
+
+def test_a_run_preflight_never_invokes_the_identity_probe(
+    monkeypatch, subscription_connection, tmp_path
+):
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=_no_probe)
+    _write_credentials(tmp_path, expires_at=time.time() + 3600, refresh="r")
+    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
+    assert receipt.ok, receipt.problem
+    assert receipt.account_profile is None
+
+
+def test_four_concurrent_run_preflights_all_pass_with_a_probe_that_would_fail(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """The 2026-10-01 failure: an empty probe refused every call for a minute."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: None)
+    _write_credentials(tmp_path, expires_at=time.time() + 3600, refresh="r")
+    request = _profile_request(subscription_connection, tmp_path)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        receipts = list(pool.map(lambda _: adapter.preflight(request), range(8)))
+    assert all(r.ok for r in receipts), [r.problem for r in receipts]
+
+
+def test_a_missing_login_names_the_directory_and_the_fix_and_tries_nothing_else(
+    monkeypatch, subscription_connection, tmp_path
+):
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=_no_probe)
+    request = _profile_request(subscription_connection, tmp_path)  # no credential file
+    receipt = adapter.preflight(request)
+    assert receipt.ok is False
+    assert "claude /login" in receipt.problem
+    assert "CLAUDE_CONFIG_DIR set to that directory" in receipt.problem
+    assert str(tmp_path) in receipt.problem
+    with pytest.raises(SubpassError) as raised:
+        receipt.require_ok()
+    assert subscription_connection.name in str(raised.value)
+
+
+def test_an_expired_token_without_a_refresh_token_is_refused_with_the_relogin_command(
+    monkeypatch, subscription_connection, tmp_path
+):
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=_no_probe)
+    _write_credentials(tmp_path, expires_at=time.time() - 600, refresh="")
+    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
+    assert receipt.ok is False
+    assert "claude /login" in receipt.problem
+
+
+def test_the_setup_preflight_still_probes_identity(
+    monkeypatch, subscription_connection, tmp_path
+):
+    calls: list[str] = []
+
+    def auth_status(binary, env):
+        calls.append(env.get("CLAUDE_CONFIG_DIR"))
+        return {"loggedIn": True, "email": "work@example.com"}
+
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=auth_status)
+    _write_credentials(tmp_path, expires_at=time.time() + 3600, refresh="r")
+    receipt = adapter.identity_preflight(_profile_request(subscription_connection, tmp_path))
+    assert calls == [str(tmp_path)]
+    assert receipt.account_profile is not None
+    assert receipt.account_profile.email == "work@example.com"
+
+
+def test_an_empty_identity_answer_is_never_cached(monkeypatch):
+    from modelpass.adapters import anthropic as module
+
+    answers = iter([None, {"loggedIn": True}])
+    adapter = module.AnthropicAdapter(auth_status=lambda b, e: next(answers))
+    assert adapter._cached_auth_status("claude", {"CLAUDE_CONFIG_DIR": "x"}) is None
+    assert adapter._cached_auth_status("claude", {"CLAUDE_CONFIG_DIR": "x"}) == {
+        "loggedIn": True
+    }
+
+
+def test_concurrent_identity_probes_for_one_config_dir_share_one_answer():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from modelpass.adapters import anthropic as module
+
+    calls = []
+    gate = threading.Event()
+
+    def auth_status(binary, env):
+        calls.append(1)
+        gate.wait(0.2)
+        return {"loggedIn": True}
+
+    adapter = module.AnthropicAdapter(auth_status=auth_status)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        answers = list(
+            pool.map(
+                lambda _: adapter._cached_auth_status("claude", {"CLAUDE_CONFIG_DIR": "x"}),
+                range(4),
+            )
+        )
+    assert answers == [{"loggedIn": True}] * 4
+    assert len(calls) == 1

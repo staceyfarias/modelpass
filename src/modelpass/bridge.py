@@ -171,6 +171,11 @@ _UNPINNED_NOTE = (
 )
 
 
+#: Appended to the account a run receipt reports, so nobody reads a pinned
+#: account as one that was checked live. See :meth:`Bridge._with_recorded_identity`.
+_RECORDED_LABEL = "(recorded at verify, not re-checked at run time)"
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationReport:
     """What :meth:`Bridge.validate` found, offline (2026-08-17).
@@ -783,8 +788,17 @@ class Bridge:
         model: str | None = None,
         schema: Mapping[str, Any] | None = None,
         sampling: Sampling | Mapping[str, Any] | None = None,
+        verify_identity: bool = False,
     ) -> Receipt:
         """Run the full preflight and return the receipt, without starting a run.
+
+        ``verify_identity`` is the setup-time switch (owner decision, 2026-10-01).
+        Off, which is what every run does, the receipt is built from the
+        connection's own credential store only: no vendor identity probe, no
+        comparison with the pinned account, and the account line reports what
+        was recorded at ``verify``. On -- ``modelpass check`` / ``verify`` /
+        ``connect`` and the bench -- the vendor is asked who is logged in and a
+        mismatch with the pin fails the receipt.
 
         ``model`` is the model the caller intends to pass to :meth:`chat`. It is
         accepted here so that "which model will this run ask for" is answerable
@@ -813,9 +827,14 @@ class Bridge:
             schema=normalize_schema(schema) if schema is not None else None,
         )
         adapter = self.adapter_for(resolved.runtime)
-        receipt = self._with_identity_verification(
-            resolved, adapter.preflight(request)
-        )
+        if verify_identity:
+            receipt = self._with_identity_verification(
+                resolved, adapter.identity_preflight(request)
+            )
+        else:
+            receipt = self._with_recorded_identity(
+                resolved, adapter.preflight(request)
+            )
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
         receipt = self._with_reasoning_disclosure(request, receipt)
@@ -958,6 +977,30 @@ class Bridge:
             problems=tuple(problems),
             notes=tuple(notes),
         )
+
+    @staticmethod
+    def _with_recorded_identity(
+        connection: Connection, receipt: Receipt
+    ) -> Receipt:
+        """The run-time counterpart of :meth:`_with_identity_verification`.
+
+        Owner decision, 2026-10-01: a run does not ask the vendor who is logged
+        in and does not compare anything with the pin -- which login belongs to
+        which connection is decided once, at setup. What a run still shows is
+        which account the connection was pinned to, **labelled as recorded**, so
+        a receipt always says whose login it ran under without claiming to have
+        checked. Idempotent for the same reason the verifying step is: a
+        session's receipt passes through here twice.
+        """
+        binding = connection.account_binding
+        if binding is None:
+            if not connection.is_subscription or _UNPINNED_NOTE in receipt.notes:
+                return receipt
+            return replace(receipt, notes=(*receipt.notes, _UNPINNED_NOTE))
+        if receipt.account is not None and _RECORDED_LABEL in receipt.account:
+            return receipt
+        who = binding.email or binding.organization_id
+        return replace(receipt, account=f"{who} {_RECORDED_LABEL}")
 
     @staticmethod
     def _with_identity_verification(
@@ -2266,7 +2309,7 @@ class Bridge:
         # Answered from the ``SessionRequest``, not from the run-shaped wrapper
         # above: a worker's prefix starts with the runtime's own preset, and
         # only the session request carries the prompt semantics that say so.
-        receipt = self._with_identity_verification(resolved, receipt)
+        receipt = self._with_recorded_identity(resolved, receipt)
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
         receipt = self._with_reasoning_disclosure(request, receipt)
@@ -2922,7 +2965,7 @@ class Bridge:
         :meth:`achat` can hand it to a thread without copying the decorations
         that follow it.
         """
-        receipt = self._with_identity_verification(
+        receipt = self._with_recorded_identity(
             plan.request.connection, plan.adapter.preflight(plan.request)
         )
         _note = self._option_note(plan.adapter, plan.request.options)
@@ -3325,7 +3368,7 @@ class Bridge:
                 schema=primary.schema,
                 schema_name=primary.schema_name,
             )
-            receipt = self._with_identity_verification(
+            receipt = self._with_recorded_identity(
                 target, adapter.preflight(request)
             )
             receipt.require_ok()

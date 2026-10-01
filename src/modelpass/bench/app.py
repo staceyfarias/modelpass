@@ -397,7 +397,7 @@ def _receipt_view(bridge: Bridge, name: str) -> dict[str, Any]:
     """
     try:
         connection = bridge.connection(name)
-        receipt = bridge.preflight(connection)
+        receipt = bridge.preflight(connection, verify_identity=True)
     except SubpassError as exc:
         return {"connection": name, "failed": str(exc)}
     data = receipt.to_dict()
@@ -718,7 +718,7 @@ def create_app(
             # adapter's short-lived cache of one.
             active.refresh_identity(connection)
             candidate = replace(connection, account_binding=None)
-            receipt = active.preflight(candidate)
+            receipt = active.preflight(candidate, verify_identity=True)
             if not receipt.ok:
                 raise ValueError(receipt.problem or "identity preflight failed")
             profile = receipt.account_profile

@@ -458,6 +458,41 @@ def test_verify_pins_an_existing_unverified_account(cli, store, subscription_con
     assert store.get(subscription_connection.name).account_binding is not None
 
 
+def test_check_and_verify_still_probe_identity_and_report_a_mismatch(
+    cli, store, subscription_connection
+):
+    """Identity is answered at setup (owner decision, 2026-10-01), not at run time."""
+    from dataclasses import replace
+
+    from modelpass.connections import AccountBinding
+    from modelpass.preflight import AccountProfile
+
+    store.add(
+        replace(
+            subscription_connection,
+            account_binding=AccountBinding(email="work@example.com"),
+        )
+    )
+    adapter = FakeAdapter(
+        [],
+        account_profile=AccountProfile(
+            vendor="anthropic", source="test", email="personal@example.com"
+        ),
+    )
+    code, out, _ = cli(["check", subscription_connection.name], adapter=adapter)
+    assert code != 0
+    assert "MISMATCH" in out
+    assert len(adapter.identity_probes) == 1
+
+    code, out, _ = cli(["verify", subscription_connection.name], adapter=adapter)
+    assert code == 0
+    assert len(adapter.identity_probes) == 2
+    assert (
+        store.get(subscription_connection.name).account_binding.email
+        == "personal@example.com"
+    )
+
+
 def test_accounts_uses_account_language_on_a_fresh_install(cli):
     code, out, _ = cli(["accounts"])
     assert code == 0

@@ -405,6 +405,7 @@ class FakeAdapter(Adapter):
 
         self.requests: list[RunRequest] = []
         self.preflights: list[RunRequest] = []
+        self.identity_probes: list[RunRequest] = []
         self.cancelled = 0
         self.consumed: list[AgentEvent] = []
         self.closed = False
@@ -427,14 +428,30 @@ class FakeAdapter(Adapter):
         return self.cache
 
     def preflight(self, request: RunRequest) -> Receipt:
+        """The run-time check: like a real adapter, it reports no vendor profile."""
         self.preflights.append(request)
+        return self._receipt(request, account_profile=None)
+
+    def identity_preflight(self, request: RunRequest) -> Receipt:
+        """The setup-time check: reports ``account_profile``, and counts the probe.
+
+        ``identity_probes`` is what a test asserts on to show a run never asked
+        the vendor who is logged in.
+        """
+        self.preflights.append(request)
+        self.identity_probes.append(request)
+        return self._receipt(request, account_profile=self.account_profile)
+
+    def _receipt(
+        self, request: RunRequest, *, account_profile: AccountProfile | None
+    ) -> Receipt:
         return Receipt.from_plan(
             request.plan,
             detected_auth_mode=self.detected_auth_mode or request.connection.auth_mode,
             credential_source=request.connection.credential_ref.describe(),
             account=self.account,
             plan_name=self.plan_name,
-            account_profile=self.account_profile,
+            account_profile=account_profile,
             runtime_available=self.runtime_available,
             ok=self.ok,
             problem=self.problem,

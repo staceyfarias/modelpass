@@ -113,7 +113,7 @@ def receipt_for(
             runtime_available=available,
             secrets=source,
         )
-    return bridge.preflight(connection)
+    return bridge.preflight(connection, verify_identity=True)
 
 
 def binding_from_receipt(receipt: Receipt) -> AccountBinding | None:

@@ -5,6 +5,25 @@ work landed.
 
 ## Unreleased
 
+### Changed
+
+- **Account identity is verified at setup, not on each run** (2026-10-01). A RAGauge
+  grading run lost 97 of 100 questions in 55 seconds to `PreflightFailed: ... the
+  vendor identity probe returned nothing`: four workers probed `claude auth status`
+  at once, one probe came back empty, and the empty answer was cached for 60 s and
+  refused every call. Runs (`chat`, `achat`, sessions, failover) no longer probe
+  the vendor or compare with the pinned account: the Anthropic and Codex adapters'
+  `preflight()` reads the connection's own credential store only (valid or
+  refreshable login runs; otherwise a typed `PreflightFailed` names the connection
+  and the `claude /login` / `codex login` command for its config directory).
+  `modelpass connect`, `verify`, `check` and the bench keep the probe and the pin
+  comparison via the new `Adapter.identity_preflight()` /
+  `Bridge.preflight(..., verify_identity=True)`. Run receipts report the pinned
+  account labelled `(recorded at verify, not re-checked at run time)`. Probe
+  results are never cached when empty, and are serialized per (binary, config dir).
+  New: `FakeAdapter.identity_probes`. Tests that pinned per-run identity
+  verification as the intended behaviour were updated to the setup-time path.
+
 ### Fixed
 
 - **A lapsed Claude access token no longer refuses a subscription run**

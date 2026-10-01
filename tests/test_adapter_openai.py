@@ -953,7 +953,9 @@ def test_cancel_kills_the_process_and_synthesizes_cancelled():
 # --- preflight ------------------------------------------------------------------
 
 
-def preflight_with(status_output, connection=None, env=None, account_read=None):
+def preflight_with(
+    status_output, connection=None, env=None, account_read=None, identity=True
+):
     connection = connection or codex_connection()
     adapter = OpenAIAdapter(
         codex_bin="codex",
@@ -963,7 +965,8 @@ def preflight_with(status_output, connection=None, env=None, account_read=None):
         # runs `codex --version`, which this suite never does.
         codex_version=lambda b, e: "codex-cli 0.117.0",
     )
-    return adapter.preflight(request_for(connection, env=env))
+    run = adapter.identity_preflight if identity else adapter.preflight
+    return run(request_for(connection, env=env))
 
 
 def test_preflight_detects_chatgpt_subscription_login():
@@ -994,6 +997,53 @@ def test_preflight_exposes_openai_account_identity_without_vendor_secrets():
     assert receipt.account_profile is not None
     assert receipt.account_profile.auth_method == "chatgpt"
     assert "must-not-escape" not in json.dumps(receipt.to_dict())
+
+
+def test_a_run_preflight_never_reads_the_account():
+    """Owner decision 2026-10-01: a run does not ask who is logged in."""
+
+    def account_read(binary, env):
+        raise AssertionError("account/read must not run on the run path")
+
+    receipt = preflight_with(
+        "Logged in using ChatGPT\n", account_read=account_read, identity=False
+    )
+    assert receipt.ok
+    assert receipt.account_profile is None
+
+
+def test_concurrent_run_preflights_pass_with_an_account_read_that_would_fail():
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        receipts = list(
+            pool.map(
+                lambda _: preflight_with(
+                    "Logged in using ChatGPT\n",
+                    account_read=lambda b, e: None,
+                    identity=False,
+                ),
+                range(8),
+            )
+        )
+    assert all(r.ok for r in receipts)
+
+
+def test_a_logged_out_codex_home_is_refused_without_an_account_read():
+    receipt = preflight_with(
+        "Not logged in\n", account_read=lambda b, e: 1 / 0, identity=False
+    )
+    assert receipt.ok is False
+    assert "codex login" in receipt.problem
+
+
+def test_an_empty_openai_identity_answer_is_never_cached(tmp_path):
+    answers = iter([None, {"account": {"type": "chatgpt"}}])
+    adapter = OpenAIAdapter(codex_bin="codex", account_read=lambda b, e: next(answers))
+    assert adapter._cached_account_read("codex", {}, tmp_path) is None
+    assert adapter._cached_account_read("codex", {}, tmp_path) == {
+        "account": {"type": "chatgpt"}
+    }
 
 
 def test_openai_account_profile_ignores_unknown_top_level_payloads():
@@ -1125,7 +1175,7 @@ def test_the_isolated_home_reaches_both_vendor_probes_as_codex_home(tmp_path):
         account_read=account_read,
         codex_version=lambda b, e: "codex-cli 0.117.0",
     )
-    receipt = adapter.preflight(request_for(_isolated_openai(home)))
+    receipt = adapter.identity_preflight(request_for(_isolated_openai(home)))
     assert receipt.ok is True
     assert seen == {"login": str(home), "account": str(home)}
     assert receipt.account == "work@example.com"
