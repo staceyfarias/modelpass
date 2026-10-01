@@ -184,6 +184,21 @@ def codex_connection(auth_mode=AuthMode.SUBSCRIPTION) -> Connection:
 EXEC = {"transport": "exec"}
 
 
+
+@pytest.fixture(autouse=True)
+def _hermetic_codex_home(tmp_path_factory, monkeypatch):
+    """No test here may read this machine's real ``~/.codex``.
+
+    The run-time preflight reads ``auth.json`` from the connection's Codex home
+    (owner decision, 2026-10-01), so an unisolated connection would otherwise
+    pick up whatever login the developer running the suite has.
+    """
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+
 def request_for(
     connection: Connection, env: dict[str, str] | None = None, **kwargs
 ) -> RunRequest:
@@ -1227,53 +1242,75 @@ def test_preflight_flags_api_key_login_as_a_mismatch():
         receipt.require_auth_mode()
 
 
-def test_an_expired_but_refreshable_codex_login_is_verified_and_refreshed(tmp_path):
-    """Parity with the Anthropic adapter's fix for the real-world failure: a
-    receipt saying ok=True on a login whose refresh silently failed lets a run
-    start and then die on the first token, because 'codex login status' can
-    keep saying 'logged in' after a permanently-failed refresh without ever
-    clearing the stored tokens. Preflight now re-checks auth.json after one
-    forced CLI probe instead of trusting the text answer alone.
-    """
-    home = tmp_path / "codex-work"
-    _write_auth_json(home, access_exp=time.time() - 10, refresh="r")
-    calls = {"n": 0}
-
+def _codex_adapter_that_must_not_ask(**kwargs):
     def login_status(binary, env):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            _write_auth_json(home, access_exp=time.time() + 3600, refresh="r")
-        return "Logged in using ChatGPT\n"
+        raise AssertionError("codex login status must not run when auth.json answers")
 
-    adapter = OpenAIAdapter(
+    return OpenAIAdapter(
         codex_bin="codex",
         login_status=login_status,
         codex_version=lambda b, e: "codex-cli 0.117.0",
+        **kwargs,
     )
-    receipt = adapter.preflight(request_for(_isolated_openai(home)))
-
-    assert receipt.ok
-    assert calls["n"] == 2
-    assert "was refreshed during preflight" in " ".join(receipt.notes)
 
 
-def test_a_permanently_failed_codex_refresh_fails_closed_and_says_to_log_in_again(tmp_path):
-    """auth.json still expired after the forced re-probe is exactly the
-    permanent-refresh-failure shape (dead refresh_token, revoked grant) that
-    'codex login status' alone does not surface -- the run must not proceed."""
+def test_an_expired_but_refreshable_codex_login_proceeds_without_a_subprocess(tmp_path):
+    """Expired access token, refresh token present: the run goes ahead.
+
+    Codex refreshes on the first call that needs a token, and the run is that
+    call; a refresh that fails ends the run as an authentication error. The
+    preflight neither shells out to provoke it nor claims it happened.
+    """
     home = tmp_path / "codex-work"
     _write_auth_json(home, access_exp=time.time() - 10, refresh="r")
+    receipt = _codex_adapter_that_must_not_ask().preflight(
+        request_for(_isolated_openai(home))
+    )
+    assert receipt.ok, receipt.problem
+    assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
+    joined = " ".join(receipt.notes)
+    assert "past its expiry" in joined and "first use" in joined
+    assert "was refreshed during preflight" not in joined
 
+
+def test_a_valid_auth_json_is_enough_and_no_subprocess_runs(tmp_path):
+    home = tmp_path / "codex-work"
+    _write_auth_json(home, access_exp=time.time() + 3600, refresh="r")
+    receipt = _codex_adapter_that_must_not_ask().preflight(
+        request_for(_isolated_openai(home))
+    )
+    assert receipt.ok, receipt.problem
+    assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
+    assert str(home / "auth.json") in receipt.credential_source
+
+
+def test_an_api_key_auth_json_is_detected_from_the_file(tmp_path):
+    home = tmp_path / "codex-work"
+    home.mkdir()
+    (home / "auth.json").write_text('{"OPENAI_API_KEY": "sk-test"}', encoding="utf-8")
+    receipt = _codex_adapter_that_must_not_ask().preflight(
+        request_for(_isolated_openai(home))
+    )
+    assert receipt.detected_auth_mode is AuthMode.API_KEY
+    with pytest.raises(AuthModeMismatch):
+        receipt.require_auth_mode()
+
+
+def test_a_keyring_login_that_cannot_be_inspected_proceeds_on_a_run_with_a_note(tmp_path):
+    """No auth.json and a silent ``login status``: a note on a run, a refusal at setup."""
+    home = tmp_path / "codex-work"
+    home.mkdir()
     adapter = OpenAIAdapter(
         codex_bin="codex",
-        login_status=lambda b, e: "Logged in using ChatGPT\n",
+        login_status=lambda b, e: None,
         codex_version=lambda b, e: "codex-cli 0.117.0",
     )
-    receipt = adapter.preflight(request_for(_isolated_openai(home)))
-
-    assert not receipt.ok
-    assert "could not be refreshed" in receipt.problem
-    assert "codex login" in receipt.problem
+    request = request_for(_isolated_openai(home))
+    run = adapter.preflight(request)
+    assert run.ok, run.problem
+    assert any("not inspected" in n for n in run.notes)
+    setup = adapter.identity_preflight(request)
+    assert not setup.ok and "codex login status" in setup.problem
 
 
 def test_an_expired_codex_login_without_refresh_token_fails_closed(tmp_path):

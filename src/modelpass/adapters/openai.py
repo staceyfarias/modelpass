@@ -1639,6 +1639,28 @@ def read_credential_status(home: Path) -> CredentialStatus:
     )
 
 
+def _stored_login_kind(home: Path) -> str | None:
+    """What kind of login ``auth.json`` holds: ``"chatgpt"``, ``"api_key"`` or ``None``.
+
+    ``None`` means the file cannot answer -- absent (the login may be in the OS
+    keyring), unreadable, or holding neither. Metadata only, like
+    :func:`read_credential_status`: presence is tested, no value is returned.
+    """
+    path = home / "auth.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    tokens = raw.get("tokens")
+    if isinstance(tokens, Mapping) and str(tokens.get("access_token") or ""):
+        return "chatgpt"
+    if str(raw.get("OPENAI_API_KEY") or raw.get("openai_api_key") or ""):
+        return "api_key"
+    return None
+
+
 def _format_expiry(expires_at: float | None) -> str:
     if expires_at is None:
         return "at an unknown time"
@@ -3357,30 +3379,18 @@ class OpenAIAdapter(Adapter):
             "than scrubbed",
         )
 
+    @staticmethod
     def _verify_subscription_token(
-        self,
-        binary: str,
-        env: dict[str, str],
-        home: Path,
-        notes: tuple[str, ...],
+        home: Path, notes: tuple[str, ...]
     ) -> tuple[bool, str | None, tuple[str, ...]]:
-        """Confirm the ChatGPT login's access token is actually usable now.
+        """Confirm the ChatGPT login's access token can authenticate, from ``auth.json``.
 
-        ``codex login status`` reporting "logged in" is not the same claim as
-        "the stored access token still works": Codex records a *permanent*
-        refresh failure (dead refresh_token, revoked grant) without logging
-        the account out, so a stale-but-optimistic status line is exactly the
-        shape of failure a preflight is supposed to catch before a run spends
-        anything. ``auth.json``'s token expiry is the fact ``login status``
-        does not expose, so this reads it directly (metadata only -- see
-        :class:`CredentialStatus`).
-
-        An expired-but-refreshable token gets one extra chance: Codex
-        refreshes lazily on any command that needs a valid token, and
-        ``codex login status`` is exactly such a command, so re-running it
-        once and re-reading ``auth.json`` afterwards is the cheapest way to
-        turn "the runtime will probably refresh it" into "it just did, or it
-        didn't." No model tokens are spent either way.
+        Reads the file and nothing else -- no subprocess (owner decision,
+        2026-10-01). An expired access token with a refresh token proceeds:
+        Codex refreshes lazily on the first call that needs a valid token, and
+        the run about to start is such a call. ``codex login status`` used to be
+        re-run here to provoke that refresh; the run does it, and a refresh that
+        fails ends the run as an authentication error.
         """
         status = read_credential_status(home)
         if not status.present:
@@ -3388,8 +3398,8 @@ class OpenAIAdapter(Adapter):
         if status.usable and not status.expired:
             return True, None, notes
 
+        when = _format_expiry(status.expires_at)
         if not status.usable:
-            when = _format_expiry(status.expires_at)
             return (
                 False,
                 f"the Codex ChatGPT login's access token expired {when} and carries "
@@ -3397,21 +3407,53 @@ class OpenAIAdapter(Adapter):
                 "Re-run 'codex login' to log in again",
                 notes,
             )
+        return (
+            True,
+            None,
+            (
+                *notes,
+                f"access token is past its expiry ({when}); Codex refreshes it with the "
+                "stored refresh token on first use -- a failed refresh ends the run as "
+                "an authentication error",
+            ),
+        )
 
-        # status.expired and status.refreshable: give the CLI one chance to
-        # refresh it, then trust only what auth.json shows afterwards.
-        self._login_status(binary, env)
-        refreshed = read_credential_status(home)
-        if refreshed.expired:
-            when = _format_expiry(refreshed.expires_at)
+    @staticmethod
+    def _parse_login_status(
+        output: str, request: RunRequest, home: Path
+    ) -> tuple[AuthMode | None, str, bool, str | None]:
+        """Read ``codex login status`` text: the fallback when ``auth.json`` is silent."""
+        lower = output.lower()
+        if "logged in using chatgpt" in lower:
             return (
-                False,
-                f"the Codex ChatGPT login's access token expired {when} and could not "
-                "be refreshed (re-checked via 'codex login status'); the stored refresh "
-                "token may be revoked or invalid. Re-run 'codex login' to log in again",
-                notes,
+                AuthMode.SUBSCRIPTION,
+                f"Sign in with ChatGPT (codex login, {home / 'auth.json'})",
+                True,
+                None,
             )
-        return True, None, (*notes, "access token had expired and was refreshed during preflight")
+        if "logged in" in lower and "api key" in lower:
+            return AuthMode.API_KEY, "API key login (codex login --with-api-key)", True, None
+        if "not logged in" in lower:
+            # Name the directory when the connection chose one. `codex login`
+            # with no CODEX_HOME logs in the *default* account, so a user who
+            # follows the bare advice against a profile connection authenticates
+            # the wrong account and the connection fails exactly as before --
+            # having spent a browser round trip to change nothing.
+            if request.connection.config_dir:
+                problem = (
+                    f"codex is not logged in for {home}; run 'codex login' with "
+                    "CODEX_HOME set to that directory before using this "
+                    "subscription connection"
+                )
+            else:
+                problem = "codex is not logged in; run 'codex login' first"
+            return None, "", False, problem
+        return (
+            None,
+            "",
+            False,
+            f"unrecognized 'codex login status' output: {output.strip()[:200]!r}",
+        )
 
     def preflight(self, request: RunRequest) -> Receipt:
         """The run-time check: Codex's own login state, no account read.
@@ -3459,52 +3501,54 @@ class OpenAIAdapter(Adapter):
             *_guard_timing_note(request),
             *_schema_notes(request),
         )
-        output = self._login_status(binary, dict(plan.env))
-        if output is None:
-            return Receipt.from_plan(
-                plan,
-                runtime_available=True,
-                ok=False,
-                problem="could not run 'codex login status' to determine the auth mode",
-                notes=notes,
-                binary=binary,
-                **model_fields,
-            )
-
-        lower = output.lower()
-        if "logged in using chatgpt" in lower:
+        # The login is read from this connection's own ``auth.json`` (owner
+        # decision, 2026-10-01): a subscription login is treated like an API key,
+        # with no subprocess on the run path. ``codex login status`` is asked
+        # only when the file cannot answer -- the login lives in the OS keyring,
+        # or the file is absent -- and there an empty answer is a note on a run,
+        # not a refusal (the keyring cannot be inspected), while setup keeps
+        # the strict reading.
+        stored = _stored_login_kind(home)
+        if stored == "chatgpt":
             detected: AuthMode | None = AuthMode.SUBSCRIPTION
             source = f"Sign in with ChatGPT (codex login, {home / 'auth.json'})"
             ok, problem = True, None
-        elif "logged in" in lower and "api key" in lower:
+        elif stored == "api_key":
             detected = AuthMode.API_KEY
             source = "API key login (codex login --with-api-key)"
             ok, problem = True, None
-        elif "not logged in" in lower:
-            detected, source = None, ""
-            # Name the directory when the connection chose one. `codex login`
-            # with no CODEX_HOME logs in the *default* account, so a user who
-            # follows the bare advice against a profile connection authenticates
-            # the wrong account and the connection fails exactly as before --
-            # having spent a browser round trip to change nothing.
-            if request.connection.config_dir:
-                problem = (
-                    f"codex is not logged in for {home}; run 'codex login' with "
-                    "CODEX_HOME set to that directory before using this "
-                    "subscription connection"
+        else:
+            output = self._login_status(binary, dict(plan.env))
+            if output is None and not probe_identity:
+                detected, source, ok, problem = (
+                    request.connection.auth_mode,
+                    f"Codex login (not found in {home / 'auth.json'}; not inspected)",
+                    True,
+                    None,
+                )
+                notes = (
+                    *notes,
+                    "no readable auth.json and 'codex login status' returned nothing, so "
+                    "the login was not inspected; a run without a valid login ends as an "
+                    "authentication error",
+                )
+            elif output is None:
+                return Receipt.from_plan(
+                    plan,
+                    runtime_available=True,
+                    ok=False,
+                    problem="could not run 'codex login status' to determine the auth mode",
+                    notes=notes,
+                    binary=binary,
+                    **model_fields,
                 )
             else:
-                problem = "codex is not logged in; run 'codex login' first"
-            ok = False
-        else:
-            detected, source = None, ""
-            ok = False
-            problem = f"unrecognized 'codex login status' output: {output.strip()[:200]!r}"
+                detected, source, ok, problem = self._parse_login_status(
+                    output, request, home
+                )
 
-        if detected is AuthMode.SUBSCRIPTION and ok:
-            ok, problem, notes = self._verify_subscription_token(
-                binary, dict(plan.env), home, notes
-            )
+        if detected is AuthMode.SUBSCRIPTION and ok and stored == "chatgpt":
+            ok, problem, notes = self._verify_subscription_token(home, notes)
 
         account_profile = None
         if detected is not None and probe_identity:

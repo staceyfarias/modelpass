@@ -2012,8 +2012,14 @@ and unresolved `auto` on the mistaken belief that only `auth.json` moved with th
 directory. See OpenAI's [authentication storage documentation](https://learn.chatgpt.com/docs/auth)
 and [advanced configuration documentation](https://learn.chatgpt.com/docs/config-file/config-advanced).
 
-**Account identity (setup time only).** After `codex login status` confirms the billing
-mode, the setup-time `identity_preflight` (never a run) uses the supported app-server
+**Run-time login check.** A run reads `<CODEX_HOME>/auth.json` and nothing else: a ChatGPT
+`tokens.access_token` is a subscription login, an `OPENAI_API_KEY` entry is an API-key
+login, an expired access token with a refresh token proceeds (Codex refreshes on first use),
+and one without a refresh token is refused with the `codex login` command. No subprocess.
+`codex login status` is asked only when the file cannot answer (login in the OS keyring, or
+no file); there a silent answer is a receipt note on a run and a refusal at setup.
+
+**Account identity (setup time only).** After the billing mode is established, the setup-time `identity_preflight` (never a run) uses the supported app-server
 `account/read` request inside the selected `CODEX_HOME`.
 Codex reports account type, email, and ChatGPT plan type; those fields become the
 normalized `Receipt.account_profile`. Tokens and the rest of the app-server payload are

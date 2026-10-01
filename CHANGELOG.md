@@ -21,7 +21,10 @@ work landed.
   `Bridge.preflight(..., verify_identity=True)`. Run receipts report the pinned
   account labelled `(recorded at verify, not re-checked at run time)`. Probe
   results are never cached when empty, and are serialized per (binary, config dir).
-  New: `FakeAdapter.identity_probes`. Tests that pinned per-run identity
+  Codex likewise decides subscription vs API-key and token validity from
+  `auth.json`, with no `codex login status` subprocess on a run (the subprocess
+  remains only where the file cannot answer, e.g. a keyring login). An expired
+  token with a refresh token proceeds. New: `FakeAdapter.identity_probes`. Tests that pinned per-run identity
   verification as the intended behaviour were updated to the setup-time path.
 
 ### Fixed
