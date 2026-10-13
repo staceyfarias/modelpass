@@ -749,6 +749,9 @@ def _stream_event_to_events(event: Mapping[str, Any]) -> list[AgentEvent]:
 #: the ordinary assistant/user stream. modelpass recognizes it by name so that
 #: runtime plumbing never reaches a caller as a ``tool_call``.
 STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
+#: Turn ceiling for a schema run: room for the runtime to re-ask after a
+#: submission fails validation (see the output_format block in run()).
+STRUCTURED_OUTPUT_MAX_TURNS = 3
 
 
 def map_message(
@@ -2561,13 +2564,20 @@ class AnthropicAdapter(Adapter):
         if request.schema is not None:
             # The runtime's own mechanism (D13). ``output_format`` becomes
             # ``--json-schema <json>`` in the transport and the answer comes back
-            # on ResultMessage.structured_output. max_turns=1 is left alone: the
-            # submission tool's round trip does not need a higher ceiling
-            # (verified live -- num_turns=2, terminal_reason "completed").
+            # on ResultMessage.structured_output. A first submission that
+            # validates fits under max_turns=1 (verified live -- num_turns=2,
+            # terminal_reason "completed"), but one that FAILS validation is
+            # sent back for another attempt, and that re-submission is a turn
+            # the ceiling of 1 forbids: the run ends error_max_turns instead of
+            # being corrected. Seen live 2026-10-13 on Pelorus outline and
+            # extract calls (several per hundred). Three turns gives the
+            # runtime its retry; tokens stay bounded by the guards, and a
+            # caller's own max_turns below still wins.
             options_kwargs["output_format"] = {
                 "type": "json_schema",
                 "schema": dict(request.schema),
             }
+            options_kwargs["max_turns"] = STRUCTURED_OUTPUT_MAX_TURNS
         for key, value in request.options.items():
             if key == "include_partial_messages":
                 continue

@@ -3007,3 +3007,25 @@ def test_concurrent_identity_probes_for_one_config_dir_share_one_answer():
         )
     assert answers == [{"loggedIn": True}] * 4
     assert len(calls) == 1
+
+
+def test_a_schema_run_leaves_room_for_a_validation_retry(monkeypatch, request_factory):
+    """A StructuredOutput submission that fails validation is re-asked; under
+    max_turns=1 that retry ended the run error_max_turns (2026-10-13)."""
+    from modelpass.adapters.anthropic import STRUCTURED_OUTPUT_MAX_TURNS
+
+    request = request_factory(schema={"type": "object", "properties": {}})
+    options = launch_options(monkeypatch, request)
+    assert options["max_turns"] == STRUCTURED_OUTPUT_MAX_TURNS
+    assert options["output_format"]["type"] == "json_schema"
+
+
+def test_a_plain_chat_run_keeps_one_turn(monkeypatch, request_factory):
+    assert launch_options(monkeypatch, request_factory())["max_turns"] == 1
+
+
+def test_a_callers_turn_ceiling_still_wins_on_a_schema_run(monkeypatch, request_factory):
+    request = request_factory(
+        schema={"type": "object", "properties": {}}, options={"max_turns": 5}
+    )
+    assert launch_options(monkeypatch, request)["max_turns"] == 5
