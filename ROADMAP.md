@@ -36,13 +36,17 @@ on the subscription route it ran far slower than the model needs.
   the one asked for. The warning is the CLI's own model table lagging, not a
   substitution.
 
+**Measured since (2026-10-20):** a modelpass subscription call is lean. One
+structured relevance-filter call through `claude-sub` / `claude-haiku-5-5`,
+with a 935-character prompt (~235 tokens), reported usage
+`input_tokens 2, cache_write_tokens 1245, output_tokens 110`. So modelpass
+adds about 1,000 tokens (the form and a minimal setup), not the ~60K a bare
+`claude -p` carries. The per-call overhead is not what caps throughput here.
+
 **Not yet known (measure first):**
 
-- How many input tokens a modelpass subscription call actually sends around a
-  ~1,000-token prompt. A RAGauge certification run earlier recorded 7,282
-  tokens around a 10-word message on a "polluted" route, then re-certified on
-  a clean one, so modelpass may already strip much of the harness. Unmeasured
-  for this workload.
+- Whether the same ~1,000-token overhead holds on other runtimes and on
+  unstructured calls, and how it splits between the form and the setup.
 - Whether the cap is requests, tokens per minute, or concurrent sessions per
   account, and how it is shared with interactive Claude Code sessions on the
   same account.
