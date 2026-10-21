@@ -1916,6 +1916,21 @@ def test_a_chat_session_replaces_the_persona_and_keeps_the_toolbelt_off(
     assert options["setting_sources"] == []
 
 
+def test_a_chat_session_loads_no_account_connectors(monkeypatch, session_request):
+    """A subscription login adds the account's claude.ai connectors as MCP servers, which the built-in
+    disallow list does not reach (live 2026-10-21: a chat called the Claude Docs connector and ended in
+    error_max_turns). A chat loads only the servers modelpass passes, and passes none."""
+    options = session_launch_options(monkeypatch, session_request())
+    assert options["strict_mcp_config"] is True
+    assert options["mcp_servers"] == {}
+
+
+def test_a_worker_keeps_the_runtimes_mcp_configuration(monkeypatch, session_request):
+    """A worker is the runtime with its toolbelt on; its connectors are its owner's to configure."""
+    options = session_launch_options(monkeypatch, session_request(kind=SessionKind.WORKER))
+    assert "strict_mcp_config" not in options and "mcp_servers" not in options
+
+
 def test_a_chat_without_a_prompt_gets_the_empty_replacement_not_the_preset(
     monkeypatch, session_request
 ):
