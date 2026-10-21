@@ -1600,6 +1600,8 @@ def session_options(
     ``tools`` / ``mcp_servers``  ``mcp_servers`` / ``allowed_tools`` via
                                 :func:`_tool_options`
     ``resume_id``               ``resume``, set by the adapter after this
+    ``schema``                  ``output_format``, and room for its re-ask in
+                                ``max_turns``
     ``options``                 merged last, minus the six a session owns
     ==========================  ================================================
 
@@ -1663,6 +1665,15 @@ def session_options(
     _effort = stated_reasoning(request.connection)
     if _effort is not None:
         options_kwargs.update(_reasoning_options(_effort))
+    if request.schema is not None:
+        # The stateless path's mechanism (D13), held for the client's life: every
+        # turn ends in the runtime's StructuredOutput tool and the answer arrives
+        # on that turn's ResultMessage. A chat's one-turn ceiling is raised for the
+        # re-ask after a failed validation, as run() raises it; a worker keeps its
+        # unbounded loop, and a caller's own max_turns below still wins.
+        options_kwargs["output_format"] = {"type": "json_schema", "schema": dict(request.schema)}
+        if options_kwargs.get("max_turns") is not None:
+            options_kwargs["max_turns"] = STRUCTURED_OUTPUT_MAX_TURNS
 
     for key, value in request.options.items():
         reason = _SESSION_RESERVED_OPTIONS.get(key)
@@ -1913,6 +1924,8 @@ class AnthropicSessionHandle:
                     vendor_message,
                     partial_text=self._partial_text,
                     tool_names=tool_names,
+                    schema=self._request.schema,
+                    schema_name=self._request.schema_name,
                 ):
                     items.put(event)
         except BaseException as exc:

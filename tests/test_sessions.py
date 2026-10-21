@@ -33,6 +33,7 @@ from modelpass.errors import (
     ConnectionDisabled,
     GuardStop,
     InvalidGuards,
+    InvalidSchema,
     InvalidSession,
     SessionClosed,
     SessionNotFound,
@@ -813,3 +814,71 @@ def test_help_leads_with_the_cell_that_defines_the_class(sessions):
     on_default = bridge.new_chat(connection="codex-sub").help()
     default_limits = on_default.split("Limits on openai-sdk")[1]
     assert "system_prompt_replace is unsupported" not in default_limits
+
+
+# --- schema (2026-10-21) --------------------------------------------------------
+
+#: A reply schema of the shape a game harness binds every turn to.
+CHOICE = {
+    "title": "decision",
+    "type": "object",
+    "properties": {"choice": {"type": "integer"}, "note": {"type": "string"}},
+    "required": ["choice"],
+}
+
+
+def test_a_chat_schema_is_fixed_on_the_session_request(sessions):
+    bridge, made = sessions(anthropic_connection())
+    bridge.new_chat(connection="claude-sub", schema=CHOICE)
+
+    request = made["claude-sub"].session_requests[0]
+    assert request.schema["properties"]["choice"] == {"type": "integer"}
+    assert request.schema_name == "decision"
+
+
+def test_a_resumed_chat_carries_the_schema_it_is_given(sessions):
+    """A launch option on anthropic-sdk, like the system prompt: passed again, kept again."""
+    bridge, made = sessions(anthropic_connection())
+    bridge.resume_chat(
+        connection="claude-sub", session_id="sess-42", system_prompt="", schema=CHOICE,
+        schema_name="move",
+    )
+
+    request = made["claude-sub"].session_requests[0]
+    assert request.resume_id == "sess-42"
+    assert request.schema["required"] == ["choice"] and request.schema_name == "move"
+
+
+def test_a_chat_without_a_schema_has_none(sessions):
+    bridge, made = sessions(anthropic_connection())
+    bridge.new_chat(connection="claude-sub")
+    request = made["claude-sub"].session_requests[0]
+    assert request.schema is None and request.schema_name == ""
+
+
+def test_a_session_schema_beside_tools_is_refused(sessions):
+    tool = ToolDef(
+        name="look_up",
+        description="Look something up.",
+        parameters={"type": "object", "properties": {}},
+        handler=lambda args: "x",
+    )
+    bridge, made = sessions(anthropic_connection())
+    with pytest.raises(InvalidSchema, match="tools="):
+        bridge.new_chat(connection="claude-sub", schema=CHOICE, tools=[tool])
+    assert made["claude-sub"].session_requests == []
+
+
+def test_a_schema_name_alone_is_refused(sessions):
+    bridge, _ = sessions(anthropic_connection())
+    with pytest.raises(InvalidSchema, match="without schema="):
+        bridge.new_chat(connection="claude-sub", schema_name="decision")
+
+
+def test_a_session_schema_is_refused_where_the_session_adapter_does_not_apply_it(sessions):
+    """openai-sdk answers structured_output for one-shots, but its sessions pass no schema to a
+    turn: accepting one would hand prose to a caller promised JSON."""
+    bridge, made = sessions(codex_connection())
+    with pytest.raises(CapabilityNotSupported, match="anthropic-sdk session adapter only"):
+        bridge.new_chat(connection="codex-sub", schema=CHOICE)
+    assert made["codex-sub"].session_requests == []

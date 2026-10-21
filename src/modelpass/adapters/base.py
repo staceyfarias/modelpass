@@ -344,6 +344,12 @@ class SessionRequest:
 
     ``resume_id`` is set only by :meth:`Adapter.resume_session` and is the id the
     caller asked to pick back up.
+
+    ``schema`` / ``schema_name`` bind **every turn's** answer to one JSON Schema
+    (2026-10-21), normalized and gated by the bridge exactly as
+    :attr:`RunRequest.schema` is. Fixed at construction like ``tools`` and the
+    system prompt: on ``anthropic-sdk`` the schema is a launch option of the live
+    client, so a per-turn schema would be a different process.
     """
 
     connection: Connection
@@ -357,6 +363,8 @@ class SessionRequest:
     mcp_servers: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     options: Mapping[str, Any] = field(default_factory=dict)
     resume_id: str | None = None
+    schema: Mapping[str, Any] | None = None
+    schema_name: str = ""
 
     @property
     def runtime(self) -> Runtime:

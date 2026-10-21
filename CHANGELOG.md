@@ -7,6 +7,16 @@ work landed.
 
 ### Changed
 
+- **Chat sessions take a `schema=`** (2026-10-21). `new_chat(schema=, schema_name=)` and
+  `resume_chat(...)` bind every turn's answer to one JSON Schema, fixed at construction
+  like `tools` and the system prompt: on `anthropic-sdk` it is the client's
+  `output_format`, the chat's one-turn ceiling rises to the stateless path's re-ask
+  allowance, and each turn's stream gains a `structured_output` event before its
+  terminal (an `error` terminal when no usable answer arrived). Refused beside `tools=` /
+  `mcp_servers=`, and on runtimes whose sessions do not pass a schema to the turn yet
+  (`openai-sdk` and the rest), rather than accepted and ignored. A resumed chat needs
+  the schema passed again: on `anthropic-sdk` it is a launch option, not transcript.
+
 - **Account identity is verified at setup, not on each run** (2026-10-01). A RAGauge
   grading run lost 97 of 100 questions in 55 seconds to `PreflightFailed: ... the
   vendor identity probe returned nothing`: four workers probed `claude auth status`

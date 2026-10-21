@@ -298,6 +298,11 @@ class Answer:
 #: Read as a set rather than as one cell on purpose. Picking a single cell would
 #: make the policy an accident of which one a future runtime happened to fill
 #: in first.
+#: Runtimes whose session adapter binds every turn to a ``schema=`` (2026-10-21).
+#: Not a capability cell: ``structured_output`` already answers for stateless
+#: calls, and this is the narrower fact of which session handles pass it on.
+_SESSION_SCHEMA_RUNTIMES: frozenset[Runtime] = frozenset({Runtime.ANTHROPIC_SDK})
+
 _SESSION_CELLS: tuple[Capability, ...] = (
     Capability.SESSIONS_RESUME,
     Capability.SESSIONS_FORK,
@@ -1849,6 +1854,8 @@ class Bridge:
         expect_auth_mode: AuthMode | str | None = None,
         options: Mapping[str, Any] | None = None,
         raise_on_stop: bool = False,
+        schema: Mapping[str, Any] | None = None,
+        schema_name: str | None = None,
     ) -> ChatSession:
         """Open a conversation with the runtime's own agent persona stripped out.
 
@@ -1871,6 +1878,15 @@ class Bridge:
         ``messages``, matched exactly), so varying them per turn is the most
         cache-destructive thing available; making that unexpressible beats
         documenting it as discouraged (D17).
+
+        ``schema`` binds **every turn's** answer to one JSON Schema, as
+        ``chat(schema=)`` does for one call (D13): each turn's stream gains a
+        ``structured_output`` event before its terminal. It is fixed here for
+        the same reason as ``tools`` -- on ``anthropic-sdk`` it is a launch option
+        of the live client. Refused beside ``tools`` / ``mcp_servers`` (as on
+        :meth:`chat`), and refused on a runtime whose session adapter does not
+        apply it yet (today everything but ``anthropic-sdk``), rather than
+        accepted and ignored.
 
         ``persist=False`` means nothing is written down and the session cannot
         be resumed from another process. It is not merely a storage flag: on
@@ -1912,6 +1928,8 @@ class Bridge:
             expect_auth_mode=expect_auth_mode,
             options=options,
             raise_on_stop=raise_on_stop,
+            schema=schema,
+            schema_name=schema_name,
         )
 
     def new_worker(
@@ -1986,6 +2004,8 @@ class Bridge:
         expect_auth_mode: AuthMode | str | None = None,
         options: Mapping[str, Any] | None = None,
         raise_on_stop: bool = False,
+        schema: Mapping[str, Any] | None = None,
+        schema_name: str | None = None,
     ) -> ChatSession:
         """Pick a persisted session back up by id.
 
@@ -2030,6 +2050,10 @@ class Bridge:
         ``session_id`` is refused out loud rather than quietly ignored: an
         ephemeral session was never written down, so there is nothing to resume.
 
+        ``schema`` is a launch option on ``anthropic-sdk``, like the system
+        prompt, so it is not carried by the transcript: pass the session's schema
+        again to keep its turns schema-bound. Gated as on :meth:`new_chat`.
+
         Refused outright on a runtime that holds no conversation of its own; see
         :meth:`_require_sessions`.
         """
@@ -2050,6 +2074,8 @@ class Bridge:
             options=options,
             raise_on_stop=raise_on_stop,
             session_id=session_id,
+            schema=schema,
+            schema_name=schema_name,
         )
 
     def list_sessions(
@@ -2127,6 +2153,8 @@ class Bridge:
         options: Mapping[str, Any] | None,
         raise_on_stop: bool,
         session_id: str | None = None,
+        schema: Mapping[str, Any] | None = None,
+        schema_name: str | None = None,
     ) -> _SessionT:
         """Everything the two faces share, which is everything except policy.
 
@@ -2249,6 +2277,10 @@ class Bridge:
                 "Use bridge.new_worker(), where append is the semantics you want",
                 session_options,
             )
+
+        normalized_schema, resolved_schema_name = self._session_schema(
+            adapter, runtime, schema, schema_name, tool_defs, servers, session_options
+        )
         owns_folder = False
         folder = (project_folder or "").strip()
         if not folder:
@@ -2281,6 +2313,8 @@ class Bridge:
             mcp_servers=servers,
             options=session_options,
             resume_id=session_id,
+            schema=normalized_schema,
+            schema_name=resolved_schema_name,
         )
 
         # The receipt is taken over the session's *own* launch plan, wrapped in
@@ -2335,6 +2369,61 @@ class Bridge:
             raise_on_stop=raise_on_stop,
             owns_project_folder=owns_folder,
         )
+
+    def _session_schema(
+        self,
+        adapter: Adapter,
+        runtime: Runtime,
+        schema: Mapping[str, Any] | None,
+        schema_name: str | None,
+        tool_defs: tuple[ToolDef, ...],
+        servers: Mapping[str, Mapping[str, Any]],
+        options: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, str]:
+        """A session's schema, normalized and gated, or ``(None, "")`` (2026-10-21).
+
+        The same three rules :meth:`_prepare` applies to ``chat(schema=)``:
+        never beside caller tools or MCP servers (D13), the ``structured_output``
+        cell asked for this request, and ``schema_name`` meaningless alone. One
+        more, because that cell describes a *stateless* call: only a runtime whose
+        session adapter applies the schema to every turn is let through. Where it
+        does not, the schema would reach no wire and the caller would get prose
+        from an object that promised JSON, so it refuses instead.
+        """
+        if schema is None:
+            if schema_name is not None:
+                raise InvalidSchema(
+                    "schema_name= was passed without schema=; it names a schema, and "
+                    "on its own it does nothing"
+                )
+            return None, ""
+        if tool_defs or servers:
+            raise InvalidSchema(
+                "schema= cannot be combined with tools= or mcp_servers= on a session, "
+                "for the reason bridge.chat() refuses it (D13): structured output is "
+                "itself an end-turn tool on anthropic-sdk, and the interaction with a "
+                "caller's tool loop is unverified"
+            )
+        normalized = normalize_schema(schema)
+        name = resolve_schema_name(normalized, schema_name)
+        self._require_for_session(
+            adapter,
+            runtime,
+            Capability.STRUCTURED_OUTPUT,
+            "schema= on a session binds every turn's answer to a JSON Schema",
+            options,
+        )
+        if runtime not in _SESSION_SCHEMA_RUNTIMES:
+            raise CapabilityNotSupported(
+                str(runtime),
+                str(Capability.STRUCTURED_OUTPUT),
+                str(Support.UNSUPPORTED),
+                "schema= on a session is applied by the anthropic-sdk session adapter "
+                "only; this runtime's sessions do not pass a schema to the turn yet, "
+                "so the answer would be prose. Use bridge.chat(schema=) for "
+                "schema-bound one-shots here",
+            )
+        return normalized, name
 
     def _require_sessions(self, runtime: Runtime, call: str) -> None:
         """The session policy, stated once and enforced before an adapter exists.
@@ -2550,6 +2639,8 @@ class Bridge:
         mcp_servers: Mapping[str, Mapping[str, Any]],
         options: Mapping[str, Any],
         resume_id: str | None = None,
+        schema: Mapping[str, Any] | None = None,
+        schema_name: str = "",
     ) -> SessionRequest:
         """The session analogue of :meth:`_build_request`, with the same guarantees.
 
@@ -2580,6 +2671,8 @@ class Bridge:
             mcp_servers=dict(mcp_servers),
             options=dict(options),
             resume_id=resume_id,
+            schema=schema,
+            schema_name=schema_name,
         )
 
     # --- internals -------------------------------------------------------------

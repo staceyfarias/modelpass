@@ -1703,7 +1703,10 @@ Three properties of the shape, each deliberate:
 * **There is no `tools=` and no `system_prompt=` on `send()`.** Both are fixed at
   construction, because they sit at the very front of a prefix that has been warm since
   the first turn; re-declaring one would mean either ignoring it silently or changing
-  that prefix silently.
+  that prefix silently. A `schema=` is fixed there too: `new_chat(schema=...)` binds
+  every turn's answer to one JSON Schema, and each turn's stream ends in a
+  `structured_output` event before its terminal (`anthropic-sdk` only for now; other
+  runtimes refuse it rather than return prose).
 * **Guards on a session are the session's envelope**, not the turn's. `stop_at_tokens`
   bounds everything this session will ever spend — a per-turn tracker on a fifty-turn
   worker never fires while the allowance drains.

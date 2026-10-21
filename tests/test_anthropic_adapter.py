@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from modelpass.adapters.anthropic import (
+    STRUCTURED_OUTPUT_MAX_TURNS,
     AnthropicAdapter,
     _account_profile_from_auth_status,
     _run_coroutine_threadsafe,
@@ -57,6 +58,7 @@ from modelpass.types import (
     ReceiptEvent,
     Role,
     SessionKind,
+    StructuredOutputEvent,
     TerminalEvent,
     TerminalStatus,
     TextDeltaEvent,
@@ -158,6 +160,7 @@ class ResultMessage:
     api_error_status: int | None = None
     num_turns: int = 1
     duration_ms: int = 10
+    structured_output: Any = None
 
 
 @dataclass
@@ -1923,6 +1926,67 @@ def test_a_chat_session_loads_no_account_connectors(monkeypatch, session_request
     options = session_launch_options(monkeypatch, session_request())
     assert options["strict_mcp_config"] is True
     assert options["mcp_servers"] == {}
+
+
+#: A session reply schema, already normalized the way the bridge hands it over.
+SESSION_SCHEMA = {"type": "object", "properties": {"choice": {"type": "integer"}}, "required": ["choice"]}
+
+
+def test_a_session_schema_becomes_the_clients_output_format(monkeypatch, session_request):
+    """The stateless mechanism (D13), held for the client's life, with the chat's one-turn ceiling
+    raised for the runtime's re-ask after a failed validation."""
+    options = session_launch_options(
+        monkeypatch, session_request(schema=SESSION_SCHEMA, schema_name="decision")
+    )
+    assert options["output_format"] == {"type": "json_schema", "schema": SESSION_SCHEMA}
+    assert options["max_turns"] == STRUCTURED_OUTPUT_MAX_TURNS
+
+
+def test_a_session_without_a_schema_has_no_output_format(monkeypatch, session_request):
+    options = session_launch_options(monkeypatch, session_request())
+    assert "output_format" not in options and options["max_turns"] == 1
+
+
+def test_a_callers_turn_ceiling_still_wins_over_the_schemas(monkeypatch, session_request):
+    options = session_launch_options(
+        monkeypatch, session_request(schema=SESSION_SCHEMA, options={"max_turns": 5})
+    )
+    assert options["max_turns"] == 5
+
+
+def test_every_turn_of_a_schema_session_ends_in_its_structured_answer(
+    monkeypatch, session_request
+):
+    sdk = SessionSdk(turns=[
+        [ResultMessage(session_id="sess-1", result='{"choice": 2}', structured_output={"choice": 2})],
+        [ResultMessage(session_id="sess-1", result='{"choice": 5}', structured_output={"choice": 5})],
+    ])
+    handle = session_adapter(monkeypatch, sdk).open_session(
+        session_request(schema=SESSION_SCHEMA, schema_name="decision")
+    )
+
+    answers = []
+    for message in ("first", "second"):
+        events = list(handle.send(message))
+        structured = [e for e in events if isinstance(e, StructuredOutputEvent)]
+        assert len(structured) == 1 and events.index(structured[0]) == len(events) - 2
+        assert structured[0].valid and structured[0].schema_name == "decision"
+        assert events[-1].status is TerminalStatus.OK
+        answers.append(structured[0].data)
+
+    assert answers == [{"choice": 2}, {"choice": 5}]
+    handle.close()
+
+
+def test_a_schema_turn_with_no_usable_answer_ends_in_error(monkeypatch, session_request):
+    """As on a stateless run: prose where JSON was promised is not a success."""
+    sdk = SessionSdk(turns=[[ResultMessage(session_id="sess-1", result="I would rather not.")]])
+    handle = session_adapter(monkeypatch, sdk).open_session(session_request(schema=SESSION_SCHEMA))
+
+    events = list(handle.send("first"))
+
+    assert events[-1].status is TerminalStatus.ERROR
+    handle.close()
 
 
 def test_a_worker_keeps_the_runtimes_mcp_configuration(monkeypatch, session_request):
