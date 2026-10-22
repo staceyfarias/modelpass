@@ -377,6 +377,7 @@ from ..types import (
     Message,
     Role,
     SessionInfo,
+    SessionKind,
     TerminalEvent,
     TerminalStatus,
     TextDeltaEvent,
@@ -2794,6 +2795,9 @@ class CodexAppServerSession:
         #: get ``{}`` from :func:`~modelpass.adapters.codex_appserver.
         #: decline_approvals`, which the model is told is an invalid response.
         self._dispatcher = CallerToolDispatcher(request.tools)
+        #: A chat carries only what the caller sent; a worker keeps the user's
+        #: Codex setup. See :meth:`_ensure_client`.
+        self._isolated = request.kind is SessionKind.CHAT
 
     # --- identity ----------------------------------------------------------------
 
@@ -2826,6 +2830,14 @@ class CodexAppServerSession:
         accepts the same ``-c`` config layer ``codex exec`` does (checked
         token-free 2026-08-31; see
         :func:`~modelpass.adapters.codex_appserver.app_server_argv`).
+
+        A chat also launches with :func:`isolation_overrides`, the stateless
+        call's (2026-10-22). The 2026-09-29 fix left sessions out, and a
+        playtest seat opened with ``new_chat()`` paid about 17,300 cold input
+        tokens for a ~3,100-character first message: the user's skills,
+        plugins, MCP servers and personality rode along on every new chat. A
+        :class:`~modelpass.sessions.WorkerSession` keeps the user's setup, as it
+        keeps Codex's persona and toolbelt.
         """
         client = self._client
         if client is not None and client.running:
@@ -2837,7 +2849,10 @@ class CodexAppServerSession:
             cwd=request.project_folder,
             spawn=self._adapter._app_server_spawn,
             server_request_handler=self._dispatcher,
-            config_overrides=() if request.native_tools else chat_tool_overrides(),
+            config_overrides=(
+                *(() if request.native_tools else chat_tool_overrides()),
+                *(isolation_overrides() if self._isolated else ()),
+            ),
         )
         client.start()
         self._client = client
@@ -2853,15 +2868,39 @@ class CodexAppServerSession:
         client = self._ensure_client()
         if self._thread_ready:
             return client
+        isolation = self._isolation_config(client) if self._isolated else {}
         if self._resume_id is not None:
-            self._resume_thread(client, self._resume_id)
+            self._resume_thread(client, self._resume_id, isolation)
         else:
-            started = self._start_thread(client)
+            started = self._start_thread(client, isolation)
             self._thread_id = _started_thread_id(started)
         self._thread_ready = True
         return client
 
-    def _start_thread(self, client: AppServerClient) -> Mapping[str, Any]:
+    def _isolation_config(self, client: AppServerClient) -> dict[str, Any]:
+        """The configured MCP servers a chat's thread must switch off.
+
+        :meth:`OpenAIAdapter._isolation_thread_config` for a session: asked of
+        this session's own child, in the thread's folder, before the thread is
+        started or resumed. **Fails closed** the same way -- no thread is
+        touched and no turn runs, so nothing is spent.
+        """
+        try:
+            answer = client.request(
+                CONFIG_READ_METHOD, {"cwd": self._request.project_folder}
+            )
+            return isolation_thread_config(answer)
+        except (AppServerRequestFailed, ValueError) as exc:
+            raise VendorRunFailed(
+                "codex app-server could not report its configured MCP servers "
+                f"({CONFIG_READ_METHOD}: {exc}), so this chat session could not be "
+                "isolated from them; no thread was started or resumed and nothing "
+                "was spent"
+            ) from exc
+
+    def _start_thread(
+        self, client: AppServerClient, isolation: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
         """``thread/start``, with a tool-bearing refusal made legible.
 
         The same reading :meth:`OpenAIAdapter._start_thread` gives the stateless
@@ -2872,6 +2911,8 @@ class CodexAppServerSession:
         """
         request = self._request
         params = _session_thread_start_params(request, request.project_folder)
+        if isolation:
+            params["config"] = dict(isolation)
         try:
             started = client.request("thread/start", params)
             # The echo, held rather than yielded: this method is reached from
@@ -2895,7 +2936,12 @@ class CodexAppServerSession:
                 "is the collision"
             ) from exc
 
-    def _resume_thread(self, client: AppServerClient, thread_id: str) -> None:
+    def _resume_thread(
+        self,
+        client: AppServerClient,
+        thread_id: str,
+        isolation: Mapping[str, Any],
+    ) -> None:
         """``thread/resume``, turning the vendor's own refusal into SessionNotFound.
 
         **Undriven from this side and marked so** (see
@@ -2909,15 +2955,21 @@ class CodexAppServerSession:
         leave the session looking usable.
 
         Any other refusal is a vendor failure and keeps its own words.
+
+        ``isolation`` goes in ``ThreadResumeParams.config``, which openai-codex
+        0.154.0 types beside ``cwd`` and ``model``. The same field on
+        ``thread/start`` was driven live (2026-09-29); on resume it is
+        schema-sourced only, so a resumed chat's MCP isolation is unverified
+        until a live resume shows no ``mcpServer/startupStatus/updated``.
         """
         request = self._request
+        params = thread_resume_params(
+            thread_id, cwd=request.project_folder, model=request.model
+        )
+        if isolation:
+            params["config"] = dict(isolation)
         try:
-            client.request(
-                THREAD_RESUME_METHOD,
-                thread_resume_params(
-                    thread_id, cwd=request.project_folder, model=request.model
-                ),
-            )
+            client.request(THREAD_RESUME_METHOD, params)
         except AppServerRequestFailed as exc:
             if is_missing_thread(exc.detail):
                 raise SessionNotFound(

@@ -7,6 +7,21 @@ work landed.
 
 ### Changed
 
+- **A Codex chat session carries only what the caller sent** (2026-10-22). The
+  2026-09-29 isolation covered stateless calls and left sessions out, so a
+  `new_chat()` on the `app-server` transport still loaded the user's skills,
+  plugins, configured MCP servers and `personality`: a King's Unit playtest seat
+  paid about 17,300 cold input tokens for a ~3,100-character first message, and
+  again at every context rotation. A chat session now launches with
+  `isolation_overrides()` and switches each configured MCP server off for its
+  thread by name, asked of its own child with `config/read` before
+  `thread/start` or `thread/resume`; a child that cannot answer ends the turn
+  before any thread is touched. Worker sessions keep the user's Codex setup, as
+  they keep its persona and toolbelt. On resume the servers go in
+  `ThreadResumeParams.config`, which is schema-typed but not yet driven live.
+  A chat resumed across this change sees a different prefix, so expect one
+  cache-cold turn.
+
 - **Chat sessions take a `schema=`** (2026-10-21). `new_chat(schema=, schema_name=)` and
   `resume_chat(...)` bind every turn's answer to one JSON Schema, fixed at construction
   like `tools` and the system prompt: on `anthropic-sdk` it is the client's

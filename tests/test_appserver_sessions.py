@@ -56,11 +56,12 @@ from modelpass.adapters.openai import (
     CodexSession,
     OpenAIAdapter,
     chat_tool_overrides,
+    isolation_overrides,
 )
 from modelpass.bridge import Bridge
 from modelpass.capabilities import Capability, CapabilityRegistry, Support
 from modelpass.connections import Connection, CredentialRef
-from modelpass.errors import CapabilityNotSupported, SessionNotFound
+from modelpass.errors import CapabilityNotSupported, SessionNotFound, VendorRunFailed
 from modelpass.preflight import plan_launch
 from modelpass.runtimes import Runtime
 from modelpass.store import ConnectionStore
@@ -202,6 +203,10 @@ class ScriptedThreadServer:
 
     def __init__(self, script: dict[str, list[tuple[Any, list[Any]]]]) -> None:
         self.script = {method: list(pairs) for method, pairs in script.items()}
+        # Nothing configured, the shape a real child answers with. A chat session
+        # asks before its thread exists (isolation, 2026-10-22); a test about
+        # configured servers scripts ``config/read`` itself.
+        self.script.setdefault("config/read", [({"config": {}}, [])])
         self.stdout = _Stream()
         self.stderr = _Stream()
         self.stdin = _Stdin(self)
@@ -1161,3 +1166,115 @@ def test_mcp_servers_are_refused_on_the_app_server_transport(tmp_path):
         )
     assert excinfo.value.capability == "mcp_servers"
     assert "exec" in str(excinfo.value)
+
+
+# --- isolation of a chat session (2026-10-22) ---------------------------------------
+#
+# The 2026-09-29 isolation covered stateless calls only. A playtest seat opened
+# with new_chat() on the app-server transport still loaded the user's skills,
+# plugins, MCP servers and personality: about 17,300 cold input tokens for a
+# ~3,100-character first message, paid again at every context rotation. A chat
+# now launches as a stateless call does; a worker keeps the user's setup.
+
+#: Two configured servers and one the user already switched off.
+CONFIGURED = {
+    "config": {
+        "mcp_servers": {
+            "amt": {"command": "python", "enabled": True},
+            "node_repl": {"command": "node_repl.exe"},
+            "dormant": {"command": "x", "enabled": False},
+        }
+    }
+}
+
+SWITCHED_OFF = {"amt": {"enabled": False}, "node_repl": {"enabled": False}}
+
+
+def _configured(script: dict) -> dict:
+    return {**script, "config/read": [(CONFIGURED, [])]}
+
+
+def test_a_chat_session_launches_with_the_isolation_overrides(tmp_path):
+    server = ScriptedThreadServer(two_turn_script())
+    adapter, spawn = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path, kind=SessionKind.CHAT))
+    list(handle.send("hello"))
+    assert spawn.argv == [
+        "C:/codex/codex.exe",
+        "app-server",
+        *chat_tool_overrides(),
+        *isolation_overrides(),
+        "--listen",
+        "stdio://",
+    ]
+
+
+def test_a_chat_session_switches_configured_mcp_servers_off_on_its_thread(tmp_path):
+    """By name, for this thread only, asked of the child in the thread's folder."""
+    server = ScriptedThreadServer(_configured(two_turn_script()))
+    adapter, _ = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path, kind=SessionKind.CHAT))
+    list(handle.send("one"))
+    list(handle.send("two"))
+
+    start = server.sent("thread/start")[0]
+    assert start["config"] == {"mcp_servers": SWITCHED_OFF}
+    assert server.sent("config/read") == [{"cwd": start["cwd"]}], (
+        "asked once, before the thread: the prefix must not move between turns"
+    )
+    assert server.methods.index("config/read") < server.methods.index("thread/start")
+
+
+def test_a_chat_session_with_nothing_configured_sends_no_thread_config(tmp_path):
+    server = ScriptedThreadServer(two_turn_script())
+    adapter, _ = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path, kind=SessionKind.CHAT))
+    list(handle.send("hello"))
+    assert "config" not in server.sent("thread/start")[0]
+
+
+def test_a_resumed_chat_session_is_isolated_too(tmp_path):
+    """``ThreadResumeParams.config`` is schema-typed; the launch is the same."""
+    server = ScriptedThreadServer(_configured(resume_script()))
+    adapter, spawn = adapter_for(server)
+    handle = adapter.resume_session(
+        session_request(tmp_path, kind=SessionKind.CHAT, resume_id=THREAD_ID)
+    )
+    list(handle.send("carry on"))
+
+    assert spawn.argv is not None
+    assert spawn.argv[-2 - len(isolation_overrides()):-2] == isolation_overrides()
+    assert server.sent(THREAD_RESUME_METHOD)[0]["config"] == {"mcp_servers": SWITCHED_OFF}
+    assert server.methods.index("config/read") < server.methods.index(THREAD_RESUME_METHOD)
+
+
+def test_a_worker_session_keeps_the_users_codex_setup(tmp_path):
+    """A worker keeps Codex's persona and toolbelt, and the setup beside them."""
+    server = ScriptedThreadServer(_configured(two_turn_script()))
+    adapter, spawn = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path, kind=SessionKind.WORKER))
+    list(handle.send("Fix the build."))
+    assert spawn.argv == ["C:/codex/codex.exe", "app-server", "--listen", "stdio://"]
+    assert "config/read" not in server.methods
+    assert "config" not in server.sent("thread/start")[0]
+
+
+@pytest.mark.parametrize(
+    "config_read",
+    [{"__error__": {"code": -32601, "message": "nope"}}, {}, {"config": {"mcp_servers": ["amt"]}}],
+    ids=["refused", "no-config", "servers-not-a-table"],
+)
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "resumed"])
+def test_a_chat_session_that_cannot_be_isolated_fails_closed(tmp_path, config_read, resume):
+    script = resume_script() if resume else two_turn_script()
+    server = ScriptedThreadServer({**script, "config/read": [(config_read, [])]})
+    adapter, _ = adapter_for(server)
+    request = session_request(
+        tmp_path, kind=SessionKind.CHAT, resume_id=THREAD_ID if resume else None
+    )
+    handle = (adapter.resume_session if resume else adapter.open_session)(request)
+    with pytest.raises(VendorRunFailed, match="could not be isolated"):
+        list(handle.send("hello"))
+    assert "thread/start" not in server.methods
+    assert THREAD_RESUME_METHOD not in server.methods
+    assert "turn/start" not in server.methods
