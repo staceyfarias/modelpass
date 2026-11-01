@@ -624,6 +624,52 @@ class Bridge:
         """Resolve an account profile by its stable ID, not its nickname."""
         return self.connection(name)
 
+    def models(self, connection: str | Connection, *, refresh: bool = False,
+               timeout: float = 15.0):
+        """Return model suggestions for one explicit connection.
+
+        Offline by default: subscription catalogues come from local vendor
+        state; API results come only from this Bridge's previous explicit
+        refresh. refresh=True may request authenticated model metadata, never
+        generate, fall back to another account, or write a run receipt.
+        """
+        from .models import ModelCatalogue, models_for
+        if not isinstance(refresh, bool):
+            raise ValueError("refresh must be true or false")
+        if isinstance(connection, str) and connection.startswith(_GROUP_PREFIX):
+            raise ValueError("Model discovery requires a connection, not a group")
+        selected = self._resolve(connection)
+        if selected.runtime not in API_RUNTIMES:
+            return models_for(selected.runtime, codex_root=selected.config_dir)
+        if refresh and not selected.enabled:
+            raise ConnectionDisabled(selected.name)
+        cache = getattr(self, "_model_catalogues", None)
+        if cache is None:
+            cache = self._model_catalogues = {}
+        key = repr(selected)
+        if not refresh:
+            return cache.get(key, ModelCatalogue(
+                runtime=selected.runtime, source="not fetched",
+                problem="Load models to request this account's model list."))
+        if (isinstance(timeout, bool) or not isinstance(timeout, (float, int))
+                or not 0 < timeout <= 120):
+            raise ValueError(
+                "Model discovery timeout must be greater than 0 and at most 120 seconds")
+        adapter = self.adapter_for(selected.runtime)
+        discover = getattr(adapter, "list_models", None)
+        if not callable(discover):
+            return ModelCatalogue(runtime=selected.runtime,
+                                  problem="This adapter does not support model discovery.")
+        try:
+            result = discover(selected, timeout=timeout)
+        except SubpassError:
+            raise
+        except Exception as exc:
+            raise AdapterFailed(selected.runtime.value, "Model discovery failed") from exc
+        if result.problem is None:
+            cache[key] = result
+        return result
+
     def groups(self) -> tuple[Group, ...]:
         """Every group, with its membership, in name order.
 

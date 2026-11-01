@@ -814,6 +814,11 @@ class GoogleAPIAdapter(Adapter):
         key = resolve_credential(connection, self._env, secrets=self._secrets)
         return self._client_factory(api_key=key, base_url=connection.base_url)
 
+    def list_models(self, connection: Connection, *, timeout: float):
+        """List metadata under this connection's explicit credential and endpoint."""
+        from ..models import api_catalogue
+        return api_catalogue(connection, self._client(connection), timeout=timeout)
+
     # --- preflight -------------------------------------------------------------
 
     def preflight(self, request: RunRequest) -> Receipt:

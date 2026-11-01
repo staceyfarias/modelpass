@@ -2682,3 +2682,34 @@ in isolation and in the complete development-environment run. No live model call
 was made and no native runtime capability cell changed. Nine pre-existing
 line-length lint findings were resolved by wrapping comments/test expressions,
 with no adapter behavior or test assertion changes.
+
+
+## Connection-scoped model discovery (2026-11-01)
+
+`Bridge.models(connection: str | Connection, *, refresh=False, timeout=15)`
+returns `modelpass.models.ModelCatalogue`. A group is refused: discovery names
+one account, never a dynamically chosen route or a failover account.
+
+- Default calls are offline. Subscription suggestions use the selected
+  connection's `config_dir` for the Codex cache (Claude aliases remain labelled
+  as aliases). API results come only from successful refreshes cached in that
+  same Bridge instance; configuration changes produce a separate cache key.
+- `refresh=True` for an API connection calls its explicitly authenticated SDK
+  model-list endpoint. Anthropic Messages, OpenAI Responses, Gemini and
+  OpenAI-compatible adapters support it. Disabled API connections cannot be
+  refreshed. Subscription refresh still reads local state and launches nothing.
+- Timeout is greater than zero and at most 120 seconds. Discovery disables SDK
+  retries, bounds page count and model count, follows Anthropic/Gemini cursors,
+  and marks partial lists as such. Vendor failures are sanitized into a
+  catalogue `problem`; configuration, credential and missing-extra failures
+  retain their existing typed exceptions. Clients are closed after discovery.
+- Results carry vendor IDs/labels and provenance, never keys. No generation,
+  inference receipt, guard consumption, failover, run log or disk cache is
+  created. `exact` describes vendor provenance, not workload compatibility:
+  catalogues can include embeddings, media or otherwise unsuitable chat models.
+
+Evidence: installed SDK model-list signatures and fields inspected on
+2026-11-01 (OpenAI 2.x, Anthropic 0.x and google-genai 1.x); offline adapter tests
+in `tests/test_model_discovery.py` cover account/endpoint binding, pagination,
+timeouts, closure, cache isolation, disabled accounts and sanitized failure.
+No live account calls were made for this change.

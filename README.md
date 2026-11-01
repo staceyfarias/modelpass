@@ -39,6 +39,24 @@ Afterwards the terminal event carries the same answer — stamped by modelpass, 
 adapter — and one line of it goes to `~/.modelpass/runs.jsonl`, so the question survives
 the run that answered it.
 
+### Choosing a model
+
+`bridge.models("my-account")` returns a `ModelCatalogue` without a network call:
+local vendor catalogues/aliases for subscriptions, or successful API metadata
+cached in that Bridge instance. Explicitly request an API list with:
+
+```python
+catalogue = bridge.models("my-account", refresh=True, timeout=15)
+for choice in catalogue.choices:
+    print(choice.id, choice.label)
+```
+
+This lists metadata using the selected connection's credential and endpoint;
+it never generates, selects a different account, or writes a run log. API SDKs
+remain optional extras. Inspect `problem` and `notes`: a list may be partial or
+include models intended for other tasks. Successful discovery does not promise
+that every listed model supports chat, tools or your chosen workload.
+
 ### The subscription half, which is where this started
 
 If you pay for Claude Max or a ChatGPT plan, you are already paying for a lot of model

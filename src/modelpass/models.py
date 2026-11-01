@@ -7,7 +7,14 @@ the same thing.
 The honesty rule for this module is the one D6 established for capabilities:
 **say where the list came from, and never present a guess as the vendor's
 list.** So a catalogue carries a ``source`` phrase and an ``exact`` flag, and
-the two v1 runtimes land on opposite sides of it.
+the two subscription runtimes land on opposite sides of it.
+
+``Bridge.models(connection, refresh=True)`` also lists API models using the
+connection's explicit credential and endpoint through its vendor adapter.
+Without refresh, API discovery reads only successful metadata cached in that
+Bridge instance. No generations, fallback accounts, run receipts, or prompt data
+are involved. A catalogue may include non-chat models; listing is not a claim
+that every model supports a particular workload.
 
 ``openai-sdk`` -- exact
     The Codex CLI maintains ``~/.codex/models_cache.json`` and refreshes it
@@ -50,6 +57,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -275,3 +284,76 @@ def _codex_choices(entries: list[Any]) -> tuple[ModelChoice, ...]:
         )
     picked.sort(key=lambda item: (item[0], item[1]))
     return tuple(choice for _, _, choice in picked)
+
+
+def api_catalogue(connection, client, *, timeout: float) -> ModelCatalogue:
+    """Fetch model metadata only, via an already explicitly authenticated client.
+
+    SDK response shapes verified from installed OpenAI 2.x, Anthropic 0.x and
+    google-genai 1.x on 2026-11-01. Never invokes a generation endpoint.
+    """
+    runtime = connection.runtime
+    source = f"{runtime.value} models endpoint"
+    deadline = time.monotonic() + timeout
+    found: dict[str, ModelChoice] = {}
+    cursor = None
+    target = client
+    problem = None
+    try:
+        if runtime is not Runtime.GOOGLE_API:
+            target = client.with_options(max_retries=0)
+        for _ in range(20):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            if runtime is Runtime.GOOGLE_API:
+                config = {"page_size": 1000, "http_options": {
+                    "timeout": max(1, int(remaining * 1000)),
+                    "retry_options": {"attempts": 1}}}
+                if cursor:
+                    config["page_token"] = cursor
+                page = target.models.list(config=config)
+                rows = page.page
+                next_cursor = page.config.get("page_token")
+            else:
+                kwargs = {"timeout": remaining}
+                if runtime is Runtime.ANTHROPIC_API:
+                    kwargs["limit"] = 1000
+                    if cursor:
+                        kwargs["after_id"] = cursor
+                page = target.models.list(**kwargs)
+                rows = page.data
+                more = page.has_next_page()
+                next_cursor = (getattr(rows[-1], "id", None) if rows and more else None)
+            for row in rows:
+                identifier = getattr(row, "id", None) or getattr(row, "name", None)
+                if not isinstance(identifier, str) or not identifier:
+                    continue
+                if runtime is Runtime.GOOGLE_API:
+                    identifier = identifier.removeprefix("models/")
+                label = getattr(row, "display_name", None) or identifier
+                description = getattr(row, "description", None) or ""
+                found[identifier] = ModelChoice(identifier, str(label), str(description))
+            if not next_cursor:
+                break
+            if runtime not in (Runtime.ANTHROPIC_API, Runtime.GOOGLE_API):
+                problem = "The model list is partial; this endpoint returned additional pages."
+                break
+            if next_cursor == cursor or len(found) >= 5000:
+                problem = "The model list is partial; the endpoint exceeded discovery limits."
+                break
+            cursor = next_cursor
+        else:
+            problem = "The model list is partial; the endpoint exceeded discovery limits."
+    except Exception as exc:
+        problem = (f"Could not finish listing models ({type(exc).__name__}). "
+                   "Check the selected account, endpoint and API access, then retry.")
+    finally:
+        for handle in (target,) if target is client else (target, client):
+            with suppress(Exception):
+                handle.close()
+    return ModelCatalogue(
+        runtime=runtime, choices=tuple(found.values()), source=source, exact=True,
+        problem=problem,
+        notes=("This is the account's model catalogue, not a promise that every model "
+               "supports this runtime's chat or tools. No generation was requested.",))

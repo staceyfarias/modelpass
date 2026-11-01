@@ -7,6 +7,12 @@ work landed.
 
 ### Added
 
+- **Connection-scoped model discovery** (2026-11-01). `Bridge.models` supplies
+  offline subscription suggestions or cached API metadata. Explicit refresh
+  requests a model catalogue through the selected API adapter and credentials,
+  with pagination/time bounds, sanitized failures and no generation/run log.
+  Supports Anthropic, OpenAI, Gemini and OpenAI-compatible API endpoints.
+
 - **Application-scoped managed conversations** (2026-11-01).
   `Bridge.conversations(root, application=...)` returns a durable private
   `ConversationStore` with create/list/open, rename/archive, fixed connection/model
