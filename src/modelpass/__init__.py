@@ -63,6 +63,15 @@ from .connections import (
     QuotaAction,
     QuotaPolicy,
 )
+from .conversations import (
+    Conversation,
+    ConversationBusy,
+    ConversationError,
+    ConversationInfo,
+    ConversationNotFound,
+    ConversationStore,
+    ConversationTurn,
+)
 from .errors import (
     AdapterFailed,
     AdapterNotImplemented,
@@ -213,6 +222,13 @@ __all__ = [
     "ConnectionPlan",
     "ConnectionStore",
     "ContentBlock",
+    "Conversation",
+    "ConversationBusy",
+    "ConversationError",
+    "ConversationInfo",
+    "ConversationNotFound",
+    "ConversationStore",
+    "ConversationTurn",
     "Credential",
     "CredentialKind",
     "CredentialRef",

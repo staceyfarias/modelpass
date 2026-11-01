@@ -1746,6 +1746,95 @@ have handed back a chat wearing a worker's name.
 The two models are set side by side in
 [docs/api-and-runtimes.md](docs/api-and-runtimes.md).
 
+## Managed conversations for applications
+
+A desktop app needs more than a vendor session id: named chats, durable history,
+a fixed connection/model, and a way to reopen the right project's conversation.
+`bridge.conversations(...)` provides this reusable, opt-in layer. It has zero extra
+dependencies and stores private content in a SQLite file under a root the app supplies.
+It does not put chats into the shared connection file or discover other apps' chats.
+
+```python
+chats = bridge.conversations(
+    "./my-app-data/chats",
+    application="soundbench",                  # required stable origin
+    application_name="O.H.R. Soundbench",       # human-facing origin
+)
+chat = chats.create(
+    connection="my-configured-connection",
+    model="my-chosen-model-id",                # or the connection's explicit model
+    title="Song brainstorming",
+    scope="song-project-id", scope_name="New Song",
+    system_prompt="Help explore the song; follow the artist's process.",
+)
+for event in chat.send("Help me explore this idea"):
+    ...
+
+# Later, even after the process exits:
+chat = chats.open(chat.id)
+for event in chat.send("Let's return to the chorus"):
+    ...
+for info in chats.list(scope="song-project-id"):
+    print(info.application_name, info.scope_name, info.title, info.connection, info.model)
+```
+
+Creation, listing, reopening, renaming and archiving are local operations: they do
+not start a vendor or spend allowance. Sending starts when the iterator is consumed.
+`asend()` is the async twin and shares the same locking/history contract.
+`chat.rename(...)`, `chat.archive()` and `chat.archive(False)` preserve its contents.
+The app decides which chat is selected and which configuration is its default.
+
+**Origin is mandatory.** Every record includes the stable application id, display
+name, optional project/workspace scope and its display name. Applications may share
+one storage root, but list/open/update/send are always filtered by the requesting
+application. This is local namespacing, not an authentication boundary between
+untrusted programs. Do not point unrelated untrusted programs at the same database.
+
+**A conversation keeps its connection and requested model.** Changing a configuration's
+default model does not change older chats. Changing its runtime, billing mode,
+credential pointer, endpoint or recorded account identity is refused before sending;
+create a separate conversation instead. Credential values are never copied into this
+store. Model ids/aliases are requested ids; receipts keep what the vendor actually
+reported. Failover to another connection is disabled for managed-history turns.
+
+Create a new conversation with another connection/model for a fresh perspective.
+It starts empty. To intentionally carry selected context into a new **history-mode**
+chat, supply `seed_history=[Message(...), ...]` to `create()`. There is no automatic
+cross-conversation context sharing and no model switch hidden inside an old history.
+
+Two explicit modes preserve the distinction between who holds the conversation:
+
+| Mode | History and execution |
+| --- | --- |
+| `history` (default) | Modelpass stores successful user/assistant text turns and passes them through `Bridge.chat/achat` on each turn. Works across the API and subscription runtimes. No truncation or summarization is invented. |
+| `native` | Modelpass stores a reference and resumes the vendor's durable chat session. Capability-gated exactly like `new_chat/resume_chat`, with no fallback. Managed native chats are text-only; use the existing `Session` API for fixed tools/schema or a continuously open native session. |
+
+`chat.turns()` is the app's durable observation journal, including partial output,
+receipt/tool/usage/terminal events and unsuccessful statuses. Events are persisted
+before being yielded, and the final record is committed and unlocked before the
+terminal reaches the caller. `chat.history()` returns successful replayable text in
+history mode; in native mode it reads the vendor history, never a fabricated transcript.
+Tool observations are kept in the journal, not replayed as invented chat roles. History
+mode accepts the existing `Bridge.chat` per-call controls (tools, schema, sampling,
+timeout and guards), except fields that would override the binding or stored context.
+Native mode accepts only `timeout` and `reasoning` on send. Each managed send is a run;
+there is no additional cumulative managed-conversation token ceiling in this layer.
+
+A nonblocking OS lock prevents overlapping turns/mutations across store instances,
+threads and processes. Independent conversations can run concurrently. Closing a
+stream cancels only that run and preserves its partial journal. History-mode retries
+exclude unsuccessful turns; the app can explicitly seed selected partial text into a
+new chat. After a process crash, the next history send marks orphaned running turns
+interrupted. Native continuity after an interrupted run is uncertain and is refused
+rather than silently replayed into a fresh session. Missing native sessions remain
+`SessionNotFound`; their observed journal remains available.
+
+The conversation database contains **private prompts and replies**, unlike the
+shareable connection file. Choose an app data root that is backed up/protected as
+appropriate, and exclude it from source control. No chats are persisted unless an
+app explicitly opts into this layer. Existing stateless calls and native sessions
+retain their current contracts. See [the full managed API contract](docs/api-and-runtimes.md#managed-conversations).
+
 ## Managing connections from Python
 
 `modelpass connect` is a consent flow, and a desktop app's Settings page needs the

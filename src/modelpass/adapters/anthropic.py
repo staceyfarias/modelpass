@@ -1648,11 +1648,12 @@ def session_options(
         options_kwargs["disallowed_tools"] = list(_BUILTIN_TOOLS)
         # One turn is one chat response, exactly as in the stateless path.
         options_kwargs["max_turns"] = 1
-        # The account's claude.ai connectors are MCP servers the runtime adds on a subscription login, not
-        # built-in tools, so the list above does not reach them. Seen live 2026-10-21: a chat whose turn
-        # mentioned a "report" called the Claude Docs connector, and the one-turn chat ended in
-        # error_max_turns. Only the servers passed here load, and a chat passes none (as isolation_options
-        # does for a stateless run); caller tools, below, bring their own server under the same lock.
+        # The account's claude.ai connectors are MCP servers the runtime adds on a subscription
+        # login, not built-in tools, so the list above does not reach them. Seen live 2026-10-21:
+        # a chat whose turn mentioned a "report" called the Claude Docs connector, and the
+        # one-turn chat ended in error_max_turns. Only the servers passed here load, and a chat
+        # passes none (as isolation_options does for a stateless run); caller tools, below,
+        # bring their own server under the same lock.
         options_kwargs["strict_mcp_config"] = True
         options_kwargs["mcp_servers"] = {}
     options_kwargs.update(_tool_options(sdk, request))

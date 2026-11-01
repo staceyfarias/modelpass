@@ -5,6 +5,20 @@ work landed.
 
 ## Unreleased
 
+### Added
+
+- **Application-scoped managed conversations** (2026-11-01).
+  `Bridge.conversations(root, application=...)` returns a durable private
+  `ConversationStore` with create/list/open, rename/archive, fixed connection/model
+  binding and optional project/workspace origin. History mode works across runtimes
+  using existing stateless calls; explicit native mode resumes vendor sessions
+  without changing their capability/refusal contracts. Sync/async turns journal
+  observed events and interrupted output, hold a nonblocking process-safe lock,
+  and release it before delivering a terminal. Shared stores enforce application
+  ownership, and new conversations inherit no other chat unless the caller
+  explicitly supplies seed history. No new runtime dependencies or live calls.
+
+
 ### Changed
 
 - **A Codex chat session carries only what the caller sent** (2026-10-22). The

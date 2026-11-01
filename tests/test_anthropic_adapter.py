@@ -1920,16 +1920,20 @@ def test_a_chat_session_replaces_the_persona_and_keeps_the_toolbelt_off(
 
 
 def test_a_chat_session_loads_no_account_connectors(monkeypatch, session_request):
-    """A subscription login adds the account's claude.ai connectors as MCP servers, which the built-in
-    disallow list does not reach (live 2026-10-21: a chat called the Claude Docs connector and ended in
-    error_max_turns). A chat loads only the servers modelpass passes, and passes none."""
+    """A subscription login adds the account's claude.ai connectors as MCP servers,
+    which the built-in disallow list does not reach (live 2026-10-21: a chat called
+    the Claude Docs connector and ended in error_max_turns). A chat loads only
+    the servers modelpass passes, and passes none.
+    """
     options = session_launch_options(monkeypatch, session_request())
     assert options["strict_mcp_config"] is True
     assert options["mcp_servers"] == {}
 
 
 #: A session reply schema, already normalized the way the bridge hands it over.
-SESSION_SCHEMA = {"type": "object", "properties": {"choice": {"type": "integer"}}, "required": ["choice"]}
+SESSION_SCHEMA = {
+    "type": "object", "properties": {"choice": {"type": "integer"}}, "required": ["choice"]
+}
 
 
 def test_a_session_schema_becomes_the_clients_output_format(monkeypatch, session_request):
@@ -1958,8 +1962,10 @@ def test_every_turn_of_a_schema_session_ends_in_its_structured_answer(
     monkeypatch, session_request
 ):
     sdk = SessionSdk(turns=[
-        [ResultMessage(session_id="sess-1", result='{"choice": 2}', structured_output={"choice": 2})],
-        [ResultMessage(session_id="sess-1", result='{"choice": 5}', structured_output={"choice": 5})],
+        [ResultMessage(session_id="sess-1", result='{"choice": 2}',
+                       structured_output={"choice": 2})],
+        [ResultMessage(session_id="sess-1", result='{"choice": 5}',
+                       structured_output={"choice": 5})],
     ])
     handle = session_adapter(monkeypatch, sdk).open_session(
         session_request(schema=SESSION_SCHEMA, schema_name="decision")

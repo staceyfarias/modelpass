@@ -77,6 +77,7 @@ from collections.abc import (
 )
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from ._deadline import Deadline
@@ -152,6 +153,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; the import at use is a cycle
+    from .conversations import ConversationStore
     from .manage import ConnectionManager
 
 __all__ = ["Answer", "Bridge", "ValidationReport", "chat", "default_bridge"]
@@ -543,6 +545,14 @@ class Bridge:
         self._adapters: dict[Runtime, Adapter] = dict(adapters or {})
         self._env = env
         self._run_log = run_log
+
+    def conversations(
+        self, root: str | Path, *, application: str, application_name: str | None = None,
+    ) -> ConversationStore:
+        """Open private, app-scoped managed history; no model call or global chat listing."""
+        from .conversations import ConversationStore
+        return ConversationStore(root, bridge=self, application=application,
+                                 application_name=application_name)
 
     @property
     def run_log(self) -> RunLog:

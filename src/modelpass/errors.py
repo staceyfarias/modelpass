@@ -20,6 +20,9 @@ __all__ = [
     "CapabilityNotSupported",
     "ConfigError",
     "ConnectionDisabled",
+    "ConversationBusy",
+    "ConversationError",
+    "ConversationNotFound",
     "CredentialRefIsSecret",
     "DuplicateConnection",
     "GroupUnavailable",
@@ -131,6 +134,18 @@ class SubpassError(Exception):
 
 
 # --- configuration -------------------------------------------------------------
+
+
+class ConversationError(SubpassError, ValueError):
+    """Invalid managed-conversation input, binding or storage contract."""
+
+
+class ConversationNotFound(ConversationError):
+    """No conversation with this id belongs to the requesting application."""
+
+
+class ConversationBusy(ConversationError):
+    """Another caller/process owns this conversation's turn or mutation."""
 
 
 class ConfigError(SubpassError):

@@ -2602,3 +2602,83 @@ marked `unverified`, which is a real answer.
   beside the code and not published: they cite private consumer repositories and
   work nobody outside can check. The reasoning they carry that a caller can act
   on is stated in this document and in the README.
+
+
+## Managed conversations
+
+`Bridge.conversations(root, *, application, application_name=None) -> ConversationStore`
+is an opt-in app-owned persistence layer, separate from native runtime sessions.
+The root is explicit; no default global prompt store is created. SQLite and OS locks
+use the standard library only. The schema version is checked before existing data is
+changed. A future schema is refused, never reset.
+
+`ConversationStore.create(*, connection, model=None, title="New conversation", scope=None,
+scope_name=None, system_prompt=None, mode="history", seed_history=()) -> Conversation`
+creates a stable local id without preflight, vendor startup or spend. `model` must be
+explicit or present on the connection; an unset ambient runtime default is not a
+stable selection. `application` is mandatory on the store, recorded with its display
+name on every conversation, and enforced on every lookup/mutation. `scope` is an
+optional app-defined project/workspace id. Origin labels are metadata, not hidden
+model instructions.
+
+`store.open(id)` reopens locally. `store.list(scope=None, connection=None, model=None,
+include_archived=False, limit=50, offset=0)` lists only that store's application;
+omitted/None filters are unrestricted within that application. Ordering is most
+recently updated first. These operations never enumerate the vendor's account-wide
+sessions. Guessing another application's id yields `ConversationNotFound`.
+
+`conversation.info` returns an immutable `ConversationInfo`; `to_dict()` is JSON-safe.
+It contains id, application/application_name, scope/scope_name, title, connection,
+requested model, runtime, auth mode, mode, timestamps, archive state and optional
+native session id. No credentials are stored. Native ids remain None until a turn
+finishes durably. Rename/archive mutate only title/archive metadata and update time;
+connection/model/origin are immutable. Disabled or removed connections retain their
+usual bridge refusal at send time. Runtime/auth/credential-pointer/endpoint/account
+identity drift is detected before a run; default-model changes do not rebind chats.
+
+`conversation.send(message, **controls)` / `asend(...)` stream existing `AgentEvent`s.
+History mode supplies the saved instructions and successful user/assistant text to
+`Bridge.chat` / `achat`, disables cross-connection failover, and permits other bridge
+controls. The message and system prompt are text; text-block seed history preserves
+its cache markers. Connection/model/history/instructions/auth/failover overrides on
+send are refused. Native mode uses a durable vendor session, opens/resumes and closes
+the local handle for each managed turn, and admits only timeout/reasoning per turn.
+Unsupported native runtimes are refused instead of converted to history replay.
+Construction-time fixed tools/schema sessions remain the existing `Session` API.
+Existing native session capability cells have not changed.
+
+`conversation.turns()` returns `ConversationTurn`s with message, partial/final text,
+status, timestamps, serialized observed events and optional exception type. The
+journal is a UI/audit record, not a claim of the vendor's full internal transcript.
+`history()` returns replayable successful messages in history mode and the runtime's
+own `get_history()` in native mode. It never reconstructs native history from the
+observation journal. Storage is required for this layer: a storage failure propagates
+rather than silently turning a durable chat into an unrecorded one.
+
+The per-conversation nonblocking OS lock covers sending, history reads requiring a
+stable snapshot, rename and archive. A second operation raises `ConversationBusy`;
+other conversations remain independent. Terminal records and lock release precede
+terminal delivery, so a UI can begin its next operation immediately. `close()` on a
+sync stream or `aclose()` on an async stream cancels that run and archives partial
+output. Failed/interrupted turns stay in the journal but are not automatically replayed.
+After a history-mode process crash the next lock holder marks running records
+interrupted. A native turn with observed events but no successful completion refuses
+further sends because runtime state is uncertain; it never starts a replacement native
+thread under the old managed id. A native preflight failure with no observed events
+can be retried. There are no automatic retries or automatic conversation migrations.
+Each send inherits bridge run guards/timeouts; this layer has no additional cumulative
+conversation token guard.
+
+Offline evidence: `tests/test_conversations.py` drives real Bridge calls through
+scripted stateless/session adapters, including app-origin isolation, real subprocess
+locking/crash recovery, sync/async persistence, cancellation, terminal ordering and
+binding drift. No live vendor call is part of this feature's verification.
+
+Verification on 2026-11-01: the complete offline suite in the development Python
+passed **2,616 tests**, with 2 skipped and 23 live tests deselected (64.38 s);
+`ruff check src tests` passed. An earlier run in a consumer environment lacking
+the optional Anthropic SDK failed one existing sampling test; that test passed
+in isolation and in the complete development-environment run. No live model call
+was made and no native runtime capability cell changed. Nine pre-existing
+line-length lint findings were resolved by wrapping comments/test expressions,
+with no adapter behavior or test assertion changes.
