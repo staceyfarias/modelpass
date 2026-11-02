@@ -39,6 +39,35 @@ Afterwards the terminal event carries the same answer — stamped by modelpass, 
 adapter — and one line of it goes to `~/.modelpass/runs.jsonl`, so the question survives
 the run that answered it.
 
+### Login credentials and request transport are different
+
+Signing in to a subscription creates a stored, renewable **login token**, not a
+portable API key. Modelpass's subscription connections point at the vendor's login
+and let that runtime manage refresh; modelpass does not extract the token and turn
+it into a direct HTTP API connection. Starting a runtime is not signing in again.
+
+| Connection | Who handles the login/credential | How requests run |
+| --- | --- | --- |
+| Claude subscription (`anthropic-sdk`) | Claude Code owns its cached OAuth login and refresh | Agent SDK starts the Claude Code binary in the background |
+| ChatGPT subscription (`openai-sdk`) | Codex owns its cached login and refresh | A background Codex process, using the selected transport |
+| API connections | Modelpass resolves the explicitly configured API credential | Vendor client SDK makes direct API requests; no Claude/Codex process |
+
+The Agent SDK is a library around Claude Code, not the direct Claude API client.
+See [Anthropic's SDK comparison](https://code.claude.com/docs/en/agent-sdk/overview).
+Changing from a subscription connection to an API connection changes billing; modelpass
+never does that automatically to avoid a subprocess. Subscription runtimes are still
+needed locally, but ordinary noninteractive calls and identity probes suppress console
+windows on Windows. Explicit interactive login is a separate action.
+
+For a chat UI, **retain the Bridge and consume its event stream immediately**.
+`chat(history=...)` is stateless: a subscription runtime can start afresh for every
+call and replay your text. It preserves conversation content, but is not a retained
+vendor session. For native conversation continuity and reuse, choose managed
+`mode="native"` and retain a store opened with `keep_alive=True` (below). A library
+stream does not make your web UI stream automatically: forward deltas to the UI
+instead of collecting the whole answer first. No latency improvement is guaranteed
+for vendor work; hidden windows, cached probes and session reuse remove local overhead.
+
 ### Choosing a model
 
 `bridge.models("my-account")` returns a `ModelCatalogue` without a network call:
@@ -1825,7 +1854,7 @@ Two explicit modes preserve the distinction between who holds the conversation:
 | Mode | History and execution |
 | --- | --- |
 | `history` (default) | Modelpass stores successful user/assistant text turns and passes them through `Bridge.chat/achat` on each turn. Works across the API and subscription runtimes. No truncation or summarization is invented. |
-| `native` | Modelpass stores a reference and resumes the vendor's durable chat session. Capability-gated exactly like `new_chat/resume_chat`, with no fallback. Managed native chats are text-only; use the existing `Session` API for fixed tools/schema or a continuously open native session. |
+| `native` | Modelpass stores a reference and resumes the vendor's durable chat session. Capability-gated exactly like `new_chat/resume_chat`, with no fallback. Native sends can reattach fixed tool definitions with fresh handlers. `keep_alive=True` retains live native sessions between turns; schema sessions remain the existing `Session` API. |
 
 `chat.turns()` is the app's durable observation journal, including partial output,
 receipt/tool/usage/terminal events and unsuccessful statuses. Events are persisted
@@ -1835,8 +1864,32 @@ history mode; in native mode it reads the vendor history, never a fabricated tra
 Tool observations are kept in the journal, not replayed as invented chat roles. History
 mode accepts the existing `Bridge.chat` per-call controls (tools, schema, sampling,
 timeout and guards), except fields that would override the binding or stored context.
-Native mode accepts only `timeout` and `reasoning` on send. Each managed send is a run;
-there is no additional cumulative managed-conversation token ceiling in this layer.
+Native mode accepts `timeout`, `reasoning`, `tools`, `stop_at_tokens` and
+`warn_at_tokens`. The tool definitions and guard overrides are fixed on first send;
+subsequent sends must supply the same definitions/overrides, with fresh handlers.
+Native guards apply to the underlying session, not a fresh budget for every message.
+`resume_chat(tools=...)` explicitly restores handlers; raw callers must supply the
+original definitions. Managed conversations record and compare them for you.
+
+```python
+chats = bridge.conversations(private_root, application="my.app", keep_alive=True)
+chat = chats.create(connection="claude-sub", model="sonnet", mode="native")
+try:
+    for question in ("Help me explore an idea", "Develop that further"):
+        for event in chat.send(question):
+            if event.type == "text_delta":
+                print(event.text, end="", flush=True)
+finally:
+    chats.close()  # release idle processes; vendor ids/history remain resumable
+```
+
+Retain this store across HTTP requests. It keeps at most four native sessions;
+idle ones are evicted, active turns are never evicted. Other-process progress makes
+an older local handle stale, so it is closed and the recorded vendor id resumed.
+A failed/cancelled turn is not reused as a successful warm session. `close()` refuses
+while a retained turn is active. Default `keep_alive=False` still closes the handle
+after every turn. Existing history-mode conversations stay in history mode; selecting
+native mode creates a separate conversation, never silently changes an old chat.
 
 A nonblocking OS lock prevents overlapping turns/mutations across store instances,
 threads and processes. Independent conversations can run concurrently. Closing a

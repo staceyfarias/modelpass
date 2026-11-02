@@ -641,13 +641,23 @@ def test_a_missing_session_raises_session_not_found(sessions):
     assert "no rollout found" in str(caught.value)
 
 
-def test_resume_does_not_accept_tools(sessions):
-    """Tools are the front of a warm prefix and cannot be re-declared (D17)."""
-    bridge, _ = sessions(anthropic_connection())
-    with pytest.raises(TypeError):
-        bridge.resume_chat(
-            connection="claude-sub", session_id="s", tools=[]
-        )  # type: ignore[call-arg]
+def test_resume_reattaches_explicit_tools(sessions):
+    """Native managed chats restore the same definitions and fresh handlers."""
+    from modelpass import ToolDef
+    bridge, made = sessions(anthropic_connection())
+    tool = ToolDef("current_page", "Read page", {"type": "object"}, lambda _: "today")
+    session = bridge.new_chat(connection="claude-sub", tools=[tool], system_prompt="helper")
+    list(session.send("first"))
+    identifier = session.id
+    session.close()
+    resumed = bridge.resume_chat(connection="claude-sub", session_id=identifier,
+                                 tools=[tool], system_prompt="helper")
+    list(resumed.send("second"))
+    request = made["claude-sub"].session_requests[-1]
+    assert request.tools[0].name == "current_page"
+    assert request.tools[0].handler({}) == "today"
+    assert request.resume_id == identifier
+    resumed.close()
 
 
 def test_resume_requires_the_system_prompt_where_the_runtime_drops_it(sessions):

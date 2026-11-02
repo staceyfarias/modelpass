@@ -32,6 +32,25 @@ A connection binds a runtime, an auth mode and a credential together, and is
 named. There is no per-call "use an API key this time": switching billing means
 naming a different connection (D3).
 
+### Authentication does not select a transport (2026-11-01)
+
+A subscription OAuth login token is not an API key. `anthropic-sdk` uses the
+Claude Agent SDK/Claude Code binary and its existing login/refresh; `openai-sdk`
+uses the selected Codex process transport and its login. Modelpass keeps the
+connection's identity/credential pointer and verifies billing, not a portable copy
+of a subscription token for direct API calls. API runtimes resolve their configured
+credential and call vendor HTTP clients directly. There is no silent substitution
+between these routes. Background runtime startup is separate from interactive login.
+
+Noninteractive Claude/Codex children and identity probes use `CREATE_NO_WINDOW` on
+Windows. Claude's AnyIO child creation goes through a modelpass-owned asyncio loop
+that applies the flag locally; no global subprocess or event-loop policy is patched.
+Interactive login remains explicitly interactive. API clients need no such CLI child.
+Retain the Bridge to keep successful version/account probes cached. Stream deltas to
+the application's UI as received; returning one final JSON response is buffering,
+even if the library exposes a stream. See the managed modes below for the difference
+between replaying a transcript and retaining a vendor conversation.
+
 ### 1.1 The stream contract, stated once
 
 Both doors — `Bridge.chat()` and `Session.send()` — return an
@@ -2606,7 +2625,7 @@ marked `unverified`, which is a real answer.
 
 ## Managed conversations
 
-`Bridge.conversations(root, *, application, application_name=None) -> ConversationStore`
+`Bridge.conversations(root, *, application, application_name=None, keep_alive=False) -> ConversationStore`
 is an opt-in app-owned persistence layer, separate from native runtime sessions.
 The root is explicit; no default global prompt store is created. SQLite and OS locks
 use the standard library only. The schema version is checked before existing data is
@@ -2641,10 +2660,26 @@ History mode supplies the saved instructions and successful user/assistant text 
 `Bridge.chat` / `achat`, disables cross-connection failover, and permits other bridge
 controls. The message and system prompt are text; text-block seed history preserves
 its cache markers. Connection/model/history/instructions/auth/failover overrides on
-send are refused. Native mode uses a durable vendor session, opens/resumes and closes
-the local handle for each managed turn, and admits only timeout/reasoning per turn.
-Unsupported native runtimes are refused instead of converted to history replay.
-Construction-time fixed tools/schema sessions remain the existing `Session` API.
+send are refused. Native mode uses a durable vendor session. With the default
+`keep_alive=False` it closes the local handle after each turn; `keep_alive=True`
+retains up to four native handles in this store for subsequent sends. Retain the
+store across requests and call `store.close()` on shutdown. Close refuses active
+retained turns; idle handles are evicted when capacity is reached, never active ones.
+No handle or callable is persisted. External native progress invalidates an older
+local handle; the next turn resumes the stored vendor id instead of using stale state.
+
+Native sends accept `timeout`, `reasoning`, `tools`, `stop_at_tokens` and
+`warn_at_tokens`. Tool definitions (name/description/schema) and guard overrides are
+recorded on first send and must match thereafter. Handlers are rebound for the active
+turn only, so a page-reading tool can access fresh context without changing the tool
+prefix or retaining another turn's closure. Async handlers are supported. Guards
+remain underlying-session budgets. Cancellation/failure closes the handle and keeps
+the existing uncertain-native-state refusal; there is no silent history replay.
+`resume_chat(tools=...)` restores explicit in-process handlers; raw callers are
+responsible for supplying the original definitions, while managed native chats compare
+them before resume. Schema sessions remain the existing `Session` API. Unsupported
+native runtimes are refused instead of converted to history replay. Existing history
+mode chats are not migrated into native mode automatically.
 Existing native session capability cells have not changed.
 
 `conversation.turns()` returns `ConversationTurn`s with message, partial/final text,
@@ -2713,3 +2748,22 @@ Evidence: installed SDK model-list signatures and fields inspected on
 in `tests/test_model_discovery.py` cover account/endpoint binding, pagination,
 timeouts, closure, cache isolation, disabled accounts and sanitized failure.
 No live account calls were made for this change.
+
+
+### Subscription desktop-chat verification (2026-11-01)
+
+`tests/test_background.py` checks Windows flags at the private loop boundary and
+unchanged non-Windows options. `tests/test_conversations.py` checks native reuse,
+per-turn handler refresh, fixed definitions, isolation, async sends, external
+progress, bounded retention, cancellation and explicit shutdown through real Bridge
+and Session objects with fake vendor adapters. `tests/test_sessions.py` verifies
+handler reattachment through resume. The installed Claude Agent SDK's
+`SubprocessCLITransport.connect` uses AnyIO/asyncio; its client supports retained
+streaming queries and launch-time MCP tools. No live model calls or allowance were
+used. Vendor latency and the user's visual desktop check remain separate validation.
+
+Completed offline sweep for this batch: **2,594 passed, 40 skipped, 23 live tests
+deselected** (pytest exit 0). `ruff check src tests` passed. The offline sampling
+fixture now explicitly marks its already-injected fake API transport available,
+so the run-log test does not depend on an optional installed vendor SDK. Its
+sampling/run-log assertions remain unchanged. No live vendor requests were made.

@@ -584,6 +584,9 @@ def api_bridge(tmp_path, factory, model: str | None = MODEL):
     store = ConnectionStore(tmp_path / "modelpass")
     store.add(api_connection(model))
     api = adapter(factory)
+    # The transport is already an offline fake. Its availability must not depend
+    # on whether the optional vendor SDK happens to be installed on this machine.
+    api.is_available = lambda: True
     bridge = Bridge(
         store=store,
         registry=CapabilityRegistry(),

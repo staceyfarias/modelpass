@@ -478,3 +478,116 @@ def test_explicit_seed_cache_markers_are_preserved_across_storage(setup):
     assert reopened.history()[0].to_dict() == seed.to_dict()
     list(reopened.send("consider this material"))
     assert adapter.requests[-1].messages[0].cache_breakpoints == 1
+
+
+def test_keep_alive_reuses_native_session_and_refreshes_only_handlers(tmp_path):
+    from modelpass import ToolDef
+
+    connection = Connection(
+        name="native", runtime=Runtime.ANTHROPIC_SDK, auth_mode="subscription", model="sonnet"
+    )
+    bridge, _, adapter = fake_session_bridge(
+        connections=[connection], script=[TextDeltaEvent(text="reply")], home=tmp_path / "config"
+    )
+    store = bridge.conversations(tmp_path / "chats", application="soundbench", keep_alive=True)
+    chat = store.create(connection="native", mode="native")
+
+    def tools(value):
+        return [ToolDef("current_page", "Read current page", {"type": "object"}, lambda _: value)]
+
+    list(chat.send("first", tools=tools("first page")))
+    session = store._live[chat.id]["session"]
+    handle = adapter.handles[0]
+    assert handle.closes == 0
+    # The actual retained tool dispatcher gets the second turn's closure.
+    original = handle.send
+    observed = []
+
+    def sending(message, **kwargs):
+        observed.append(asyncio.run(handle.request.tools[0].handler({})))
+        yield from original(message, **kwargs)
+
+    handle.send = sending
+    chat.rename("New title")  # metadata must not restart a native process
+    list(store.open(chat.id).send("second", tools=tools("second page")))
+    assert observed == ["second page"]
+    assert len(adapter.handles) == 1
+    assert store._live[chat.id]["session"] is session
+    assert chat.info.native_session_id == "sess-1"
+    store.close()
+    assert handle.closes == 1
+    list(store.open(chat.id).send("third", tools=tools("third page")))
+    assert len(adapter.handles) == 2
+    assert adapter.handles[-1].request.resume_id == "sess-1"
+    store.close()
+
+
+def test_native_tools_do_not_change_schema_or_leak_between_chats(tmp_path):
+    from modelpass import ToolDef
+
+    connection = Connection(
+        name="native", runtime=Runtime.ANTHROPIC_SDK, auth_mode="subscription", model="sonnet"
+    )
+    bridge, _, adapter = fake_session_bridge(
+        connections=[connection], script=[TextDeltaEvent(text="reply")], home=tmp_path / "config"
+    )
+    store = bridge.conversations(tmp_path / "chats", application="soundbench", keep_alive=True)
+    one = store.create(connection="native", mode="native")
+    two = store.create(connection="native", mode="native")
+    tool = ToolDef("current_page", "Read page", {"type": "object"}, lambda _: "private")
+    list(one.send("first", tools=[tool]))
+    list(two.send("other", tools=[tool]))
+    assert adapter.handles[0] is not adapter.handles[1]
+    with pytest.raises(ConversationError, match="tools/guards changed"):
+        list(one.send("changed", tools=[]))
+    with pytest.raises(ConversationError, match="No active handler"):
+        asyncio.run(adapter.handles[0].request.tools[0].handler({}))
+    store.close()
+
+
+def test_keep_alive_async_and_external_progress_resume_instead_of_stale_cache(tmp_path):
+    connection = Connection(
+        name="native", runtime=Runtime.ANTHROPIC_SDK, auth_mode="subscription", model="sonnet"
+    )
+    bridge, _, adapter = fake_session_bridge(
+        connections=[connection], script=[TextDeltaEvent(text="reply")], home=tmp_path / "config"
+    )
+    store = bridge.conversations(tmp_path / "chats", application="soundbench", keep_alive=True)
+    chat = store.create(connection="native", mode="native")
+
+    async def turns():
+        for question in ["first", "second"]:
+            assert [event async for event in chat.asend(question)]
+
+    asyncio.run(turns())
+    assert len(adapter.handles) == 1
+    other = bridge.conversations(tmp_path / "chats", application="soundbench")
+    list(other.open(chat.id).send("external progress"))
+    list(chat.send("after external progress"))
+    assert len(adapter.handles) == 3
+    assert adapter.handles[0].closes == 1
+    store.close()
+
+
+def test_keep_alive_is_bounded_and_cancelled_turn_is_not_reused(tmp_path):
+    connection = Connection(
+        name="native", runtime=Runtime.ANTHROPIC_SDK, auth_mode="subscription", model="sonnet"
+    )
+    bridge, _, adapter = fake_session_bridge(
+        connections=[connection], script=[TextDeltaEvent(text="partial")], home=tmp_path / "config"
+    )
+    store = bridge.conversations(tmp_path / "chats", application="soundbench", keep_alive=True)
+    for _ in range(5):
+        list(store.create(connection="native", mode="native").send("first"))
+    assert len(store._live) == 4
+    assert adapter.handles[0].closes == 1
+    chat = store.create(connection="native", mode="native")
+    stream = chat.send("cancel me")
+    next(stream)  # receipt
+    next(stream)  # text
+    with pytest.raises(ConversationBusy):
+        store.close()
+    stream.close()
+    assert chat.id not in store._live
+    assert chat.turns()[-1].status == "cancelled"
+    store.close()

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import re
 import sqlite3
+import threading
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -24,6 +26,7 @@ from uuid import uuid4
 from .capabilities import Capability
 from .errors import ConversationBusy, ConversationError, ConversationNotFound
 from .runtimes import Runtime
+from .tools import ToolDef, normalize_tools
 from .types import AgentEvent, Message, Role, TerminalEvent, TextDeltaEvent
 
 if TYPE_CHECKING:
@@ -120,12 +123,16 @@ class ConversationStore:
         bridge: Bridge,
         application: str,
         application_name: str | None = None,
+        keep_alive: bool = False,
     ) -> None:
         self.application = _text(application, "application")
         self.application_name = _text(
             application if application_name is None else application_name, "application_name"
         )
         self.bridge = bridge
+        self.keep_alive = keep_alive
+        self._live: dict[str, dict[str, Any]] = {}
+        self._live_lock = threading.RLock()
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.root / "conversations.sqlite3"
@@ -232,8 +239,9 @@ class ConversationStore:
         """Create a separate conversation. History is empty unless explicitly seeded.
 
         ``history`` uses Bridge.chat/achat on any runtime; ``native`` explicitly
-        uses new_chat/resume_chat and never falls back. Native managed chats are
-        text-only; use the existing Session API for fixed tools/schema sessions.
+        uses new_chat/resume_chat and never falls back. Native sends can rebind
+        handlers for fixed tool definitions; keep_alive retains the vendor handle.
+        Schema sessions remain the existing Session API.
         """
         selected = self.bridge.store.get(_text(connection, "connection"))
         chosen_model = _text(model if model is not None else selected.model, "model")
@@ -281,6 +289,33 @@ class ConversationStore:
                 (identifier, self.application, stamp, json.dumps(data)),
             )
         return Conversation(self, identifier)
+
+    def close(self) -> None:
+        """Release retained idle vendor sessions; never cancel another active turn.
+
+        A store with keep_alive=True must be retained by its host and closed on
+        shutdown. At most four native sessions are kept; idle ones are evicted.
+        Persisted vendor ids and the app's conversation journal remain intact.
+        """
+        with self._live_lock:
+            if any(entry["active"] for entry in self._live.values()):
+                raise ConversationBusy("Cannot close a store with an active conversation turn")
+            entries = list(self._live.values())
+            self._live.clear()
+        for entry in entries:
+            entry["session"].close()
+
+    def _release_native(self, identifier, session, data, successful):
+        with self._live_lock:
+            entry = self._live.get(identifier)
+            if successful and entry and entry["session"] is session:
+                entry["active"] = False
+                entry["marker"] = data.get("native_revision")
+                entry["handlers"] = {}
+                return
+            if entry and entry["session"] is session:
+                self._live.pop(identifier)
+        session.close()
 
     def open(self, identifier: str) -> Conversation:
         self._read(identifier)
@@ -388,11 +423,13 @@ class Conversation:
             if data["mode"] == "native":
                 if not data["native_session_id"]:
                     return []
-                session = self._native(data)
+                signature = json.loads(data.get("native_signature", "{}"))
+                tools = normalize_tools(signature.get("tools"))
+                session = self._native(data, tools, signature.get("launch"))
                 try:
                     return session.get_history()
                 finally:
-                    session.close()
+                    self.store._release_native(self.id, session, data, True)
             return self._history(data)
 
     def _history(self, data: dict[str, Any]) -> list[Message]:
@@ -411,13 +448,58 @@ class Conversation:
                 "Conversation connection identity changed; create a new conversation"
             )
 
-    def _native(self, data: dict[str, Any]):
+    def _native(self, data: dict[str, Any], tools=(), launch=None):
         self._check_binding(data)
+        launch = launch or {}
+        signature = json.dumps(
+            {"tools": [tool.to_dict() for tool in tools], "launch": launch}, sort_keys=True
+        )
+        recorded = data.get("native_signature")
+        if recorded is not None and recorded != signature:
+            raise ConversationError("Native tools/guards changed; start a separate conversation")
+        if recorded is None and data["native_session_id"] and tools:
+            raise ConversationError(
+                "This native conversation was created without tool bindings; "
+                "start a separate conversation"
+            )
+        data["native_signature"] = signature
+        with self.store._live_lock:
+            entry = self.store._live.get(self.id)
+            if entry and (
+                entry["marker"] != data.get("native_revision") or entry["session"].closed
+            ):
+                self.store._live.pop(self.id)
+                entry["session"].close()
+                entry = None
+            if entry:
+                entry["handlers"] = {tool.name: tool.handler for tool in tools}
+                entry["active"] = True
+                return entry["session"]
+            entry = {"handlers": {tool.name: tool.handler for tool in tools}, "active": True}
+
+        def route(name):
+            async def handler(args):
+                function = entry["handlers"].get(name) if entry["active"] else None
+                if function is None:
+                    raise ConversationError("No active handler for this native turn")
+                if inspect.iscoroutinefunction(function):
+                    return await function(args)
+                result = await asyncio.to_thread(function, args)
+                return await result if inspect.isawaitable(result) else result
+
+            return handler
+
+        routed = tuple(
+            ToolDef(tool.name, tool.description, tool.parameters, route(tool.name))
+            for tool in tools
+        )
         kwargs = {
             "connection": data["connection"],
             "model": data["model"],
             "expect_auth_mode": data["auth_mode"],
             "project_folder": str(self.store.root / "native" / self.id),
+            "tools": routed,
+            **launch,
         }
         Path(kwargs["project_folder"]).mkdir(parents=True, exist_ok=True)
         if data["native_session_id"]:
@@ -426,8 +508,21 @@ class Conversation:
             )
             if not carries:
                 kwargs["system_prompt"] = data["system_prompt"] or ""
-            return self.store.bridge.resume_chat(session_id=data["native_session_id"], **kwargs)
-        return self.store.bridge.new_chat(system_prompt=data["system_prompt"], **kwargs)
+            session = self.store.bridge.resume_chat(session_id=data["native_session_id"], **kwargs)
+        else:
+            session = self.store.bridge.new_chat(system_prompt=data["system_prompt"], **kwargs)
+        if self.store.keep_alive:
+            with self.store._live_lock:
+                if len(self.store._live) >= 4:
+                    idle = next(
+                        (key for key, item in self.store._live.items() if not item["active"]), None
+                    )
+                    if idle is not None:
+                        self.store._live.pop(idle)["session"].close()
+                if len(self.store._live) < 4:
+                    entry.update(session=session, marker=data.get("native_revision"))
+                    self.store._live[self.id] = entry
+        return session
 
     def _begin(self, data: dict[str, Any], message: str) -> dict[str, Any]:
         self._check_binding(data)
@@ -489,8 +584,10 @@ class Conversation:
     ) -> None:
         turn.update(status=status, finished_at=_now(), error=error)
         data["updated_at"] = turn["finished_at"]
-        if session is not None and session.id is not None:
-            data["native_session_id"] = session.id
+        if session is not None:
+            data["native_revision"] = turn["id"]
+            if session.id is not None:
+                data["native_session_id"] = session.id
         with self.store._db() as db:
             db.execute("UPDATE turns SET data=? WHERE id=?", (json.dumps(turn), turn["id"]))
             db.execute(
@@ -517,7 +614,7 @@ class Conversation:
             "model": data["model"],
             "message": message,
             "system_prompt": data["system_prompt"],
-            "history": self._history(data),
+            "history": self._history(data) if data["mode"] == "history" else None,
             "expect_auth_mode": data["auth_mode"],
             "allow_failover": False,
             **controls,
@@ -529,15 +626,32 @@ class Conversation:
             data = self.store._read(self.id)
             # Reject override keys before recording even an attempted turn.
             request = self._request(data, message, controls)
-            if data["mode"] == "native" and set(controls) - {"timeout", "reasoning"}:
-                raise ConversationError("Native managed send accepts only timeout and reasoning")
+            tools, launch, turn_controls = (), {}, controls
+            if data["mode"] == "native":
+                if set(controls) - {
+                    "timeout",
+                    "reasoning",
+                    "tools",
+                    "stop_at_tokens",
+                    "warn_at_tokens",
+                }:
+                    raise ConversationError("Unsupported native managed send control")
+                tools = normalize_tools(controls.get("tools"))
+                launch = {
+                    key: controls[key]
+                    for key in ("stop_at_tokens", "warn_at_tokens")
+                    if key in controls
+                }
+                turn_controls = {
+                    key: controls[key] for key in ("timeout", "reasoning") if key in controls
+                }
             turn = self._begin(data, message)
             stream, session, terminal = None, None, None
             finished = False
             try:
                 if data["mode"] == "native":
-                    session = self._native(data)
-                    stream = session.send(message, **controls)
+                    session = self._native(data, tools, launch)
+                    stream = session.send(message, **turn_controls)
                 else:
                     stream = self.store.bridge.chat(**request)
                 for event in stream:
@@ -574,7 +688,9 @@ class Conversation:
                     if not finished:
                         self._finish(data, turn, "cancelled", session=session)
                     if session is not None:
-                        session.close()
+                        self.store._release_native(
+                            self.id, session, data, finished and turn["status"] == "ok"
+                        )
         if terminal:
             yield terminal
 
@@ -583,15 +699,32 @@ class Conversation:
         with self.store._lock(self.id):
             data = self.store._read(self.id)
             request = self._request(data, message, controls)
-            if data["mode"] == "native" and set(controls) - {"timeout", "reasoning"}:
-                raise ConversationError("Native managed send accepts only timeout and reasoning")
+            tools, launch, turn_controls = (), {}, controls
+            if data["mode"] == "native":
+                if set(controls) - {
+                    "timeout",
+                    "reasoning",
+                    "tools",
+                    "stop_at_tokens",
+                    "warn_at_tokens",
+                }:
+                    raise ConversationError("Unsupported native managed send control")
+                tools = normalize_tools(controls.get("tools"))
+                launch = {
+                    key: controls[key]
+                    for key in ("stop_at_tokens", "warn_at_tokens")
+                    if key in controls
+                }
+                turn_controls = {
+                    key: controls[key] for key in ("timeout", "reasoning") if key in controls
+                }
             turn = self._begin(data, message)
             stream, session, terminal = None, None, None
             finished = False
             try:
                 if data["mode"] == "native":
-                    session = self._native(data)
-                    stream = session.asend(message, **controls)
+                    session = self._native(data, tools, launch)
+                    stream = session.asend(message, **turn_controls)
                 else:
                     stream = self.store.bridge.achat(**request)
                 async for event in stream:
@@ -628,6 +761,8 @@ class Conversation:
                     if not finished:
                         self._finish(data, turn, "cancelled", session=session)
                     if session is not None:
-                        session.close()
+                        self.store._release_native(
+                            self.id, session, data, finished and turn["status"] == "ok"
+                        )
         if terminal:
             yield terminal

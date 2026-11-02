@@ -126,6 +126,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .._background import process_options, runtime_loop
 from ..connections import CredentialKind
 from ..errors import (
     AuthModeMismatch,
@@ -1437,6 +1438,7 @@ def _default_claude_version(binary: str, env: Mapping[str, str]) -> str | None:
             encoding="utf-8",
             errors="replace",
             timeout=20,
+            **process_options(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1465,6 +1467,7 @@ def _default_auth_status(
             encoding="utf-8",
             errors="replace",
             timeout=20,
+            **process_options(),
         )
         parsed = json.loads(result.stdout or "{}")
     except (OSError, subprocess.TimeoutExpired, ValueError):
@@ -2063,7 +2066,7 @@ class AnthropicSessionHandle:
         """The session's own event loop, on its own thread, for its whole life."""
         if self._loop is not None and not self._loop.is_closed():
             return self._loop
-        loop = asyncio.new_event_loop()
+        loop = runtime_loop()
         thread = threading.Thread(
             target=loop.run_forever, name="modelpass-anthropic-session", daemon=True
         )
@@ -2704,7 +2707,8 @@ class AnthropicAdapter(Adapter):
 
         def worker() -> None:
             try:
-                asyncio.run(drive())
+                with asyncio.Runner(loop_factory=runtime_loop) as runner:
+                    runner.run(drive())
             except BaseException as exc:
                 items.put(exc)
             finally:

@@ -548,11 +548,17 @@ class Bridge:
 
     def conversations(
         self, root: str | Path, *, application: str, application_name: str | None = None,
+        keep_alive: bool = False,
     ) -> ConversationStore:
-        """Open private, app-scoped managed history; no model call or global chat listing."""
+        """Open private, app-scoped history without a model call.
+
+        Retain the store across requests when keep_alive=True: native chats reuse
+        idle sessions (up to four); close the store on shutdown. History mode still
+        replays text and does not become a native conversation automatically.
+        """
         from .conversations import ConversationStore
         return ConversationStore(root, bridge=self, application=application,
-                                 application_name=application_name)
+                                 application_name=application_name, keep_alive=keep_alive)
 
     @property
     def run_log(self) -> RunLog:
@@ -2062,6 +2068,7 @@ class Bridge:
         raise_on_stop: bool = False,
         schema: Mapping[str, Any] | None = None,
         schema_name: str | None = None,
+        tools: Iterable[ToolDef | Mapping[str, Any]] | None = None,
     ) -> ChatSession:
         """Pick a persisted session back up by id.
 
@@ -2071,12 +2078,12 @@ class Bridge:
         thread whose first turn never completed leaves an id that resume
         rejects. A stored id is a hint.
 
-        **There is deliberately no ``tools=`` here.** Tools were fixed when the
-        session was created, they are the very front of a cached prefix that has
-        been warm ever since, and modelpass cannot check a re-declared value
-        against what the session actually holds -- so accepting one would mean
-        either silently ignoring it or silently changing the prefix, and D17 has
-        no room for either.
+        ``tools=`` explicitly reattaches in-process handlers when resuming a
+        tool-enabled session. The caller must supply the original definitions;
+        raw resume cannot verify a vendor's earlier prefix. Managed native
+        conversations persist and compare these definitions before resuming,
+        then rebind only the current turn's handlers. Tools remain fixed during
+        a live Session; changing definitions requires a separate managed chat.
 
         ``system_prompt`` is the exception, and the runtimes split on it because
         they store it in different places. Gated on
@@ -2121,7 +2128,7 @@ class Bridge:
             system_prompt=system_prompt,
             persist=persist,
             project_folder=project_folder,
-            tools=None,
+            tools=tools,
             mcp_servers=None,
             guards=guards,
             stop_at_tokens=stop_at_tokens,

@@ -7,6 +7,17 @@ work landed.
 
 ### Added
 
+- **Reusable managed native chats and hidden background launches** (2026-11-01).
+  `Bridge.conversations(..., keep_alive=True)` retains at most four native sessions
+  across requests, with fixed tool definitions/guards and fresh per-turn handlers.
+  `ConversationStore.close()` releases idle handles; external progress, failures and
+  cancellation invalidate cached handles. `resume_chat(tools=...)` can explicitly
+  reattach in-process handlers. Windows noninteractive vendor children and probes
+  suppress console windows through local creation flags, without global policy
+  changes. README/API docs distinguish subscription login tokens from direct API
+  credentials, stateless replay from native sessions, and library streaming from
+  buffered UI delivery. No direct subscription-token HTTP adapter is introduced.
+
 - **Connection-scoped model discovery** (2026-11-01). `Bridge.models` supplies
   offline subscription suggestions or cached API metadata. Explicit refresh
   requests a model catalogue through the selected API adapter and credentials,
@@ -18,7 +29,7 @@ work landed.
   `ConversationStore` with create/list/open, rename/archive, fixed connection/model
   binding and optional project/workspace origin. History mode works across runtimes
   using existing stateless calls; explicit native mode resumes vendor sessions
-  without changing their capability/refusal contracts. Sync/async turns journal
+  on supported runtimes. Sync/async turns journal
   observed events and interrupted output, hold a nonblocking process-safe lock,
   and release it before delivering a terminal. Shared stores enforce application
   ownership, and new conversations inherit no other chat unless the caller
