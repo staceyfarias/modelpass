@@ -96,6 +96,7 @@ is a decision for its own record, not a cell this adapter may move.
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 import importlib.util
 import inspect
@@ -136,6 +137,7 @@ from ..types import (
     AgentEvent,
     AuthMode,
     ContentBlock,
+    DocumentBlock,
     SessionInfo,
     TerminalEvent,
     TerminalStatus,
@@ -285,9 +287,10 @@ def flatten(
     dropped; the bridge's own disclosure names the drop on the receipt (R3), and
     this function does not restate it.
     """
-    # A document has no text to join, and this runtime has no channel for one:
-    # refused rather than joined into nothing (2026-11-03). The bridge refuses
-    # such a call before it gets here; this is the second lock.
+    # A document has no text to join: refused rather than joined into nothing
+    # (2026-11-03). A user turn that carries one goes through the part-list path
+    # instead; this lock is for every string-only field and for the runtimes
+    # that share this function.
     refuse_documents(runtime, blocks)
     return "\n\n".join(
         block.text for block in blocks if isinstance(block, TextBlock) and block.text
@@ -309,6 +312,43 @@ def instructions_param(request: RunRequest) -> str | None:
     return flatten(blocks) or None
 
 
+def _input_file(block: DocumentBlock) -> dict[str, Any]:
+    """A document as ``ResponseInputFileParam`` (2026-11-04).
+
+    ``file_data`` is a base64 ``data:`` URL and ``filename`` rides beside it, the
+    shape ``langchain-core`` 1.3.2 writes for the Responses API. A block with no
+    title is sent as ``document.pdf``, because the vendor may require a name.
+    """
+    name = block.title or "document"
+    if not name.lower().endswith(".pdf"):
+        name = f"{name}.pdf"
+    encoded = base64.b64encode(block.data).decode("ascii")
+    return {
+        "type": "input_file",
+        "filename": name,
+        "file_data": f"data:{block.media_type};base64,{encoded}",
+    }
+
+
+def turn_content(blocks: Sequence[ContentBlock]) -> str | list[dict[str, Any]]:
+    """One turn's ``content``: a string, or a part list when it carries a document.
+
+    A turn with no document stays the plain string it has always been, so a text
+    call is byte-for-byte unchanged. Documents only occur in user turns, so
+    ``input_text`` is the only text part this needs. ``cache_control`` has nowhere
+    to go here, as in :func:`flatten`, and the bridge discloses that on the receipt.
+    """
+    if not any(isinstance(block, DocumentBlock) for block in blocks):
+        return flatten(blocks)
+    parts: list[dict[str, Any]] = []
+    for block in blocks:
+        if isinstance(block, DocumentBlock):
+            parts.append(_input_file(block))
+        elif isinstance(block, TextBlock) and block.text:
+            parts.append({"type": "input_text", "text": block.text})
+    return parts
+
+
 def input_items(request: RunRequest) -> list[dict[str, Any]]:
     """The ``input=`` array: one message item per non-system turn.
 
@@ -319,7 +359,7 @@ def input_items(request: RunRequest) -> list[dict[str, Any]]:
     type each role takes.
     """
     return [
-        {"role": role, "content": flatten(blocks)}
+        {"role": role, "content": turn_content(blocks)}
         for role, blocks in request.conversation_blocks
     ]
 

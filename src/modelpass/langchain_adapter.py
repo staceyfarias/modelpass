@@ -255,7 +255,7 @@ def _flatten_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        if any(isinstance(b, dict) and b.get("type") == "document" for b in content):
+        if any(isinstance(b, dict) and b.get("type") in ("document", "file") for b in content):
             # Joining the text would drop the file without a word (2026-11-03).
             raise ValueError(
                 "modelpass cannot carry a document part beside a content part it has "

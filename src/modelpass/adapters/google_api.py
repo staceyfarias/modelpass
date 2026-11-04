@@ -120,6 +120,7 @@ from ..types import (
     AgentEvent,
     AuthMode,
     ContentBlock,
+    DocumentBlock,
     SessionInfo,
     TerminalEvent,
     TerminalStatus,
@@ -276,9 +277,10 @@ def flatten(
     bridge's own disclosure names the drop on the receipt (R3), and this function
     does not restate it.
     """
-    # A document has no text to join, and this runtime has no channel for one:
-    # refused rather than joined into nothing (2026-11-03). The bridge refuses
-    # such a call before it gets here; this is the second lock.
+    # A document has no text to join: refused rather than joined into nothing
+    # (2026-11-03). A user turn that carries one goes through the part-list path
+    # instead; this lock is for every string-only field and for the runtimes
+    # that share this function.
     refuse_documents(runtime, blocks)
     return "\n\n".join(
         block.text for block in blocks if isinstance(block, TextBlock) and block.text
@@ -299,6 +301,25 @@ def system_instruction(request: RunRequest) -> str | None:
     return flatten(blocks) or None
 
 
+def turn_parts(blocks: Sequence[ContentBlock]) -> list[dict[str, Any]]:
+    """One turn's ``parts``: one text part, or parts in order when it has a document.
+
+    A document rides as ``inline_data`` with raw bytes, which is what
+    ``Part.from_bytes`` builds. Its ``title`` does not travel: ``google-genai``
+    1.73.1 raises on ``Blob.display_name`` for the Gemini API (read 2026-11-04).
+    A turn with no document is unchanged.
+    """
+    if not any(isinstance(block, DocumentBlock) for block in blocks):
+        return [{"text": flatten(blocks)}]
+    parts: list[dict[str, Any]] = []
+    for block in blocks:
+        if isinstance(block, DocumentBlock):
+            parts.append({"inline_data": {"data": block.data, "mime_type": block.media_type}})
+        elif isinstance(block, TextBlock) and block.text:
+            parts.append({"text": block.text})
+    return parts
+
+
 def content_items(request: RunRequest) -> list[dict[str, Any]]:
     """The ``contents=`` array: one ``Content`` per non-system turn.
 
@@ -307,7 +328,7 @@ def content_items(request: RunRequest) -> list[dict[str, Any]]:
     ``model``.
     """
     return [
-        {"role": _ROLES.get(role, "user"), "parts": [{"text": flatten(blocks)}]}
+        {"role": _ROLES.get(role, "user"), "parts": turn_parts(blocks)}
         for role, blocks in request.conversation_blocks
     ]
 

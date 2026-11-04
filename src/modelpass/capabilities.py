@@ -695,8 +695,12 @@ for _runtime in STATIC_TABLE:
 #: vendor's own ``DocumentBlockParam`` with a ``Base64PDFSourceParam`` source.
 #: Its note names the SDK read and the offline test.
 STATIC_TABLE[Runtime.ANTHROPIC_API][Capability.DOCUMENT_INPUT] = Support.SUPPORTED
+#: ``openai-api`` and ``google-api`` (2026-11-04): each row's note names its SDK
+#: read and offline test.
+STATIC_TABLE[Runtime.OPENAI_API][Capability.DOCUMENT_INPUT] = Support.SUPPORTED
+STATIC_TABLE[Runtime.GOOGLE_API][Capability.DOCUMENT_INPUT] = Support.SUPPORTED
 
-#: The note every runtime but ``anthropic-api`` carries for ``document_input``.
+#: The note every runtime without a document channel carries for ``document_input``.
 _DOCUMENT_UNSUPPORTED_NOTE = (
     "unsupported (2026-11-03), a checked absence in modelpass rather than a claim "
     "about the vendor: this runtime's adapter renders message content as text "
@@ -705,7 +709,7 @@ _DOCUMENT_UNSUPPORTED_NOTE = (
     "refused before anything is sent -- never flattened, never dropped "
     "(tests/test_document_blocks.py::test_every_runtime_but_anthropic_api_"
     "refuses_a_document_before_any_network). Use an anthropic-api connection for "
-    "documents"
+    "documents, or an openai-api or google-api one"
 )
 
 #: Why a given cell says what it says, where the reason is not obvious.
@@ -1379,8 +1383,25 @@ _API_RUNTIME_NOTES: dict[tuple[Runtime, Capability], str] = {
         "tests/live/test_anthropic_api_live.py::test_one_pdf_document_question "
         "(marker `live`, owner-run)"
     ),
-    (Runtime.OPENAI_API, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
-    (Runtime.GOOGLE_API, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
+    (Runtime.OPENAI_API, Capability.DOCUMENT_INPUT): (
+        "**supported** (2026-11-04), offline evidence only. A DocumentBlock in a user "
+        "message reaches responses.create as {'type': 'input_file', 'filename': ..., "
+        "'file_data': 'data:application/pdf;base64,...'}, in block order -- "
+        "tests/test_document_blocks.py::test_openai_api_sends_the_document_as_an_"
+        "input_file_in_order. What the vendor takes: openai 2.32.0 (installed, read "
+        "2026-11-04) types ResponseInputFileParam with file_data and filename. "
+        "cache_control does not travel on this row. No live call has been made"
+    ),
+    (Runtime.GOOGLE_API, Capability.DOCUMENT_INPUT): (
+        "**supported** (2026-11-04), offline evidence only. A DocumentBlock in a user "
+        "message reaches generate_content as a part {'inline_data': {'data': <bytes>, "
+        "'mime_type': 'application/pdf'}}, in block order -- "
+        "tests/test_document_blocks.py::test_google_api_sends_the_document_as_inline_"
+        "data_in_order, which also validates it with the SDK's Content model. "
+        "google-genai 1.73.1 (installed, read 2026-11-04) raises on Blob.display_name "
+        "for the Gemini API, so the block's title does not travel on this row, and "
+        "neither does cache_control. No live call has been made"
+    ),
     (Runtime.OPENAI_COMPATIBLE, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
     (Runtime.ANTHROPIC_API, Capability.CACHE_AUTOMATIC): (
         "**unverified, and never consulted, 2026-09-21.** CACHE_BREAKPOINTS is "

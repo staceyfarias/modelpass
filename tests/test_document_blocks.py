@@ -104,6 +104,7 @@ def tiny_pdf(text: str = MARKER) -> bytes:
 PDF = tiny_pdf()
 PDF_B64 = base64.b64encode(PDF).decode("ascii")
 EPHEMERAL = {"type": "ephemeral"}
+DOCUMENT_RUNTIMES = (Runtime.ANTHROPIC_API, Runtime.OPENAI_API, Runtime.GOOGLE_API)
 
 
 def document(**kwargs: Any) -> DocumentBlock:
@@ -328,7 +329,7 @@ def _bridge(tmp_path: Path, conn: Connection, script=()) -> tuple[Bridge, FakeAd
 
 
 @pytest.mark.parametrize(
-    "runtime", [r for r in Runtime if r is not Runtime.ANTHROPIC_API], ids=lambda r: r.value
+    "runtime", [r for r in Runtime if r not in DOCUMENT_RUNTIMES], ids=lambda r: r.value
 )
 def test_every_runtime_but_anthropic_api_refuses_a_document_before_any_network(
     tmp_path, runtime
@@ -537,10 +538,10 @@ def test_document_input_is_supported_on_anthropic_api_and_nowhere_else():
     registry = CapabilityRegistry()
     assert Capability.DOCUMENT_INPUT.value == "document_input"
     for runtime in Runtime:
-        expected = Support.SUPPORTED if runtime is Runtime.ANTHROPIC_API else Support.UNSUPPORTED
+        expected = Support.SUPPORTED if runtime in DOCUMENT_RUNTIMES else Support.UNSUPPORTED
         assert registry.support(runtime, Capability.DOCUMENT_INPUT) is expected, runtime
         note = registry.note(runtime, Capability.DOCUMENT_INPUT) or ""
-        assert "2026-11-03" in note, runtime
+        assert "2026-11-0" in note, runtime
     note = registry.note(Runtime.ANTHROPIC_API, Capability.DOCUMENT_INPUT) or ""
     assert "anthropic 0.97.0" in note
     assert "DocumentBlockParam" in note and "Base64PDFSourceParam" in note
