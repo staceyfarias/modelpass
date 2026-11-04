@@ -1277,6 +1277,42 @@ cached. That is the failure this exists to end: three consumers were building
 four-breakpoint prompts and having the markers stripped at the door, with nothing
 anywhere reporting it.
 
+## Documents (PDF)
+
+On `anthropic-api`, a user message can carry a whole PDF as a `DocumentBlock`.
+Put the document first, mark it with a `cache_control` breakpoint, and ask your
+questions after it. The second question then reads the document from the
+prompt cache instead of paying for it again:
+
+```python
+from modelpass import DocumentBlock, TextBlock
+
+handbook = DocumentBlock.from_path("handbook.pdf", cache_control={"type": "ephemeral"})
+
+for question in ("Summarize the leave policy.", "Who approves expenses?"):
+    answer = bridge.ask("claude-api", [handbook, TextBlock(question)])
+    print(answer.text, answer.receipt.documents, answer.receipt.document_bytes)
+```
+
+* **One runtime.** `document_input` is `supported` on `anthropic-api` only. On
+  every other runtime, a call that carries a document raises
+  `CapabilityNotSupported` before preflight and before anything is sent. The
+  document is never flattened to text and never dropped.
+* **User turns only.** A document in `system_prompt=` or in an assistant turn
+  of `history=` is a `ValueError`.
+* **PDF only, base64 on the wire.** `media_type` is `"application/pdf"`.
+  `DocumentBlock.coerce` also reads the Messages API's own
+  `{"type": "document", "source": {"type": "base64", ...}}` mapping. It refuses
+  a URL or file source, and it refuses `citations` / `context`, instead of
+  dropping them.
+* **`Message.text` is text only.** Documents contribute no characters. Read the
+  documents with `Message.documents`.
+* **The file never reaches disk through modelpass.** The receipt and the run log
+  record a count and a byte total, and `repr(block)` shows the title, size and
+  SHA-256. A managed conversation (`bridge.conversations(...)`) refuses a
+  document, because its history is stored to be replayed. Send documents with
+  `chat` or `ask`.
+
 ## Sampling controls
 
 `temperature`, `top_p`, `top_k`, `max_output_tokens` and `reasoning_effort` are

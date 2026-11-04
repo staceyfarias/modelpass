@@ -114,8 +114,8 @@ What each argument promises:
 
 | Argument | Contract |
 | --- | --- |
-| `message` | The new user turn. Required. |
-| `history` | `Message` objects or `{"role": ..., "content": ...}` dicts, in the order given, ahead of `message`. Omitting it is the single-shot case. |
+| `message` | The new user turn. Required. A string, or a sequence of content blocks: `TextBlock`, and on `anthropic-api` `DocumentBlock` (a PDF; §2.0a). A document on any other runtime is refused with `CapabilityNotSupported` before preflight, never flattened or dropped. |
+| `history` | `Message` objects or `{"role": ..., "content": ...}` dicts, in the order given, ahead of `message`. Omitting it is the single-shot case. A document may appear in a user turn only; in an assistant turn it is a `ValueError`. |
 | `system_prompt` | The front of the cached prefix. **Keep it here rather than concatenating it into `message`** — that is the difference between every call after the first reading from cache and every call paying full price. Absent means the runtime's *minimal* prompt, which is a decision (D22): modelpass writes no prompt of its own. |
 | `model` | The model to ask for. The receipt names what was resolved. |
 | `expect_auth_mode` | An **assertion, not an override**. Refuses to run if the connection is not what the caller thought. |
@@ -1014,6 +1014,18 @@ log and guards do not learn that a run changed runtimes.
 * **`cache_control` breakpoints reach the vendor intact.** This is the runtime
   the content-block vocabulary of ticket 1.5 exists for. `cache_breakpoints` is
   the first `supported` cell for it in the table.
+* **A user turn can carry a PDF** (2026-11-03). A `DocumentBlock` in
+  `message=` or in a user turn of `history=` goes to `messages.create` as the
+  vendor's own `DocumentBlockParam`: `{"type": "document", "source":
+  {"type": "base64", "media_type": "application/pdf", "data": ...},
+  "title"?, "cache_control"?}`, in the order the caller gave it. Put the
+  document before the question and mark it with `cache_control`, and later
+  questions read it from cache. `document_input` is `supported` here and
+  nowhere else. modelpass sends base64 PDF sources only, and it refuses
+  `citations` / `context` instead of dropping them. The receipt counts
+  `documents` and `document_bytes`. No PDF bytes are written to the run log,
+  receipts or events, and a managed conversation refuses a document instead
+  of storing it.
 * **Structured output is native** (`output_config={"format": {"type":
   "json_schema", ...}}` in SDK 0.97.0), so the schema-as-forced-tool fallback was
   not built. No strict-subset restriction, unlike `openai-sdk`.
@@ -1032,9 +1044,10 @@ neither half can produce stay `unverified`, and each names the live test that
 moves it. The live file is `tests/live/test_anthropic_api_live.py` — marker
 `live`, deselected by default, gated on `SUBPASS_LIVE_TESTS=1` **and** on
 `MODELPASS_LIVE_ANTHROPIC_API_KEY` (a variable of its own, so merely having a key
-on the machine never starts a spend). It drives four calls: one short chat, one
-tool round trip, one structured output, and one cache breakpoint sent twice with
-`cache_read_input_tokens > 0` asserted on the second.
+on the machine never starts a spend). It drives five calls: one short chat, one
+tool round trip, one structured output, one cache breakpoint sent twice with
+`cache_read_input_tokens > 0` asserted on the second, and one tiny PDF whose
+code word must come back in the answer (2026-11-03).
 
 Two cells are still open on purpose and are worth knowing about (`sampling_controls`
 and `max_output_tokens` were the third pair, and ticket 1.7 moved both to `supported`
@@ -1463,6 +1476,7 @@ any cell is `bridge.registry.note(runtime, capability)`.
 | `api_key_auth` | supported | supported |
 | `sampling_controls` | **unsupported** | **unsupported** |
 | `max_output_tokens` | **unsupported** | **unsupported** |
+| `document_input` | **unsupported** | **unsupported** |
 
 **The four API runtimes are not reproduced here**, because one of the four rows
 is `unverified` by construction and a table of `unverified` would read as a
@@ -1474,6 +1488,13 @@ construction**: its cells are filled per connection by `modelpass verify`, never
 in this table. Ask the
 registry — `bridge.registry.row(runtime)` and `bridge.registry.note(runtime,
 capability)` — rather than this page.
+
+`document_input` is the 2026-11-03 cell: can a call carry a whole document (a
+PDF `DocumentBlock`) to the model. It is `supported` on `anthropic-api` only
+(§2.0a), and a **checked** `unsupported` on every other row, the API rows
+included. What was checked is modelpass's own adapters, which all render
+content as text, so the cell describes this library and not the vendor. A
+call that carries a document to such a runtime is refused before preflight.
 
 `sampling_controls` and `max_output_tokens` are the R5 cells, added 2026-09-13
 and filled by ticket 1.7 — see §2.3. `cache_automatic` is the 2026-09-21 cell —
@@ -1559,6 +1580,7 @@ travels with the install.
 | 2026-08-31 | App-server transport, driven live | `codex` 0.151.0-alpha.7.1 | `system_prompt_replace`, the tool-belt switch, and the six cells the default flip moved (§3.2) |
 | 2026-09-13 | The four API runtimes | `anthropic` 0.97.0, `openai` 2.32.0, `google-genai` 1.73.1, typed surfaces | §2.0a–§2.0d, including every cell those sections leave open |
 | 2026-09-21 | `cache_automatic` | `openai` 2.32.0 typed surface; two recorded captures already in the tree | The one new cell, on three rows; five rows left `unverified` (§2.4) |
+| 2026-11-03 | `document_input` | `anthropic` 0.97.0 typed surface (`DocumentBlockParam`, `Base64PDFSourceParam`), installed; `tests/test_document_blocks.py::test_anthropic_api_sends_the_document_block_with_its_cache_control_in_order` against a fake client | `supported` on `anthropic-api`; a checked `unsupported` on the other seven rows, which render content as text and refuse a document before preflight. Live half: `tests/live/test_anthropic_api_live.py::test_one_pdf_document_question`, owner-run |
 
 #### The auth-mode findings, which are the reason this library exists
 

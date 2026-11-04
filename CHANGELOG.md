@@ -7,6 +7,41 @@ work landed.
 
 ### Added
 
+- **PDF documents as message content, on `anthropic-api`** (2026-11-03). New
+  `DocumentBlock(data, media_type="application/pdf", title=None,
+  cache_control=None)`, exported from `modelpass`, with `from_path()`,
+  `coerce()` (reads the Messages API base64 document mapping), `to_dict()`
+  (that wire shape, one line of standard base64), `summary()`, `size_bytes` and
+  `sha256`. `ContentBlock` is now `TextBlock | DocumentBlock`, and
+  `normalize_content` dispatches on `type`. `Bridge.chat` / `achat` / `ask` /
+  `aask` and the module-level `chat` take documents in `message=` (and in
+  user turns of `history=`). `system_prompt=` stays text-only. A document in a
+  system or assistant message is a `ValueError` at construction. New
+  `Message.documents`. `Message.text` / `flat_text` join text blocks only.
+  Breakpoints on a document count toward `cache_breakpoints`. New capability
+  `Capability.DOCUMENT_INPUT` (`document_input`) is `supported` on
+  `anthropic-api`, with a dated note naming the anthropic 0.97.0
+  `DocumentBlockParam` / `Base64PDFSourceParam` read and the offline test. It
+  is a checked `unsupported` on every other runtime. There, a call carrying a
+  document raises the existing `CapabilityNotSupported` before preflight and
+  before any network, and failover refuses a target that cannot take it. The
+  flattening adapters refuse again through `adapters.base.refuse_documents`, so
+  a document is never joined into an empty string. `Receipt.documents` and
+  `Receipt.document_bytes` count what a call carries. The bytes never reach
+  disk: the run log, receipts and events carry counts only, `repr` shows title,
+  size and hash, and `ConversationStore.create(seed_history=...)` refuses a
+  document with `ConversationError` rather than store it. The LangChain adapter
+  turns a `{"type": "document"}` part into a `DocumentBlock` and raises rather
+  than flattening one away. Three messages changed wording. An image block's
+  refusal was `modelpass carries text content blocks only, got 'image': images
+  and documents stay out of v1` and is now `modelpass carries text content
+  blocks only, plus documents as DocumentBlock; got 'image': images stay out
+  of v1`. The two `TypeError`s for content of the wrong type now say `a
+  sequence of text or document content blocks` where they said `a sequence of
+  text content blocks`. The live drive is
+  `tests/live/test_anthropic_api_live.py::test_one_pdf_document_question`
+  (owner-run, not yet run). No new runtime dependencies.
+
 - **Application-scoped managed conversations** (2026-11-01).
   `Bridge.conversations(root, application=...)` returns a durable private
   `ConversationStore` with create/list/open, rename/archive, fixed connection/model
