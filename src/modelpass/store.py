@@ -192,6 +192,8 @@ _CONNECTION_KEYS = frozenset(
         "timeoutSeconds",
         "maxInputTokens",
         "promptCache",
+        "promptCachePlacement",
+        "promptCacheMarkers",
         "reasoning",
     }
 )
@@ -450,6 +452,10 @@ def connection_to_dict(connection: Connection) -> dict[str, Any]:
     # was not given, so a key in the file is always somebody's request.
     if connection.prompt_cache is not None:
         data["promptCache"] = connection.prompt_cache
+    if connection.prompt_cache_placement is not None:
+        data["promptCachePlacement"] = list(connection.prompt_cache_placement)
+    if connection.prompt_cache_markers is not None:
+        data["promptCacheMarkers"] = connection.prompt_cache_markers
     if connection.reasoning is not None:
         data["reasoning"] = connection.reasoning
 
@@ -509,6 +515,8 @@ def connection_from_dict(name: str, data: Mapping[str, Any]) -> Connection:
         timeout_seconds=data.get("timeoutSeconds"),
         max_input_tokens=data.get("maxInputTokens"),
         prompt_cache=data.get("promptCache"),
+        prompt_cache_placement=data.get("promptCachePlacement"),
+        prompt_cache_markers=data.get("promptCacheMarkers"),
         reasoning=data.get("reasoning"),
     )
 

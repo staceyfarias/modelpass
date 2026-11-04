@@ -1050,9 +1050,22 @@ def _list(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:
                     name=connection.name,
                 )
                 lifetime = plan.ttl or "the vendor's own lifetime"
+                stated = (
+                    "prompt caching off"
+                    if plan.off
+                    else f"prompt caching requested at {lifetime}"
+                )
                 print(
-                    f"      cache     prompt caching requested at {lifetime} "
+                    f"      cache     {stated} "
                     f"-- {plan.disposition.value} on {connection.runtime.value}",
+                    file=out,
+                )
+            if connection.prompt_cache_placement is not None:
+                placed = ", ".join(connection.prompt_cache_placement) or "nothing"
+                print(f"      cache     modelpass places: {placed}", file=out)
+            if connection.prompt_cache_markers is not None:
+                print(
+                    f"      cache     markers: {connection.prompt_cache_markers}",
                     file=out,
                 )
             if connection.retry == "never":

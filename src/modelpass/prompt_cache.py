@@ -19,9 +19,9 @@ to name.
 avoid.**
 
 * :attr:`PromptCacheDisposition.EXPLICIT` -- the runtime takes an instruction
-  about caching, so the request is honoured in the strong sense: put
-  ``cache_control`` on your content and it reaches the vendor. Today this is
-  ``anthropic-api`` alone.
+  about caching, so the request is honoured in the strong sense: breakpoints
+  reach the vendor, placed as ``promptCachePlacement`` says, and a named lifetime
+  goes on them. Today this is ``anthropic-api`` alone.
 * :attr:`PromptCacheDisposition.AUTOMATIC` -- the runtime caches without being
   asked and offers no way to stop it, so the request is **already satisfied**.
   This is not an error and must never be reported as one. It is also not the
@@ -56,24 +56,39 @@ repository on a named date, and a runtime with no entry accepts
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import Any
 
 from .capabilities import DEFAULT_REGISTRY, Capability, CapabilityRegistry, Support
 from .errors import InvalidConnection
 from .runtimes import Runtime
+from .types import CacheControl, ContentBlock, Message, TextBlock
 
 __all__ = [
+    "AUTO",
+    "CACHE_MARKER_MODES",
+    "CACHE_PLACEMENTS",
+    "LONGEST_CACHE_TTL",
+    "MAX_CACHE_BREAKPOINTS",
+    "NO_CACHE",
+    "PROMPT_CACHE_MARKER",
     "PROMPT_CACHE_TTLS",
     "VENDOR_DEFAULT",
+    "CacheRules",
     "ContinuityMechanism",
     "EffortCacheContinuity",
     "EffortContinuity",
     "PromptCacheDisposition",
     "PromptCachePlan",
+    "arrange_prompt_cache",
+    "cache_rules",
+    "check_cache_placement",
     "effort_cache_continuity",
     "observed_effort_continuity",
     "plan_prompt_cache",
+    "strip_prompt_cache_markers",
 ]
 
 #: The word for "caching on, at whatever lifetime the vendor uses". It is a
@@ -84,6 +99,33 @@ __all__ = [
 #: caching and declined to name a lifetime; ``"1h"`` means somebody named one.
 #: The same unset-versus-zero discipline ``maxInputTokens`` uses, one type along.
 VENDOR_DEFAULT = "default"
+
+#: Another word for :data:`VENDOR_DEFAULT`. Both mean caching on, at the vendor's
+#: own lifetime.
+AUTO = "auto"
+
+#: Caching off. Only a runtime that takes instructions can honour it: one that
+#: caches on its own cannot be stopped, so there this is refused.
+NO_CACHE = "none"
+
+#: The placeholder a caller writes in a prompt to end a cacheable prefix. It is
+#: the string GoTo Agents renders its ``{PROMPT_CACHE_MARKER}`` template variable
+#: to, so a prompt written there means the same thing here.
+PROMPT_CACHE_MARKER = "<<<PROMPT_CACHE_MARKER>>>"
+
+#: What ``promptCachePlacement`` can name: the end of the system prompt, and the
+#: end of the turns a call re-sends.
+CACHE_PLACEMENTS: tuple[str, ...] = ("system", "turns")
+
+#: What ``promptCacheMarkers`` can say. ``ignore`` removes the caller's markers
+#: and ``cache_control`` so only the placement decides.
+CACHE_MARKER_MODES: tuple[str, ...] = ("use", "ignore")
+
+#: How many ``cache_control`` breakpoints Anthropic takes on one request.
+MAX_CACHE_BREAKPOINTS = 4
+
+#: The longer of Anthropic's two lifetimes. A longer one may not follow a shorter.
+LONGEST_CACHE_TTL = "1h"
 
 #: The cache lifetimes each runtime accepts, in the **vendor's own spelling**.
 #:
@@ -122,9 +164,8 @@ class PromptCacheDisposition(StrEnum):
     exception rather than a value. A plan that exists has been met.
     """
 
-    #: The runtime takes an instruction. The caller's ``cache_control``
-    #: breakpoints reach the vendor, and *where* the prefix ends is the caller's
-    #: to decide.
+    #: The runtime takes an instruction. Breakpoints reach the vendor, placed
+    #: by ``promptCachePlacement`` and by the caller.
     EXPLICIT = "explicit"
     #: The runtime caches on its own and offers the caller no lever. The request
     #: was already satisfied before it was made. A caller reading this knows its
@@ -156,6 +197,11 @@ class PromptCachePlan:
     def already_satisfied(self) -> bool:
         """Whether the runtime was doing this anyway."""
         return self.disposition is PromptCacheDisposition.AUTOMATIC
+
+    @property
+    def off(self) -> bool:
+        """Whether the connection turned caching off."""
+        return self.requested == NO_CACHE
 
 
 def plan_prompt_cache(
@@ -207,8 +253,26 @@ def plan_prompt_cache(
             "tell you it was already met. Omit the key"
         )
 
+    if value == NO_CACHE:
+        if disposition is PromptCacheDisposition.AUTOMATIC:
+            raise InvalidConnection(
+                f"connection {name!r}: promptCache {NO_CACHE!r} cannot be met on "
+                f"{runtime.value}: it caches prompts on its own and offers no way to "
+                "stop it. Omit the key"
+            )
+        return PromptCachePlan(
+            requested=value,
+            disposition=disposition,
+            ttl=None,
+            note=(
+                f"prompt caching off: modelpass sends no cache_control to "
+                f"{runtime.value}, and removes any marker or breakpoint on the call"
+            ),
+        )
+
     accepted = PROMPT_CACHE_TTLS.get(runtime, ())
-    if value != VENDOR_DEFAULT:
+    vendor_default = value in (VENDOR_DEFAULT, AUTO)
+    if not vendor_default:
         if not accepted:
             raise InvalidConnection(
                 f"connection {name!r}: promptCache on {runtime.value} accepts only "
@@ -224,7 +288,7 @@ def plan_prompt_cache(
                 f"lifetime), got {value!r}"
             )
 
-    ttl = None if value == VENDOR_DEFAULT else value
+    ttl = None if vendor_default else value
     return PromptCachePlan(
         requested=value,
         disposition=disposition,
@@ -245,9 +309,9 @@ def _note(
         )
         return (
             f"prompt caching requested {where}: {runtime.value} takes an "
-            "instruction, so cache_control breakpoints on this call's content "
-            "reach the vendor. modelpass places none of its own and moves none "
-            "of yours -- where the prefix ends is yours to say"
+            "instruction, so cache_control breakpoints reach the vendor: the ones "
+            "promptCachePlacement places, and your own unless promptCacheMarkers "
+            "is 'ignore'"
         )
     if ttl:
         return (
@@ -262,6 +326,279 @@ def _note(
         "to stop it or to place a breakpoint, so the request was already met "
         "before it was made. Nothing is sent for it and nothing needs to be"
     )
+
+
+# --- where the breakpoints go -------------------------------------------------------
+#
+# Added 2026-11-04. ``promptCache`` says how long; these say where. Only a runtime
+# that takes breakpoints acts on any of this. Everywhere else a marker is removed
+# and the prompt reads as if it was never there, so a prompt written for
+# ``anthropic-api`` can move to another vendor without being edited.
+
+
+@dataclass(frozen=True, slots=True)
+class CacheRules:
+    """What one connection's settings mean for the breakpoints on a call."""
+
+    #: Whether the runtime takes breakpoints at all.
+    takes_breakpoints: bool
+    #: ``promptCache = "none"``: nothing is marked and nothing is left marked.
+    off: bool = False
+    #: The lifetime for a breakpoint that does not pin its own, or ``None``.
+    ttl: str | None = None
+    #: Mark the end of the system prompt, unless the caller marked it already.
+    system: bool = False
+    #: Mark the end of the turns re-sent on this call.
+    turns: bool = False
+    #: Honour the caller's markers and ``cache_control``. ``False`` removes them.
+    use_markers: bool = True
+
+    @property
+    def limit(self) -> int:
+        """How many breakpoints a call may carry before the turn's is placed."""
+        return MAX_CACHE_BREAKPOINTS - (1 if self.turns else 0)
+
+
+def cache_rules(connection: Any, registry: CapabilityRegistry | None = None) -> CacheRules:
+    """Read a connection's three cache settings. Never raises: they were checked."""
+    registry = registry or DEFAULT_REGISTRY
+    takes = registry.supports(connection.runtime, Capability.CACHE_BREAKPOINTS)
+    stated = connection.prompt_cache
+    off = stated == NO_CACHE
+    placement = connection.prompt_cache_placement
+    if placement is None:
+        placement = CACHE_PLACEMENTS if stated is not None and not off else ()
+    return CacheRules(
+        takes_breakpoints=takes,
+        off=off,
+        ttl=None if stated in (None, NO_CACHE, AUTO, VENDOR_DEFAULT) else stated,
+        system="system" in placement,
+        turns="turns" in placement,
+        use_markers=not off and connection.prompt_cache_markers != "ignore",
+    )
+
+
+def check_cache_placement(
+    placement: Any, markers: Any, stated: str | None, *, name: str
+) -> tuple[str, ...] | None:
+    """Validate ``promptCachePlacement`` and ``promptCacheMarkers``, or refuse them.
+
+    Neither is checked against the runtime: a connection can move to another
+    vendor with these keys still set, and the receipt says they had no effect.
+    ``promptCache = "none"`` is the exception, because asking for no caching and
+    for breakpoints in the same place contradicts itself.
+    """
+    if markers is not None and markers not in CACHE_MARKER_MODES:
+        allowed = ", ".join(repr(m) for m in CACHE_MARKER_MODES)
+        raise InvalidConnection(
+            f"connection {name!r}: promptCacheMarkers must be one of: {allowed}, "
+            f"got {markers!r}"
+        )
+    chosen: tuple[str, ...] | None = None
+    if placement is not None:
+        allowed = ", ".join(repr(p) for p in CACHE_PLACEMENTS)
+        if not isinstance(placement, (list, tuple)):
+            raise InvalidConnection(
+                f"connection {name!r}: promptCachePlacement must be a list drawn "
+                f"from: {allowed}, got {type(placement).__name__}"
+            )
+        unknown = [p for p in placement if p not in CACHE_PLACEMENTS]
+        if unknown:
+            raise InvalidConnection(
+                f"connection {name!r}: promptCachePlacement must be a list drawn "
+                f"from: {allowed}, got {unknown[0]!r}"
+            )
+        chosen = tuple(p for p in CACHE_PLACEMENTS if p in placement)
+    if stated == NO_CACHE and (chosen or markers == "use"):
+        raise InvalidConnection(
+            f"connection {name!r}: promptCache {NO_CACHE!r} turns caching off, so "
+            "promptCachePlacement and promptCacheMarkers cannot ask for breakpoints "
+            "beside it. Remove one of them"
+        )
+    return chosen
+
+
+def strip_prompt_cache_markers(text: str | None) -> str | None:
+    """``text`` with every marker removed. ``None`` stays ``None``."""
+    return text.replace(PROMPT_CACHE_MARKER, "") if text else text
+
+
+def _marker_count(message: Message) -> int:
+    if isinstance(message.content, str):
+        return message.content.count(PROMPT_CACHE_MARKER)
+    return sum(
+        block.text.count(PROMPT_CACHE_MARKER)
+        for block in message.content
+        if isinstance(block, TextBlock)
+    )
+
+
+def _split_block(block: TextBlock) -> list[TextBlock]:
+    """One block per stretch of text, each marker a breakpoint on the text before it.
+
+    Every byte but the marker is kept, because these bytes are the cached prefix.
+    A stretch of only whitespace gets no block: the vendor refuses an empty one. A
+    marker with no text before it has nothing to mark and is dropped.
+    """
+    pieces = block.text.split(PROMPT_CACHE_MARKER)
+    out: list[TextBlock] = []
+    for piece in pieces[:-1]:
+        if piece.strip():
+            out.append(TextBlock(piece, cache_control=CacheControl()))
+    if pieces[-1].strip():
+        out.append(TextBlock(pieces[-1], cache_control=block.cache_control))
+    elif out and block.cache_control is not None:
+        out[-1] = replace(out[-1], cache_control=block.cache_control)
+    return out or [replace(block, text=block.text.replace(PROMPT_CACHE_MARKER, ""))]
+
+
+def _expand_markers(message: Message, *, split: bool) -> Message:
+    """Turn a message's markers into breakpoints, or remove them."""
+    if not _marker_count(message):
+        return message
+    if not split and isinstance(message.content, str):
+        return replace(message, content=message.content.replace(PROMPT_CACHE_MARKER, ""))
+    blocks = (
+        (TextBlock(message.content),)
+        if isinstance(message.content, str)
+        else message.content
+    )
+    out: list[ContentBlock] = []
+    for block in blocks:
+        if not isinstance(block, TextBlock) or PROMPT_CACHE_MARKER not in block.text:
+            out.append(block)
+        elif split:
+            out.extend(_split_block(block))
+        else:
+            out.append(replace(block, text=block.text.replace(PROMPT_CACHE_MARKER, "")))
+    return replace(message, content=tuple(out))
+
+
+def _map_breakpoints(
+    messages: tuple[Message, ...],
+    change: Callable[[CacheControl], CacheControl | None],
+) -> tuple[Message, ...]:
+    """Apply ``change`` to each breakpoint in the order the vendor reads them."""
+    out = list(messages)
+    for index in sorted(range(len(out)), key=lambda i: out[i].role.value != "system"):
+        message = out[index]
+        if isinstance(message.content, str) or not message.cache_breakpoints:
+            continue
+        out[index] = replace(
+            message,
+            content=tuple(
+                block
+                if block.cache_control is None
+                else replace(block, cache_control=change(block.cache_control))
+                for block in message.content
+            ),
+        )
+    return tuple(out)
+
+
+def _mark_system(messages: tuple[Message, ...]) -> tuple[Message, ...]:
+    """Put a breakpoint at the end of the system prompt, unless it has one."""
+    system = [i for i, m in enumerate(messages) if m.role.value == "system"]
+    if not system or any(messages[i].cache_breakpoints for i in system):
+        return messages
+    message = messages[system[-1]]
+    blocks = (
+        (TextBlock(message.content),)
+        if isinstance(message.content, str)
+        else message.content
+    )
+    for index in range(len(blocks) - 1, -1, -1):
+        block = blocks[index]
+        if isinstance(block, TextBlock) and block.text.strip():
+            marked = replace(block, cache_control=CacheControl())
+            content = (*blocks[:index], marked, *blocks[index + 1 :])
+            out = list(messages)
+            out[system[-1]] = replace(message, content=content)
+            return tuple(out)
+    return messages
+
+
+def arrange_prompt_cache(
+    messages: tuple[Message, ...],
+    connection: Any,
+    registry: CapabilityRegistry | None = None,
+) -> tuple[tuple[Message, ...], tuple[str, ...]]:
+    """Resolve a call's markers and placement. Returns the messages and any notes.
+
+    The one place a marker is read, so no adapter ever sees one. A connection
+    that stated nothing and a prompt with no marker come back untouched.
+
+    The turn's breakpoint is not placed here. It moves every round of a tool
+    loop, so :mod:`modelpass.adapters.anthropic_api` places it at send time, and
+    :attr:`CacheRules.limit` keeps a slot free for it.
+    """
+    rules = cache_rules(connection, registry)
+    runtime = connection.runtime.value
+    notes: list[str] = []
+
+    markers = sum(_marker_count(m) for m in messages)
+    split = rules.takes_breakpoints and rules.use_markers
+    if markers:
+        messages = tuple(_expand_markers(m, split=split) for m in messages)
+        if not rules.takes_breakpoints:
+            notes.append(
+                f"{markers} prompt cache marker(s) removed: {runtime} takes no "
+                "breakpoints, so the prompt was sent without them"
+            )
+    if not rules.takes_breakpoints:
+        if connection.prompt_cache_placement:
+            notes.append(
+                f"promptCachePlacement has no effect on {runtime}: it takes no "
+                "breakpoints"
+            )
+        return messages, tuple(notes)
+
+    if not rules.use_markers:
+        breakpoints = sum(m.cache_breakpoints for m in messages)
+        if markers or breakpoints:
+            messages = _map_breakpoints(messages, lambda control: None)
+            why = (
+                "promptCache is 'none'"
+                if rules.off
+                else "promptCacheMarkers is 'ignore'"
+            )
+            notes.append(
+                f"{markers + breakpoints} prompt cache marker(s) and breakpoint(s) "
+                f"removed: {why}"
+            )
+    if rules.system:
+        messages = _mark_system(messages)
+
+    if markers or rules.ttl or rules.system or rules.turns:
+        kept = 0
+
+        def within_limit(control: CacheControl) -> CacheControl | None:
+            nonlocal kept
+            kept += 1
+            return control if kept <= rules.limit else None
+
+        messages = _map_breakpoints(messages, within_limit)
+        if kept > rules.limit:
+            notes.append(
+                f"{kept - rules.limit} cache breakpoint(s) dropped: this call may "
+                f"carry {rules.limit}, and the vendor reads the first ones first"
+            )
+
+    if rules.ttl:
+        shorter = False
+
+        def with_lifetime(control: CacheControl) -> CacheControl:
+            # The vendor refuses a longer lifetime after a shorter one, so a
+            # caller's shorter pin caps every breakpoint after it.
+            nonlocal shorter
+            if control.ttl is None and not shorter:
+                control = replace(control, ttl=rules.ttl)
+            shorter = shorter or control.ttl != LONGEST_CACHE_TTL
+            return control
+
+        messages = _map_breakpoints(messages, with_lifetime)
+
+    return messages, tuple(notes)
 
 
 # --- changing effort without losing the prefix -----------------------------------

@@ -687,10 +687,13 @@ maxInputTokens = 200000              # optional; the model's usable input window
                                      # is unknown -- there is no table of model sizes
                                      # here and nothing guesses one. Nothing in
                                      # modelpass reads it; it is for the tools that do.
-promptCache   = "default"            # optional; ask for prompt caching. "default" =
-                                     # the vendor's own lifetime, or name one the
-                                     # runtime accepts. Omit it and nothing is stated
-                                     # -- which is NOT "caching off" (see below).
+promptCache   = "auto"               # optional; ask for prompt caching. "auto" (or
+                                     # "default") = the vendor's own lifetime, "none"
+                                     # = off where it can be turned off, or name a
+                                     # lifetime the runtime accepts. Omit it and nothing
+                                     # is stated -- which is NOT "caching off" (see below).
+promptCachePlacement = ["system", "turns"]  # optional; what modelpass marks by itself
+promptCacheMarkers   = "use"         # optional; "use" | "ignore" your own markers
 
   # Spend guards. NO DEFAULTS -- see "Guards" below. A connection with no
   # [guards] table genuinely has nothing bounding one run's spend, and the file
@@ -1277,7 +1280,7 @@ cached. That is the failure this exists to end: three consumers were building
 four-breakpoint prompts and having the markers stripped at the door, with nothing
 anywhere reporting it.
 
-## Documents (PDF)
+## Documents and other files
 
 On `anthropic-api`, `openai-api` and `google-api`, a user message can carry a
 whole PDF as a `DocumentBlock`. On `anthropic-api`, put the document first, mark
@@ -1311,11 +1314,22 @@ for question in ("Summarize the leave policy.", "Who approves expenses?"):
   file comes back as the vendor's own error.
 * **User turns only.** A document in `system_prompt=` or in an assistant turn
   of `history=` is a `ValueError`.
-* **PDF only, base64 on the wire.** `media_type` is `"application/pdf"`.
-  `DocumentBlock.coerce` also reads the Messages API's own
-  `{"type": "document", "source": {"type": "base64", ...}}` mapping. It refuses
-  a URL or file source, and it refuses `citations` / `context`, instead of
-  dropping them.
+* **Any file type can be sent, and the vendor decides.** modelpass keeps no list
+  of supported types. `from_path` reads the type from the suffix using Python's
+  own table, and raises if the suffix is unknown, so pass `media_type=` for
+  files like `.docx` or `.md`. Each runtime sends images and other files in its
+  own shape. No file has been sent to a vendor live yet.
+* **A vendor refusal is typed.** If the vendor answers HTTP 400, 413, 415 or 422
+  to a call carrying a file, the call raises `DocumentRejected`, with
+  `media_types`, `status_code` and the vendor's own message. It does not claim
+  the file was the cause, because a 400 can be about something else in the
+  request, so read the message.
+* **Accepted does not mean fully read.** A vendor can take a file and read only
+  part of it. OpenAI's guide says non-PDF documents get text extraction only, so
+  charts and embedded images are lost.
+* **`DocumentBlock.coerce`** also reads the Messages API's own `{"type":
+  "document", "source": {"type": "base64", ...}}` mapping. It refuses a URL or
+  file source, and it refuses `citations` / `context`, instead of dropping them.
 * **`Message.text` is text only.** Documents contribute no characters. Read the
   documents with `Message.documents`.
 * **The file never reaches disk through modelpass.** The receipt and the run log
@@ -1323,6 +1337,26 @@ for question in ("Summarize the leave policy.", "Who approves expenses?"):
   SHA-256. A managed conversation (`bridge.conversations(...)`) refuses a
   document, because its history is stored to be replayed. Send documents with
   `chat` or `ask`.
+
+Ask what a connection's model takes before sending, where the vendor can say.
+It spends no tokens and never gates a call:
+
+```python
+support = bridge.input_support("claude-api")
+support.carries_files  # True: modelpass has a channel for a file on this runtime
+support.queried        # True: the vendor answered
+support.inputs         # ("text", "image", "pdf"), as the vendor reported them
+```
+
+| Runtime | Source | `queried` |
+| --- | --- | --- |
+| `anthropic-api` | `capabilities` on `models.retrieve` | `True` |
+| `openai-sdk` | `inputModalities` from `model/list` | `True` |
+| `openai-api`, `google-api` | Their model records have no such field | `False`: the vendor answers when you send |
+
+`queried=False` means nobody could say, not that nothing is accepted. On
+`openai-sdk`, `inputs` can list `image` while `carries_files` is `False`: the
+model takes images, but modelpass has no channel for a file on that runtime yet.
 
 ## Sampling controls
 
@@ -1655,6 +1689,64 @@ is checked against what that runtime accepts, read off the SDK installed here â€
 no house vocabulary and no translation between them, because nobody published
 one. A lifetime a runtime does not take is refused when the connection is built,
 not by a 400 halfway through a run.
+
+### Where the breakpoints go
+
+`promptCache` says how long. On `anthropic-api`, three things say where, and you
+can use any of them or none. Asking for caching is enough on its own:
+
+```toml
+[connections.claude-api]
+promptCache = "auto"                  # "none" | "auto" | "5m" | "1h"
+```
+
+That caches the system prompt and the repeated turns at Anthropic's default
+lifetime. To choose, set either of these beside it:
+
+```toml
+promptCachePlacement = ["system", "turns"]   # what modelpass marks by itself
+promptCacheMarkers   = "use"                 # or "ignore"
+```
+
+| Setting | What it does on `anthropic-api` |
+| --- | --- |
+| `promptCache = "none"` | Sends no `cache_control`, and removes any marker or breakpoint on the call |
+| `promptCache = "auto"` | Caching on at the vendor's lifetime. `"default"` means the same |
+| `promptCache = "5m"` or `"1h"` | Caching on, with that lifetime on every breakpoint that does not pin its own |
+| `promptCachePlacement` has `"system"` | Marks the end of the system prompt, unless you marked it yourself |
+| `promptCachePlacement` has `"turns"` | Marks the message before the current turn, so a one-shot call pays no cache write for its question |
+| `promptCachePlacement = []` | Marks nothing by itself; only your markers count |
+| `promptCacheMarkers = "ignore"` | Removes your markers and `cache_control`, so only the placement decides |
+
+**You can also mark a prompt yourself.** Put `PROMPT_CACHE_MARKER` where the stable
+part of a prompt ends:
+
+```python
+from modelpass import PROMPT_CACHE_MARKER
+
+system_prompt = f"{instructions}{PROMPT_CACHE_MARKER}{todays_context}"
+```
+
+On `anthropic-api` the text before the marker becomes a cached prefix. It works
+with no cache settings at all, in a system prompt or a message. On every other
+runtime the marker is removed and the rest of the prompt is sent as written, so
+you can change vendor without editing your prompts. The receipt says how many
+were removed. The marker is the same string GoTo Agents renders its
+`{PROMPT_CACHE_MARKER}` template variable to.
+
+A call stays inside the vendor's rules. It carries at most four breakpoints, and
+a slot is kept for the turn when `"turns"` is on. Later ones are dropped and the
+receipt says how many. A lifetime you pin on a block beats the connection's, and
+a shorter pin caps the breakpoints after it, because the vendor refuses a longer
+lifetime after a shorter one. Text below the model's minimum cacheable length is
+not cached, and the vendor reports no error for that.
+
+**Every other runtime caches on its own.** `promptCachePlacement` and
+`promptCacheMarkers` have no effect there and the receipt says so, so a connection
+can move to another vendor with them still set. A lifetime is different: it is
+refused when the connection is built if the runtime does not take it, and
+`"none"` is refused where caching cannot be stopped. Subscriptions take `"auto"`
+and nothing else.
 
 ### What is safe to share between threads
 

@@ -100,6 +100,7 @@ from .errors import (
 )
 from .guards import GuardTracker
 from .preflight import Receipt
+from .prompt_cache import strip_prompt_cache_markers
 from .reasoning import Effort, ReasoningPlan, plan_reasoning, stated_reasoning
 from .runlog import RunRecord
 from .runtimes import Runtime
@@ -475,7 +476,9 @@ class Session:
         self._take()
         deadline = Deadline(timeout) if timeout else None
         try:
-            async for event in self._arun_turn(message, deadline, effort):
+            async for event in self._arun_turn(
+                strip_prompt_cache_markers(message), deadline, effort
+            ):
                 yield event
         finally:
             if deadline is not None:
@@ -723,7 +726,9 @@ class Session:
         self._take()
         deadline = Deadline(timeout) if timeout else None
         try:
-            yield from self._run_turn(message, deadline, effort)
+            yield from self._run_turn(
+                strip_prompt_cache_markers(message), deadline, effort
+            )
         finally:
             if deadline is not None:
                 deadline.stop()

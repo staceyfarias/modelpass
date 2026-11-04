@@ -4587,6 +4587,46 @@ class OpenAIAdapter(Adapter):
             for thread in threads_from_list(result)
         )
 
+    def input_modalities(self, request: RunRequest) -> tuple[str, ...] | None:
+        """``model/list`` reports ``inputModalities`` per model (2026-11-04).
+
+        Driven live 2026-11-04 on codex 0.154.0: metadata only, no thread and no
+        turn, and every listed model answered ``['text', 'image']``. A model
+        with no such field returns ``None``: the generated type's default is a
+        client-side default, not something the server said.
+        """
+        binary = self._resolve_binary(request)
+        if binary is None:
+            raise VendorRunFailed("codex CLI not found")
+        client = AppServerClient(
+            binary=binary,
+            env=dict(request.plan.env),
+            cwd=tempfile.gettempdir(),
+            spawn=self._app_server_spawn,
+        )
+        listed: list[Mapping[str, Any]] = []
+        try:
+            client.start()
+            cursor = None
+            while True:
+                params: dict[str, Any] = {"includeHidden": True}
+                if cursor:
+                    params["cursor"] = cursor
+                result = client.request("model/list", params, timeout=30)
+                listed.extend(result.get("data") or ())
+                cursor = result.get("nextCursor")
+                if not cursor:
+                    break
+        finally:
+            client.close()
+        wanted = request.model
+        for entry in listed:
+            matches = wanted in (entry.get("id"), entry.get("model"))
+            if matches if wanted else entry.get("isDefault"):
+                inputs = entry.get("inputModalities")
+                return tuple(inputs) if isinstance(inputs, list) else None
+        raise ValueError(f"model/list does not name {wanted or 'a default model'!r}")
+
     def _refuse_unsupported_session(
         self, request: SessionRequest, transport: str = DEFAULT_TRANSPORT
     ) -> None:

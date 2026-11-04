@@ -36,13 +36,15 @@ side by side, because "the same" is a claim worth a test rather than a comment.
   and breaks the stream the moment ``stopAtTokens`` is crossed, which happens
   *before* that round's tools run. Better granularity than either agent runtime
   and the reason ``interim_usage`` is ``supported`` here.
-* **The caller's ``cache_control`` breakpoints reach the vendor intact.** This
+* **The caller's ``cache_control`` breakpoints reach the vendor.** The bridge
+  turns prompt markers into breakpoints and applies the connection's settings
+  (:func:`~modelpass.prompt_cache.arrange_prompt_cache`), and this adapter adds
+  the one breakpoint that moves between rounds (:func:`turn_breakpoint`). This
   is the runtime the whole content-block vocabulary of ticket 1.5 exists for:
   ``system=`` and each message's ``content=`` are block arrays, and
   :attr:`~modelpass.adapters.base.RunRequest.system_blocks` /
   :attr:`~modelpass.adapters.base.RunRequest.conversation_blocks` are handed
-  through with their markers on them. Nothing is flattened and nothing is
-  invented.
+  through with their markers on them. Nothing is flattened.
 * **Structured output is native.** ``output_config={"format": {"type":
   "json_schema", "schema": ...}}``, read off the installed SDK on 2026-09-13 (see
   :data:`SDK_VERSION_READ`). The schema-as-forced-tool fallback was written for
@@ -97,6 +99,7 @@ from ..preflight import (
     cache_floor_tokens,
     resolve_credential,
 )
+from ..prompt_cache import LONGEST_CACHE_TTL, MAX_CACHE_BREAKPOINTS, cache_rules
 from ..retry import vendor_error_facts
 from ..runtimes import Runtime
 from ..sampling_rules import plan_sampling
@@ -106,6 +109,8 @@ from ..types import (
     CALLER_TOOL_SERVER,
     AgentEvent,
     AuthMode,
+    ContentBlock,
+    DocumentBlock,
     SessionInfo,
     TerminalEvent,
     TerminalStatus,
@@ -127,6 +132,7 @@ from .base import (
     RunStream,
     SessionHandle,
     SessionRequest,
+    document_rejection,
     native_run,
 )
 
@@ -161,6 +167,9 @@ DEFAULT_MAX_OUTPUT_TOKENS = 4096
 #: "is this credential live"; the list is a bonus, and an unbounded one would put
 #: a hundred strings on a receipt nobody asked for.
 _PROBE_LIMIT = 20
+
+#: Blocks the vendor will not take a ``cache_control`` on.
+_NOT_CACHEABLE = frozenset({"thinking", "redacted_thinking"})
 
 
 # --- usage -----------------------------------------------------------------------
@@ -212,12 +221,82 @@ def system_param(request: RunRequest) -> list[dict[str, Any]] | None:
     return [block.to_dict() for block in blocks]
 
 
+def block_param(block: ContentBlock) -> dict[str, Any]:
+    """One block on the wire. Three shapes, chosen by what the SDK types.
+
+    An image is an ``image`` block, which has no ``title``. ``text/plain`` is a
+    document with a ``PlainTextSourceParam``. Anything else goes as a base64
+    document, and a type the vendor does not read comes back as a refusal.
+    """
+    wire = block.to_dict()
+    if not isinstance(block, DocumentBlock):
+        return wire
+    if block.media_type.startswith("image/"):
+        wire["type"] = "image"
+        wire.pop("title", None)
+    elif block.media_type == "text/plain":
+        try:
+            text = block.data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("a text/plain document must be UTF-8") from None
+        wire["source"] = {"type": "text", "media_type": "text/plain", "data": text}
+    return wire
+
+
 def conversation_param(request: RunRequest) -> list[dict[str, Any]]:
     """The ``messages=`` array: one entry per non-system turn, blocks and all."""
     return [
-        {"role": role, "content": [block.to_dict() for block in blocks]}
+        {"role": role, "content": [block_param(block) for block in blocks]}
         for role, blocks in request.conversation_blocks
     ]
+
+
+def turn_breakpoint(
+    messages: list[dict[str, Any]],
+    system: list[dict[str, Any]] | None,
+    ttl: str | None,
+) -> list[dict[str, Any]]:
+    """``messages`` with a breakpoint at the end of the turns being re-sent.
+
+    It goes on the message before the current turn, so a one-shot call pays no
+    cache write for a question that will not come back. It is placed on a copy,
+    each round: the marker moves as a tool loop grows, and leaving the old ones
+    behind would pass the vendor's limit of four.
+
+    A thinking block cannot carry a marker, so the last block that can takes it.
+    A message with no such block, or a call already at the limit, gets none.
+    """
+    if len(messages) < 2:
+        return messages
+    blocks = messages[-2]["content"]
+    index = next(
+        (
+            i
+            for i in range(len(blocks) - 1, -1, -1)
+            if blocks[i].get("type") not in _NOT_CACHEABLE
+        ),
+        None,
+    )
+    if index is None or blocks[index].get("cache_control"):
+        return messages
+    placed = [
+        block["cache_control"]
+        for block in (
+            *(system or ()),
+            *(block for message in messages for block in message["content"]),
+        )
+        if block.get("cache_control")
+    ]
+    if len(placed) >= MAX_CACHE_BREAKPOINTS:
+        return messages
+    control: dict[str, Any] = {"type": "ephemeral"}
+    # A longer lifetime may not follow a shorter one, so a caller's shorter pin
+    # earlier in the prompt decides this one.
+    if ttl and (ttl != LONGEST_CACHE_TTL or all(c.get("ttl") == ttl for c in placed)):
+        control["ttl"] = ttl
+    marked = {**blocks[index], "cache_control": control}
+    content = [*blocks[:index], marked, *blocks[index + 1 :]]
+    return [*messages[:-2], {**messages[-2], "content": content}, messages[-1]]
 
 
 def tool_params(tools: Sequence[ToolDef]) -> list[dict[str, Any]]:
@@ -612,6 +691,20 @@ class AnthropicAPIAdapter(Adapter):
                 ids.append(model_id)
         return ModelListProbe(ok=True, models=tuple(ids[:_PROBE_LIMIT]))
 
+    def input_modalities(self, request: RunRequest) -> tuple[str, ...] | None:
+        """``models.retrieve`` carries ``capabilities`` per model (2026-11-04)."""
+        if not request.model:
+            raise ValueError("this connection names no model to ask about")
+        info = self._client(request.connection).models.retrieve(request.model)
+        capabilities = getattr(info, "capabilities", None)
+        if capabilities is None:
+            return None
+        inputs = ["text"]
+        for name, field_name in (("image", "image_input"), ("pdf", "pdf_input")):
+            if getattr(getattr(capabilities, field_name, None), "supported", False):
+                inputs.append(name)
+        return tuple(inputs)
+
     def support_for(
         self, capability: Capability, options: Mapping[str, Any]
     ) -> Support | None:
@@ -638,15 +731,21 @@ class AnthropicAPIAdapter(Adapter):
         thing the caller asked for. The floor still reports, because a breakpoint
         below the model's minimum cacheable prefix is still not cached.
 
-        ``ttl`` is ``None``: modelpass pins no lifetime on this runtime. A caller
-        may pin one itself -- ``cache_control={"type": "ephemeral", "ttl":
-        "1h"}`` is carried through with the block -- and ``ttl_detail`` says so
-        rather than modelpass claiming a pin it did not make.
+        ``ttl`` is the connection's ``promptCache`` lifetime, or ``None`` when it
+        names none. A caller may pin one itself -- ``cache_control={"type":
+        "ephemeral", "ttl": "1h"}`` is carried through with the block -- and
+        ``ttl_detail`` says so rather than modelpass claiming a pin it did not make.
         """
         floor, floor_source = cache_floor_tokens(request.model)
         pinned = _pinned_ttls(request)
+        standing = cache_rules(request.connection).ttl
         detail = "modelpass pins no TTL on anthropic-api; the endpoint's own default applies"
-        if pinned:
+        if standing:
+            detail = (
+                f"the connection's promptCache puts {standing!r} on every breakpoint "
+                "that does not pin its own"
+            )
+        elif pinned:
             detail = (
                 "modelpass pins no TTL on anthropic-api; the caller pinned "
                 f"{', '.join(repr(t) for t in pinned)} on its own cache_control block(s), "
@@ -658,7 +757,7 @@ class AnthropicAPIAdapter(Adapter):
             floor_tokens=floor,
             floor_source=floor_source,
             tools_declared=request.wants_tools,
-            ttl=None,
+            ttl=standing,
             ttl_detail=detail,
             explicit_breakpoints=request.cache_breakpoints,
         )
@@ -734,6 +833,9 @@ class AnthropicAPIAdapter(Adapter):
         system = system_param(request)
         if system is not None:
             params["system"] = system
+        rules = cache_rules(request.connection)
+        if rules.turns:
+            params["messages"] = turn_breakpoint(messages, system, rules.ttl)
         if request.tools:
             params["tools"] = tool_params(request.tools)
         config = output_config(request)
@@ -800,8 +902,11 @@ class AnthropicAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
-                status, reason = _vendor_failure(exc)
                 code, after = vendor_error_facts(exc)
+                rejected = document_rejection(self.runtime, request, code, exc)
+                if rejected is not None:
+                    raise rejected from exc
+                status, reason = _vendor_failure(exc)
                 yield _bare_terminal(
                     status, reason, status_code=code, retry_after=after
                 )
@@ -925,8 +1030,11 @@ class AnthropicAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
-                status, reason = _vendor_failure(exc)
                 code, after = vendor_error_facts(exc)
+                rejected = document_rejection(self.runtime, request, code, exc)
+                if rejected is not None:
+                    raise rejected from exc
+                status, reason = _vendor_failure(exc)
                 yield _bare_terminal(
                     status, reason, status_code=code, retry_after=after
                 )

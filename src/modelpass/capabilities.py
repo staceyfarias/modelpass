@@ -187,11 +187,14 @@ class Capability(StrEnum):
     # :func:`~modelpass.prompt_cache.effort_cache_continuity`, because two
     # models on one runtime disagree about it.
     REASONING_EFFORT_PER_TURN = "reasoning_effort_per_turn"
-    #: Can a call carry a whole document -- today, one PDF as a
+    #: Can a call carry a whole file -- a
     #: :class:`~modelpass.types.DocumentBlock` in a user message -- to the model
     #: (2026-11-03)? A request-shape question, like CACHE_BREAKPOINTS: it asks
     #: whether *modelpass* puts the file on this runtime's wire, not whether
-    #: the vendor has a document feature somewhere. Every runtime but
+    #: the vendor has a document feature somewhere, and it says nothing about
+    #: which file types a model reads: that is the vendor's to say, through
+    #: :meth:`Bridge.input_support <modelpass.bridge.Bridge.input_support>` or
+    #: :class:`~modelpass.errors.DocumentRejected`. Every runtime but
     #: ``anthropic-api``, ``openai-api`` and ``google-api`` renders content as
     #: text, so a document sent there could only be dropped -- and a call that
     #: silently lost the file it was about would answer a different question
@@ -1389,8 +1392,9 @@ _API_RUNTIME_NOTES: dict[tuple[Runtime, Capability], str] = {
         "Required[Literal['document']], cache_control: CacheControlEphemeralParam, "
         "citations, context, title}, and Base64PDFSourceParam as {data: base64, "
         "media_type: Required[Literal['application/pdf']], type: "
-        "Required[Literal['base64']]}. modelpass sends the base64 PDF source only "
-        "and refuses citations/context rather than dropping them. The live half is "
+        "Required[Literal['base64']]}. modelpass sends that source for every type "
+        "but image/* (an image block) and text/plain (PlainTextSourceParam), and "
+        "refuses citations/context rather than dropping them. The live half is "
         "tests/live/test_anthropic_api_live.py::test_one_pdf_document_question "
         "(marker `live`, owner-run)"
     ),
@@ -1590,9 +1594,10 @@ _API_RUNTIME_NOTES: dict[tuple[Runtime, Capability], str] = {
         "no test anyone can write today observes a *lifetime*: proving a 1h pin "
         "needs two live calls more than five minutes apart still reading cache, "
         "which tests/live/test_anthropic_api_live.py does not do and no fake can. "
-        "Moving it is that drive. Note also that modelpass itself pins nothing here "
-        "-- the lever is the caller's, which is a different shape from "
-        "anthropic-sdk, where modelpass sets the TTL for a session"
+        "Moving it is that drive. Since 2026-11-04 the connection's promptCache "
+        "lifetime goes on every breakpoint that does not pin its own "
+        "(tests/test_prompt_cache_placement.py), which is still a statement about "
+        "the request and not about what the vendor kept"
     ),
     (Runtime.ANTHROPIC_API, Capability.MIDCONVERSATION_SYSTEM): (
         "**unverified, and the reason is modelpass's rather than the vendor's** "

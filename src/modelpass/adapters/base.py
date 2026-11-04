@@ -93,7 +93,7 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from ..capabilities import Capability, Support, VerifyReport
 from ..connections import Connection
-from ..errors import AdapterNotImplemented, CapabilityNotSupported
+from ..errors import AdapterNotImplemented, CapabilityNotSupported, DocumentRejected
 from ..preflight import CacheEligibility, ModelListProbe, PreflightPlan, Receipt
 from ..runtimes import Runtime
 from ..tools import ToolDef
@@ -119,6 +119,7 @@ __all__ = [
     "SessionRequest",
     "cancel_run",
     "close_async_run",
+    "document_rejection",
     "native_run",
     "refuse_documents",
     "run_canceller",
@@ -150,6 +151,37 @@ def refuse_documents(runtime: Runtime, items: Iterable[Any]) -> None:
                 "this adapter renders message content as text and cannot carry a "
                 "document; it refused rather than send the prompt without it",
             )
+
+
+#: The statuses that mean "this request is not acceptable as sent". Everything
+#: else (auth, quota, a server fault) is not about what the call carried and
+#: keeps its ordinary terminal event.
+_REQUEST_REFUSED = frozenset({400, 413, 415, 422})
+
+
+def document_rejection(
+    runtime: Runtime, request: RunRequest, status_code: int | None, exc: BaseException
+) -> DocumentRejected | None:
+    """The typed refusal for a vendor error on a call that carried a file.
+
+    ``None`` when the call carried none or the status is not a refusal of the
+    request, so the caller's ordinary failure path runs.
+    """
+    documents = request.documents
+    if not documents or status_code not in _REQUEST_REFUSED:
+        return None
+    media_types = tuple(dict.fromkeys(document.media_type for document in documents))
+    return DocumentRejected(
+        str(runtime),
+        str(Capability.DOCUMENT_INPUT),
+        detail=(
+            f"the vendor refused a call carrying {', '.join(media_types)} "
+            f"(HTTP {status_code}). The vendor's message says whether the file was "
+            f"the cause: {str(exc)[:600]}"
+        ),
+        media_types=media_types,
+        status_code=status_code,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +226,11 @@ class RunRequest:
     #: fields directly, so the values it sends and the values the receipt reports
     #: cannot drift apart.
     sampling: Sampling | None = None
+    #: What arranging this call's cache markers did, for the receipt (2026-11-04).
+    cache_notes: tuple[str, ...] = ()
+    #: The messages as the caller wrote them, markers and all. A failover target
+    #: arranges these for itself: ``messages`` are arranged for this connection.
+    written_messages: tuple[Message, ...] = ()
 
     @property
     def runtime(self) -> Runtime:
@@ -414,6 +451,8 @@ class SessionRequest:
     resume_id: str | None = None
     schema: Mapping[str, Any] | None = None
     schema_name: str = ""
+    #: What removing this session's cache markers did, for the receipt (2026-11-04).
+    cache_notes: tuple[str, ...] = ()
 
     @property
     def runtime(self) -> Runtime:
@@ -712,6 +751,16 @@ class Adapter(abc.ABC):
         Call it through :meth:`cached_probe`, never directly: this is a network
         round trip and :meth:`~modelpass.Bridge.preflight` runs on every single
         call.
+        """
+        del request
+        return None
+
+    def input_modalities(self, request: RunRequest) -> tuple[str, ...] | None:
+        """What the vendor's model metadata says this model takes (2026-11-04).
+
+        Token-free, like :meth:`probe`. ``None`` means this vendor's metadata has
+        no such field, which is the answer on most runtimes: the type is then
+        settled at send time. An override raises when it could not get an answer.
         """
         del request
         return None

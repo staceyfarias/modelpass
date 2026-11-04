@@ -533,6 +533,36 @@ class StructuredOutputRejected(CapabilityNotSupported):
     """
 
 
+class DocumentRejected(CapabilityNotSupported):
+    """The vendor refused a call that carried a file (2026-11-04).
+
+    The same shape of refusal as :class:`StructuredOutputRejected`, for the same
+    reason: which file types a model reads is not in any table modelpass keeps,
+    so the answer can only come from the vendor. ``media_types`` lists what the
+    call carried and ``status_code`` is the vendor's.
+
+    **It does not claim the file was the cause.** An HTTP 400 on a call carrying
+    a file can also be about something else in the request, and telling the two
+    apart would mean matching vendor prose. ``detail`` quotes the vendor's own
+    message, which is what says. It is also no proof of the opposite: a vendor
+    that accepts a file may still read only part of it.
+    """
+
+    def __init__(
+        self,
+        runtime: str,
+        capability: str,
+        support: str = "rejected",
+        detail: str = "",
+        *,
+        media_types: tuple[str, ...] = (),
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(runtime, capability, support, detail)
+        self.media_types = media_types
+        self.status_code = status_code
+
+
 class RuntimeNotAvailable(SubpassError):
     """The vendor package backing a runtime is not installed.
 

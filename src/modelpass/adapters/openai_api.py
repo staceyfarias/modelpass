@@ -103,6 +103,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import mimetypes
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, ClassVar
@@ -162,6 +163,7 @@ from .base import (
     RunStream,
     SessionHandle,
     SessionRequest,
+    document_rejection,
     native_run,
     refuse_documents,
 )
@@ -315,21 +317,22 @@ def instructions_param(request: RunRequest) -> str | None:
 
 
 def _input_file(block: DocumentBlock) -> dict[str, Any]:
-    """A document as ``ResponseInputFileParam`` (2026-11-04).
+    """A file as ``ResponseInputFileParam``, or an image as ``ResponseInputImageParam``.
 
-    ``file_data`` is a base64 ``data:`` URL and ``filename`` rides beside it, the
-    shape ``langchain-core`` 1.3.2 writes for the Responses API. A block with no
-    title is sent as ``document.pdf``, because the vendor may require a name.
+    ``file_data`` is a base64 ``data:`` URL with ``filename`` beside it, because
+    the vendor may require a name: an untitled block is sent as ``document``,
+    and the name gets the type's usual suffix where Python's table has one. An
+    image has its own part, whose ``detail`` the SDK types as required.
     """
-    name = block.title or "document"
-    if not name.lower().endswith(".pdf"):
-        name = f"{name}.pdf"
     encoded = base64.b64encode(block.data).decode("ascii")
-    return {
-        "type": "input_file",
-        "filename": name,
-        "file_data": f"data:{block.media_type};base64,{encoded}",
-    }
+    url = f"data:{block.media_type};base64,{encoded}"
+    if block.media_type.startswith("image/"):
+        return {"type": "input_image", "detail": "auto", "image_url": url}
+    name = block.title or "document"
+    suffix = mimetypes.MimeTypes().guess_extension(block.media_type)
+    if suffix and not name.lower().endswith(suffix):
+        name = f"{name}{suffix}"
+    return {"type": "input_file", "filename": name, "file_data": url}
 
 
 def turn_content(blocks: Sequence[ContentBlock]) -> str | list[dict[str, Any]]:
@@ -1160,8 +1163,11 @@ class OpenAIAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
-                status, reason = _vendor_failure(exc)
                 code, after = vendor_error_facts(exc)
+                rejected = document_rejection(self.runtime, request, code, exc)
+                if rejected is not None:
+                    raise rejected from exc
+                status, reason = _vendor_failure(exc)
                 yield _bare_terminal(
                     status, reason, self.runtime, status_code=code, retry_after=after
                 )
@@ -1281,8 +1287,11 @@ class OpenAIAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
-                status, reason = _vendor_failure(exc)
                 code, after = vendor_error_facts(exc)
+                rejected = document_rejection(self.runtime, request, code, exc)
+                if rejected is not None:
+                    raise rejected from exc
+                status, reason = _vendor_failure(exc)
                 yield _bare_terminal(
                     status, reason, self.runtime, status_code=code, retry_after=after
                 )

@@ -114,7 +114,7 @@ What each argument promises:
 
 | Argument | Contract |
 | --- | --- |
-| `message` | The new user turn. Required. A string, or a sequence of content blocks: `TextBlock`, and on `anthropic-api`, `openai-api` and `google-api` `DocumentBlock` (a PDF; §2.0a, §2.0b, §2.0d). A document on any other runtime is refused with `CapabilityNotSupported` before preflight, never flattened or dropped. |
+| `message` | The new user turn. Required. A string, or a sequence of content blocks: `TextBlock`, and on `anthropic-api`, `openai-api` and `google-api` `DocumentBlock` (a file; §2.0a, §2.0b, §2.0d, §2.2). A document on any other runtime is refused with `CapabilityNotSupported` before preflight, never flattened or dropped. |
 | `history` | `Message` objects or `{"role": ..., "content": ...}` dicts, in the order given, ahead of `message`. Omitting it is the single-shot case. A document may appear in a user turn only; in an assistant turn it is a `ValueError`. |
 | `system_prompt` | The front of the cached prefix. **Keep it here rather than concatenating it into `message`** — that is the difference between every call after the first reading from cache and every call paying full price. Absent means the runtime's *minimal* prompt, which is a decision (D22): modelpass writes no prompt of its own. |
 | `model` | The model to ask for. The receipt names what was resolved. |
@@ -840,7 +840,8 @@ Three states, and they are all distinguishable:
 | the file says | `prompt_cache` | `plan.ttl` | means |
 | --- | --- | --- | --- |
 | nothing | `None` | — | **nothing stated.** Nothing about the connection's behaviour changes. This is not "caching off" |
-| `promptCache = "default"` | `"default"` | `None` | caching asked for, **lifetime unspecified** — the vendor's own applies |
+| `promptCache = "default"` or `"auto"` | as written | `None` | caching asked for, **lifetime unspecified** — the vendor's own applies |
+| `promptCache = "none"` | `"none"` | `None` | caching off. Refused on a runtime that caches on its own (§1.9a) |
 | `promptCache = "1h"` | `"1h"` | `"1h"` | caching asked for at a named lifetime |
 
 A consumer must read `is None`, not falsiness, for the same reason
@@ -861,19 +862,17 @@ that the vendor has no lever.
 
 #### What reaches a wire
 
-One thing: on `openai-api`, a named lifetime is sent as
+Two things. On `openai-api`, a named lifetime is sent as
 `prompt_cache_retention`, which is a typed field of that SDK's Responses
 request. `"default"` sends nothing, because the wire has no way to say "cache at
 whatever you normally do" other than by not saying anything.
 
+On `anthropic-api`, a named lifetime goes on every breakpoint that does not pin
+its own, and breakpoints are placed as §1.9a describes (2026-11-04). Before that
+date the lifetime was accepted and never sent.
+
 Everywhere else `promptCache` is a **declaration**, in the same way `retry =
-"never"` is a stance rather than a retry loop. In particular, on `anthropic-api`
-modelpass does not write the connection's lifetime onto the caller's
-breakpoints: `TextBlock`'s own contract is that modelpass never invents a
-breakpoint and never moves one, and filling in a `ttl` the caller left off would
-be editing their content. Place it on the `CacheControl` where it belongs; what the connection
-buys you is that an impossible lifetime is refused before a run rather than
-after a 400.
+"never"` is a stance rather than a retry loop.
 
 No `prompt_cache_key` is sent either. Grouping requests so they land on the same
 cache is a caching *strategy* — it depends on what a caller considers one
@@ -882,6 +881,7 @@ that for everybody.
 
 #### Where it is reported
 
+Notes from placing and removing breakpoints (§1.9a) go in `Receipt.notes`.
 `Receipt.prompt_cache_requested` and `Receipt.prompt_cache_disposition`, both
 `None` on every connection that stated nothing, plus one sentence in
 `Receipt.notes`. `modelpass list --verbose` prints the request and its
@@ -920,6 +920,61 @@ machine is never on its own enough to start a spend:
 | `tests/live/test_openai_compatible_live.py` | `MODELPASS_LIVE_COMPATIBLE_BASE_URL` (naming the endpoint is the consent) and `MODELPASS_LIVE_COMPATIBLE_MODEL` | one chat, one tool round trip, one structured-output call against your own endpoint | **nothing in this table**, by design — that runtime's cells are per connection |
 
 Only the first three spend money; the fourth spends electricity.
+
+
+### 1.9a Placing breakpoints: `promptCachePlacement`, `promptCacheMarkers` and the prompt marker (2026-11-04)
+
+```toml
+promptCache          = "1h"                 # "none" | "auto" | "default" | a lifetime
+promptCachePlacement = ["system", "turns"]  # optional
+promptCacheMarkers   = "use"                # optional; "use" | "ignore"
+```
+
+Read back as `Connection.prompt_cache_placement` (`tuple[str, ...] | None`) and
+`Connection.prompt_cache_markers` (`str | None`).
+
+**`promptCachePlacement`** names what modelpass marks by itself. `None` means both
+when `promptCache` asks for caching and neither otherwise, so a connection that
+states nothing behaves as it did. `[]` means only the caller's own. Stated without
+`promptCache`, it caches at the vendor's lifetime.
+
+* `"system"` puts a breakpoint on the last system text, unless a system block
+  already carries one.
+* `"turns"` puts a breakpoint on the last cacheable block of the message before
+  the current turn, each round of a tool loop. It is placed by the adapter on a
+  copy of the request, so it moves and never accumulates. A call with no earlier
+  message gets none.
+
+**`promptCacheMarkers = "ignore"`** removes the caller's markers and
+`cache_control` before placement, on the call as well as in the text.
+
+**`PROMPT_CACHE_MARKER`** (`"<<<PROMPT_CACHE_MARKER>>>"`) in any text ends a
+cacheable prefix. `Bridge` resolves markers in `_build_request` through
+`prompt_cache.arrange_prompt_cache`, so no adapter ever sees one. Where
+`cache_breakpoints` is `supported` the text is split into blocks, every byte but
+the marker kept, with a breakpoint on the block before each marker. A stretch of
+only whitespace gets no block, and a marker with no text before it marks nothing.
+Everywhere else the marker is removed in place, so the text is what it would have
+been without it, and `Receipt.notes` gives the count. Session prompts and turns
+take no breakpoints, so their markers are always removed.
+
+`RunRequest.written_messages` keeps the messages as written, and a failover target
+arranges those for itself rather than inheriting another runtime's result.
+
+| Rule | What modelpass does |
+| --- | --- |
+| At most four breakpoints | The first ones are kept, three when `"turns"` is on, and `Receipt.notes` counts the rest. A call with no settings and no marker is left as it was sent |
+| A longer lifetime may not follow a shorter one | A caller's pin stays on its block and caps every unpinned breakpoint after it |
+| `"none"` beside a placement or `"use"` | `InvalidConnection`, because the two contradict |
+
+`promptCachePlacement` and `promptCacheMarkers` are not checked against the runtime.
+A connection can move to another vendor with them set, and a note says they had no
+effect. `promptCache = "none"` is checked: it is refused where
+`cache_automatic` is `supported`, because caching there cannot be stopped.
+
+`receipt.cache_breakpoints_requested` counts what the arranged call carries, which
+includes a `"system"` breakpoint and excludes the `"turns"` one. `Receipt.cache.ttl`
+is the connection's lifetime.
 
 ### 2.0 The four API-key runtimes (2026-09-13)
 
@@ -1516,6 +1571,32 @@ modelpass's own adapters, which render content as text on those rows, so the
 cell describes this library and not the vendor. A call that carries a document
 to such a runtime is refused before preflight.
 
+**`document_input` says whether a runtime can carry a file, never which types.**
+Which types a model reads is the vendor's to say, and modelpass keeps no list of
+them (2026-11-04). `DocumentBlock.media_type` takes any well-formed `type/subtype`.
+Each adapter picks a wire shape by family: on `anthropic-api` an `image` block for
+`image/*`, a `PlainTextSourceParam` document for `text/plain` (which must be
+UTF-8), and a base64 document otherwise; on `openai-api` `input_image` for
+`image/*` and `input_file` otherwise; on `google-api` `inline_data` for everything.
+
+Two things answer the type question:
+
+* **`Bridge.input_support(connection, *, model=None)`** returns an `InputSupport`
+  and spends no tokens. `anthropic-api` reports from `capabilities` on
+  `models.retrieve`, and `openai-sdk` from `inputModalities` on `model/list`.
+  `openai-api` and `google-api` publish nothing queryable (`openai` 2.32.0 `Model`
+  and `google-genai` 1.73.1 `Model` have no such field), so `queried` is false. A
+  failed query is reported in `detail`, not raised. It is advisory and never gates
+  a call.
+* **`DocumentRejected`**, a subclass of `CapabilityNotSupported`, is raised when a
+  vendor answers HTTP 400, 413, 415 or 422 to a call carrying a file. It has
+  `media_types` and `status_code` and quotes the vendor's message. It does not
+  assert the file was the cause: a 400 can be about another part of the request,
+  and separating them would mean matching vendor prose. Other statuses, and calls
+  with no file, keep their ordinary terminal event. Not retryable.
+
+A vendor accepting a file is not proof the model read all of it.
+
 On `openai-sdk` the refusal also has nothing to build on yet. Codex's input types
 have no file item, so a PDF has no route through a ChatGPT subscription; the
 evidence is in §2.2a and the request is
@@ -1607,6 +1688,7 @@ travels with the install.
 | 2026-09-21 | `cache_automatic` | `openai` 2.32.0 typed surface; two recorded captures already in the tree | The one new cell, on three rows; five rows left `unverified` (§2.4) |
 | 2026-11-03 | `document_input` | `anthropic` 0.97.0 typed surface (`DocumentBlockParam`, `Base64PDFSourceParam`), installed; `tests/test_document_blocks.py::test_anthropic_api_sends_the_document_block_with_its_cache_control_in_order` against a fake client | `supported` on `anthropic-api`; a checked `unsupported` on the other seven rows, which render content as text and refuse a document before preflight. Live half: `tests/live/test_anthropic_api_live.py::test_one_pdf_document_question`, owner-run |
 | 2026-11-04 | `document_input` | `openai` 2.32.0 (`ResponseInputFileParam`) and `google-genai` 1.73.1 (`Part`, `Blob`) typed surfaces, installed; `tests/test_document_blocks_api.py`, with no client involved | `supported` on `openai-api` and `google-api`, offline evidence only. No live test exists for either yet |
+| 2026-11-04 | `input_support` | `anthropic` 0.97.0 (`ModelInfo.capabilities`, `ModelCapabilities`); `openai-codex` 0.154.0 generated `Model.input_modalities`; `model/list` driven live on codex 0.154.0, token-free, every listed model answering `['text', 'image']`; `openai` 2.32.0 and `google-genai` 1.73.1 `Model`, which have no such field; `tests/test_document_blocks_api.py` | Query on two rows, send-time refusal on the other two. No file has been sent to any vendor yet |
 | 2026-11-04 | `document_input` on `openai-sdk` | `UserInput` and `ContentItem` in `codex-rs/protocol` on `openai/codex` main (latest release `rust-v0.166.0`); the `codex` 0.154.0 binary, which contains no `input_file` string; a third-party report on `openai/codex#1797` that `thread/inject_items` rejects `input_file` locally | Stays a checked `unsupported`. The route is closed in the Codex client. Revisit when `#1797` lands |
 
 #### The auth-mode findings, which are the reason this library exists

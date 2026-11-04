@@ -7,6 +7,9 @@ work landed.
 
 ### Fixed
 
+- **`promptCache = "5m"` or `"1h"` now reaches `anthropic-api`** (2026-11-04). The
+  lifetime was accepted and reported, and never sent.
+
 - **The LangChain adapter no longer drops a standard `file` part** (2026-11-04).
   A `{"type": "file", ...}` part fell through to the text fallback and vanished
   from the prompt without a word. It now raises the same `ValueError` as a
@@ -14,6 +17,32 @@ work landed.
   a `DocumentBlock`.
 
 ### Added
+
+- **Prompt cache placement, markers and `"none"`** (2026-11-04).
+  `promptCachePlacement` (`"system"`, `"turns"`) places breakpoints on
+  `anthropic-api` without the caller writing any, and `promptCacheMarkers =
+  "ignore"` removes the caller's own. `PROMPT_CACHE_MARKER` in a prompt ends a
+  cacheable prefix on `anthropic-api` and is removed on every other runtime.
+  `promptCache` also takes `"auto"`, the same as `"default"`, and `"none"`, which
+  is refused where caching cannot be stopped. **Changed behaviour:** a connection
+  with `promptCache` set on `anthropic-api` now gets both placements unless it
+  sets `promptCachePlacement`. Before, it placed nothing. Not yet run against the
+  vendor.
+
+- **Which file types a model reads is now the vendor's to say** (2026-11-04).
+  `DocumentBlock.media_type` takes any well-formed `type/subtype` and
+  `DOCUMENT_MEDIA_TYPES` is gone. `from_path` reads the suffix from Python's own
+  table, without the Windows registry, takes `media_type=`, and raises on a suffix
+  it does not know. New `DocumentRejected(CapabilityNotSupported)`, with
+  `media_types` and `status_code`, is raised when a vendor answers 400, 413, 415 or
+  422 to a call carrying a file; it quotes the vendor and does not assert the file
+  was the cause. New `Bridge.input_support(connection, *, model=None)` returns an
+  `InputSupport`, spends no tokens and never gates a call: `anthropic-api` and
+  `openai-sdk` report per model, `openai-api` and `google-api` have nothing to
+  query. `Adapter.input_modalities` is the seam. Images and `text/plain` get their
+  own wire shape on `anthropic-api`, and images on `openai-api`. A
+  `{"type": "image"}` mapping is still refused with its existing message; an image
+  travels as a `DocumentBlock`. No file has been sent to a vendor live yet.
 
 - **PDF documents on `openai-api` and `google-api`** (2026-11-04).
   `document_input` is now `supported` on both, with dated notes naming the SDK

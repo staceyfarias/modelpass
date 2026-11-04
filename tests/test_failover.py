@@ -510,3 +510,43 @@ def test_capability_gating_still_applies_to_the_failover_target(store, primary):
     )
     with pytest.raises(CapabilityNotSupported):
         run(bridge)
+
+
+def test_a_failover_target_arranges_the_prompt_as_it_was_written(store):
+    """Markers removed for the first runtime still count on the second."""
+    marker = "<<<PROMPT_CACHE_MARKER>>>"
+    store.add(
+        Connection(
+            name="claude-sub",
+            runtime=Runtime.ANTHROPIC_SDK,
+            auth_mode=AuthMode.SUBSCRIPTION,
+            guards=failing_over_to("claude-api"),
+        )
+    )
+    store.add(
+        Connection(
+            name="claude-api",
+            runtime=Runtime.ANTHROPIC_API,
+            auth_mode=AuthMode.API_KEY,
+            credential_ref=CredentialRef.parse("env:ANTHROPIC_API_KEY"),
+        )
+    )
+    fake = FakeAdapter(script_two_runs([EXHAUSTED], []))
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={Runtime.ANTHROPIC_SDK: fake, Runtime.ANTHROPIC_API: fake},
+        env=dict(ENV),
+    )
+    list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            system_prompt=f"stable{marker}volatile",
+            allow_failover=True,
+        )
+    )
+    first, second = fake.requests
+    assert first.cache_breakpoints == 0
+    assert first.messages[0].text == "stablevolatile"
+    assert second.cache_breakpoints == 1

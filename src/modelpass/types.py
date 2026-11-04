@@ -17,7 +17,9 @@ import base64
 import binascii
 import dataclasses
 import hashlib
+import mimetypes
 import os
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -35,7 +37,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CACHE_TTLS",
     "CALLER_TOOL_SERVER",
-    "DOCUMENT_MEDIA_TYPES",
     "EVENT_TYPES",
     "REASONING_EFFORTS",
     "SAMPLING_FIELDS",
@@ -49,6 +50,7 @@ __all__ = [
     "FailoverEvent",
     "GuardStopEvent",
     "GuardWarningEvent",
+    "InputSupport",
     "Message",
     "ReceiptEvent",
     "Role",
@@ -377,8 +379,10 @@ class TextBlock:
     batch scraping tool lost the same thing.
 
     ``cache_control`` on a block means "everything up to and including this
-    block is one cacheable prefix". modelpass never invents one and never moves
-    one; whether a runtime *honours* it is
+    block is one cacheable prefix". modelpass adds or removes one only when the
+    connection or a prompt marker says to
+    (:func:`~modelpass.prompt_cache.arrange_prompt_cache`), and never moves one;
+    whether a runtime *honours* it is
     :attr:`~modelpass.capabilities.Capability.CACHE_BREAKPOINTS`, and a runtime
     that does not says so on the receipt rather than dropping it silently.
     """
@@ -431,15 +435,16 @@ class TextBlock:
         return data
 
 
-#: The document media types modelpass carries (2026-11-03). One today, and
-#: written down as a tuple for the reason :data:`CACHE_TTLS` is: the refusal
-#: names what *is* accepted, and the second member is a one-line change here
-#: rather than a new sentence in three places.
-DOCUMENT_MEDIA_TYPES: tuple[str, ...] = ("application/pdf",)
 
-#: The file suffixes :meth:`DocumentBlock.from_path` reads, keyed to the media
-#: type each one becomes.
-_DOCUMENT_SUFFIXES: dict[str, str] = {".pdf": "application/pdf"}
+
+#: What a media type has to look like. Syntax only, on purpose: which types a
+#: vendor reads is the vendor's to say, so modelpass keeps no list to fall behind.
+_MEDIA_TYPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$")
+
+#: Suffix lookups use a private table rather than the module-level one, which on
+#: Windows reads the registry: there ``.csv`` can come back as
+#: ``application/vnd.ms-excel``, and the answer would differ by machine.
+_MIME_TABLE = mimetypes.MimeTypes()
 
 #: The keys a document block may carry on the wire. Anything else -- the
 #: Messages API's ``citations`` and ``context`` among them -- is refused rather
@@ -448,20 +453,55 @@ _DOCUMENT_SUFFIXES: dict[str, str] = {".pdf": "application/pdf"}
 _DOCUMENT_KEYS = frozenset({"type", "source", "title", "cache_control"})
 
 
+@dataclass(frozen=True, slots=True)
+class InputSupport:
+    """What is known about the inputs one connection takes (2026-11-04).
+
+    ``carries_files`` is modelpass's own fact: whether this runtime's adapter has
+    a channel for a :class:`DocumentBlock`. ``inputs`` is the vendor's, verbatim
+    from its model metadata, and it means something only when ``queried`` is
+    true. ``queried`` false means **nobody could say**, not that nothing is
+    accepted: on such a runtime the vendor answers at send time, through
+    :class:`~modelpass.errors.DocumentRejected`. ``detail`` says why.
+    """
+
+    connection: str
+    runtime: Runtime
+    model: str | None
+    carries_files: bool
+    queried: bool
+    inputs: tuple[str, ...] = ()
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "connection": self.connection,
+            "runtime": self.runtime.value,
+            "model": self.model,
+            "carries_files": self.carries_files,
+            "queried": self.queried,
+            "inputs": list(self.inputs),
+            "detail": self.detail,
+        }
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class DocumentBlock:
-    """A whole document -- today, one PDF -- sent as message content (2026-11-03).
+    """A whole file sent as message content (2026-11-03).
 
     **The second member of the block vocabulary, and a narrow one on purpose.**
     A document goes in a *user* message and nowhere else: a system prompt is
     instructions and an assistant turn is something the model said, and neither
     of those is a place a vendor reads a file. :class:`Message` refuses both at
-    construction. Only ``application/pdf`` is accepted, because that is the one
-    type the runtimes that take documents (``anthropic-api``, ``openai-api``,
-    ``google-api``) were read to accept -- see
-    :attr:`~modelpass.capabilities.Capability.DOCUMENT_INPUT`. Every other
-    runtime refuses a call that carries one before anything is sent; a document
-    is never flattened to text and never dropped.
+    construction. Any well-formed ``media_type`` is accepted, because which types
+    a vendor reads is the vendor's to say (2026-11-04): modelpass decides whether
+    a runtime can carry a file at all, which is
+    :attr:`~modelpass.capabilities.Capability.DOCUMENT_INPUT`, and a type the
+    vendor refuses comes back as :class:`~modelpass.errors.DocumentRejected`.
+    :meth:`Bridge.input_support <modelpass.bridge.Bridge.input_support>` asks
+    first, on the runtimes that can answer. A runtime with no channel refuses a
+    call that carries a file before anything is sent; a document is never
+    flattened to text and never dropped.
 
     ``data`` is the file's raw bytes, not base64: the encoding is a wire detail
     and :meth:`to_dict` does it. ``cache_control`` means what it means on a
@@ -495,10 +535,9 @@ class DocumentBlock:
             )
         if not self.data:
             raise ValueError("DocumentBlock data must not be empty")
-        if self.media_type not in DOCUMENT_MEDIA_TYPES:
-            valid = ", ".join(repr(t) for t in DOCUMENT_MEDIA_TYPES)
+        if not isinstance(self.media_type, str) or not _MEDIA_TYPE.match(self.media_type):
             raise ValueError(
-                f"DocumentBlock media_type must be one of: {valid}, got "
+                "DocumentBlock media_type must look like 'type/subtype', got "
                 f"{self.media_type!r}"
             )
         if self.title is not None and not isinstance(self.title, str):
@@ -516,23 +555,25 @@ class DocumentBlock:
         path: str | os.PathLike[str],
         *,
         title: str | None = None,
+        media_type: str | None = None,
         cache_control: CacheControl | Mapping[str, Any] | None = None,
     ) -> DocumentBlock:
-        """Read a document file. ``title`` defaults to the file name's stem.
+        """Read a file. ``title`` defaults to the file name's stem.
 
-        The suffix decides the media type, and only ``.pdf`` is read: a file
-        modelpass would have to guess the type of is a file it refuses.
+        ``media_type`` defaults to what the suffix says in Python's own table. A
+        suffix that table does not know raises, and passing ``media_type=`` is
+        the fix: sending a guessed type would make a vendor's refusal mean
+        nothing.
         """
         source = Path(path)
-        media_type = _DOCUMENT_SUFFIXES.get(source.suffix.lower())
-        if media_type is None:
-            valid = ", ".join(repr(s) for s in _DOCUMENT_SUFFIXES)
+        resolved = media_type or _MIME_TABLE.guess_type(source.name)[0]
+        if resolved is None:
             raise ValueError(
-                f"DocumentBlock.from_path reads {valid} files only, got {source.name!r}"
+                f"cannot tell the media type of {source.name!r}: pass media_type="
             )
         return cls(
             data=source.read_bytes(),
-            media_type=media_type,
+            media_type=resolved,
             title=title if title is not None else source.stem,
             cache_control=cache_control,  # type: ignore[arg-type]
         )

@@ -230,6 +230,7 @@ _ERROR_NAME_ROWS: dict[str, tuple[Retryable, str]] = {
     "UnsafeLaunch": (Retryable.NO, "a forbidden launch argument"),
     "CapabilityNotSupported": (Retryable.NO, "the runtime cannot do that"),
     "StructuredOutputRejected": (Retryable.NO, "the endpoint refuses this schema"),
+    "DocumentRejected": (Retryable.NO, "the vendor refused a call carrying this file"),
     "InvalidSchema": (Retryable.NO, "the schema is malformed"),
     "InvalidTool": (Retryable.NO, "the tool definition is malformed"),
     "InvalidGuards": (Retryable.NO, "a guard argument is unusable"),

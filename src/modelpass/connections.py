@@ -27,7 +27,7 @@ from .errors import (
     InvalidGuards,
     RuntimeGated,
 )
-from .prompt_cache import plan_prompt_cache
+from .prompt_cache import check_cache_placement, plan_prompt_cache
 from .reasoning import plan_reasoning
 from .runtimes import API_RUNTIMES, EXPERIMENTAL_RUNTIMES, VENDOR_OF, Runtime, parse_runtime
 from .types import AuthMode, parse_auth_mode
@@ -776,6 +776,15 @@ class Connection:
     #: An additive key under the store's 0.1 compatibility policy. Last in the
     #: field order, so no older field's positional shape moves.
     reasoning: str | None = None
+    #: Where modelpass places its own breakpoints (config key
+    #: ``promptCachePlacement``, 2026-11-04): a list drawn from ``"system"`` and
+    #: ``"turns"``. ``None`` means both when ``promptCache`` asks for caching and
+    #: neither otherwise; an empty list means only the caller's own.
+    prompt_cache_placement: tuple[str, ...] | None = None
+    #: Whether the caller's markers and ``cache_control`` count (config key
+    #: ``promptCacheMarkers``, 2026-11-04): ``"use"``, the default, or
+    #: ``"ignore"``, which removes them so only the placement decides.
+    prompt_cache_markers: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -885,6 +894,16 @@ class Connection:
             plan_prompt_cache(
                 self.prompt_cache, self.runtime, name=str(self.name)
             )
+        object.__setattr__(
+            self,
+            "prompt_cache_placement",
+            check_cache_placement(
+                self.prompt_cache_placement,
+                self.prompt_cache_markers,
+                self.prompt_cache,
+                name=str(self.name),
+            ),
+        )
 
         if self.reasoning is not None:
             # Resolved as well as validated, exactly as promptCache is: the

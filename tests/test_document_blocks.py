@@ -136,8 +136,8 @@ def test_construction_validates_data_media_type_and_title():
         DocumentBlock(data=b"")
     with pytest.raises(TypeError, match="must be bytes"):
         DocumentBlock(data=PDF_B64)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="'application/pdf'"):
-        DocumentBlock(data=PDF, media_type="text/plain")
+    with pytest.raises(ValueError, match="type/subtype"):
+        DocumentBlock(data=PDF, media_type="pdf")
     with pytest.raises(TypeError, match="title"):
         DocumentBlock(data=PDF, title=3)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="ttl"):
@@ -181,11 +181,11 @@ def test_coerce_refuses_what_it_would_otherwise_have_to_drop():
                 "source": {"type": "base64", "media_type": "application/pdf", "data": "%%%"},
             }
         )
-    with pytest.raises(ValueError, match="'application/pdf'"):
+    with pytest.raises(ValueError, match="type/subtype"):
         DocumentBlock.coerce(
             {
                 "type": "document",
-                "source": {"type": "base64", "media_type": "text/plain", "data": PDF_B64},
+                "source": {"type": "base64", "media_type": "plain", "data": PDF_B64},
             }
         )
     with pytest.raises(ValueError, match="type 'document'"):
@@ -202,9 +202,9 @@ def test_from_path_reads_a_pdf_and_titles_it_by_its_stem(tmp_path):
     assert block.title == "Employee Handbook"
     assert block.cache_control == CacheControl()
     assert DocumentBlock.from_path(str(path), title="HB").title == "HB"
-    other = tmp_path / "notes.txt"
+    other = tmp_path / "notes.zzz"
     other.write_text("x", encoding="utf-8")
-    with pytest.raises(ValueError, match=r"'\.pdf'"):
+    with pytest.raises(ValueError, match="pass media_type="):
         DocumentBlock.from_path(other)
 
 

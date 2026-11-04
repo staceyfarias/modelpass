@@ -77,6 +77,7 @@ from collections.abc import (
 )
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -117,9 +118,12 @@ from .errors import (
 )
 from .preflight import PreflightPlan, Receipt, plan_launch
 from .prompt_cache import (
+    PROMPT_CACHE_MARKER,
     EffortCacheContinuity,
+    arrange_prompt_cache,
     effort_cache_continuity,
     plan_prompt_cache,
+    strip_prompt_cache_markers,
 )
 from .reasoning import stated_reasoning
 from .runlog import RunLog, RunRecord, run_log_for
@@ -135,6 +139,7 @@ from .types import (
     AuthMode,
     ContentBlock,
     FailoverEvent,
+    InputSupport,
     Message,
     ReceiptEvent,
     Sampling,
@@ -789,6 +794,44 @@ class Bridge:
             return self.registry
         return self.registry.refined(resolved.runtime, observed)
 
+    def input_support(
+        self, connection: Connection | str, *, model: str | None = None
+    ) -> InputSupport:
+        """Ask what this connection's model takes, without spending (2026-11-04).
+
+        Advisory, and never a gate on a call. ``anthropic-api`` and ``openai-sdk``
+        report per model. ``openai-api`` and ``google-api`` publish nothing
+        queryable, so ``queried`` is false there and the vendor answers at send
+        time with :class:`~modelpass.errors.DocumentRejected`. A failed query is
+        reported in ``detail`` rather than raised: not knowing is an answer here.
+        """
+        resolved = self._resolve(connection)
+        adapter = self.adapter_for(resolved.runtime)
+        carries_files = (
+            self.registry.support(resolved.runtime, Capability.DOCUMENT_INPUT)
+            is Support.SUPPORTED
+        )
+        plan = plan_launch(resolved, self.env)
+        chosen = model or plan.model
+        request = RunRequest(connection=resolved, messages=(), plan=plan, model=chosen)
+        answer = partial(
+            InputSupport,
+            connection=resolved.name,
+            runtime=resolved.runtime,
+            model=chosen,
+            carries_files=carries_files,
+        )
+        try:
+            inputs = adapter.input_modalities(request)
+        except Exception as exc:
+            return answer(queried=False, detail=f"the query failed: {exc}")
+        if inputs is None:
+            return answer(
+                queried=False,
+                detail="this vendor publishes no input types; it answers at send time",
+            )
+        return answer(queried=True, inputs=inputs)
+
     # --- preflight -------------------------------------------------------------
 
     def plan(self, connection: Connection | str) -> PreflightPlan:
@@ -1198,6 +1241,8 @@ class Bridge:
         Cannot refuse. The refusal happened when the connection was built; by
         the time a request exists, the plan is known to be meetable.
         """
+        if request.cache_notes:
+            receipt = replace(receipt, notes=(*receipt.notes, *request.cache_notes))
         stated = request.connection.prompt_cache
         if stated is None:
             return receipt
@@ -2700,13 +2745,14 @@ class Bridge:
         plan.require_credential()
         if model:
             plan = replace(plan, model=model, model_source="requested for this session")
+        markers = (system_prompt or "").count(PROMPT_CACHE_MARKER)
         return SessionRequest(
             connection=connection,
             plan=plan,
             kind=kind,
             project_folder=project_folder,
             model=plan.model,
-            system_prompt=system_prompt,
+            system_prompt=strip_prompt_cache_markers(system_prompt),
             persist=persist,
             tools=tools,
             mcp_servers=dict(mcp_servers),
@@ -2714,6 +2760,14 @@ class Bridge:
             resume_id=resume_id,
             schema=schema,
             schema_name=schema_name,
+            cache_notes=(
+                (
+                    f"{markers} prompt cache marker(s) removed: a session's prompt "
+                    "takes no breakpoints",
+                )
+                if markers
+                else ()
+            ),
         )
 
     # --- internals -------------------------------------------------------------
@@ -2847,9 +2901,10 @@ class Bridge:
             # diagnosable from what was printed before the run.
             plan = replace(plan, model=model, model_source="requested for this call")
         sampling = _with_standing_reasoning(connection, sampling)
+        arranged, cache_notes = arrange_prompt_cache(messages, connection, self.registry)
         return RunRequest(
             connection=connection,
-            messages=messages,
+            messages=arranged,
             plan=plan,
             model=plan.model,
             options=dict(options),
@@ -2858,6 +2913,8 @@ class Bridge:
             mcp_servers=dict(mcp_servers or {}),
             schema=dict(schema) if schema is not None else None,
             schema_name=schema_name,
+            cache_notes=cache_notes,
+            written_messages=messages,
         )
 
     def _resolve_failover(
@@ -3514,7 +3571,7 @@ class Bridge:
                 )
             request = self._build_request(
                 target,
-                primary.messages,
+                primary.written_messages or primary.messages,
                 model=model,
                 options=primary.options,
                 tools=primary.tools,

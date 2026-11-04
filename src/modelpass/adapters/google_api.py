@@ -146,6 +146,7 @@ from .base import (
     RunStream,
     SessionHandle,
     SessionRequest,
+    document_rejection,
     native_run,
     refuse_documents,
 )
@@ -1094,8 +1095,11 @@ class GoogleAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
-                status, reason = _vendor_failure(exc)
                 code, after = vendor_error_facts(exc)
+                rejected = document_rejection(self.runtime, request, code, exc)
+                if rejected is not None:
+                    raise rejected from exc
+                status, reason = _vendor_failure(exc)
                 yield _bare_terminal(
                     status, reason, self.runtime, status_code=code, retry_after=after
                 )
@@ -1248,8 +1252,11 @@ class GoogleAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
-                status, reason = _vendor_failure(exc)
                 code, after = vendor_error_facts(exc)
+                rejected = document_rejection(self.runtime, request, code, exc)
+                if rejected is not None:
+                    raise rejected from exc
+                status, reason = _vendor_failure(exc)
                 yield _bare_terminal(
                     status, reason, self.runtime, status_code=code, retry_after=after
                 )

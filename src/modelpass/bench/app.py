@@ -652,6 +652,8 @@ def create_app(
                     timeout_seconds=previous.timeout_seconds,
                     max_input_tokens=previous.max_input_tokens,
                     prompt_cache=previous.prompt_cache,
+                    prompt_cache_placement=previous.prompt_cache_placement,
+                    prompt_cache_markers=previous.prompt_cache_markers,
                     verified_capabilities=previous.verified_capabilities,
                 )
                 if (
