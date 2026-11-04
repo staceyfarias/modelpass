@@ -1279,10 +1279,11 @@ anywhere reporting it.
 
 ## Documents (PDF)
 
-On `anthropic-api`, a user message can carry a whole PDF as a `DocumentBlock`.
-Put the document first, mark it with a `cache_control` breakpoint, and ask your
-questions after it. The second question then reads the document from the
-prompt cache instead of paying for it again:
+On `anthropic-api`, `openai-api` and `google-api`, a user message can carry a
+whole PDF as a `DocumentBlock`. On `anthropic-api`, put the document first, mark
+it with a `cache_control` breakpoint, and ask your questions after it. The second
+question then reads the document from the prompt cache instead of paying for it
+again:
 
 ```python
 from modelpass import DocumentBlock, TextBlock
@@ -1294,10 +1295,20 @@ for question in ("Summarize the leave policy.", "Who approves expenses?"):
     print(answer.text, answer.receipt.documents, answer.receipt.document_bytes)
 ```
 
-* **One runtime.** `document_input` is `supported` on `anthropic-api` only. On
-  every other runtime, a call that carries a document raises
-  `CapabilityNotSupported` before preflight and before anything is sent. The
-  document is never flattened to text and never dropped.
+* **Three runtimes.** `document_input` is `supported` on `anthropic-api`,
+  `openai-api` and `google-api`. On every other runtime, a call that carries a
+  document raises `CapabilityNotSupported` before preflight and before anything
+  is sent. The document is never flattened to text and never dropped.
+* **No subscription runtime takes one.** That includes `openai-sdk`: Codex has no
+  file input to send a PDF through, so use an `openai-api` connection, which is
+  billed separately from a ChatGPT plan.
+* **What travels with the file differs by runtime.** `cache_control` reaches the
+  vendor on `anthropic-api` only. Elsewhere it is dropped and the receipt names
+  the drop. `title` becomes the `filename` on `openai-api`, and an untitled
+  document is sent as `document.pdf`. It is not sent on `google-api`, because the
+  Gemini API has no field for it.
+* **Size is the vendor's to enforce.** modelpass checks no limit, so an oversized
+  file comes back as the vendor's own error.
 * **User turns only.** A document in `system_prompt=` or in an assistant turn
   of `history=` is a `ValueError`.
 * **PDF only, base64 on the wire.** `media_type` is `"application/pdf"`.

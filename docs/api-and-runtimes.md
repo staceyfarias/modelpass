@@ -114,7 +114,7 @@ What each argument promises:
 
 | Argument | Contract |
 | --- | --- |
-| `message` | The new user turn. Required. A string, or a sequence of content blocks: `TextBlock`, and on `anthropic-api` `DocumentBlock` (a PDF; §2.0a). A document on any other runtime is refused with `CapabilityNotSupported` before preflight, never flattened or dropped. |
+| `message` | The new user turn. Required. A string, or a sequence of content blocks: `TextBlock`, and on `anthropic-api`, `openai-api` and `google-api` `DocumentBlock` (a PDF; §2.0a, §2.0b, §2.0d). A document on any other runtime is refused with `CapabilityNotSupported` before preflight, never flattened or dropped. |
 | `history` | `Message` objects or `{"role": ..., "content": ...}` dicts, in the order given, ahead of `message`. Omitting it is the single-shot case. A document may appear in a user turn only; in an assistant turn it is a `ValueError`. |
 | `system_prompt` | The front of the cached prefix. **Keep it here rather than concatenating it into `message`** — that is the difference between every call after the first reading from cache and every call paying full price. Absent means the runtime's *minimal* prompt, which is a decision (D22): modelpass writes no prompt of its own. |
 | `model` | The model to ask for. The receipt names what was resolved. |
@@ -1020,8 +1020,10 @@ log and guards do not learn that a run changed runtimes.
   {"type": "base64", "media_type": "application/pdf", "data": ...},
   "title"?, "cache_control"?}`, in the order the caller gave it. Put the
   document before the question and mark it with `cache_control`, and later
-  questions read it from cache. `document_input` is `supported` here and
-  nowhere else. modelpass sends base64 PDF sources only, and it refuses
+  questions read it from cache. `document_input` is `supported` here, on
+  `openai-api` (§2.0b) and on `google-api` (§2.0d), and this is the only one of
+  the three where a breakpoint on the document reaches the vendor. modelpass
+  sends base64 PDF sources only, and it refuses
   `citations` / `context` instead of dropping them. The receipt counts
   `documents` and `document_bytes`. No PDF bytes are written to the run log,
   receipts or events, and a managed conversation refuses a document instead
@@ -1099,6 +1101,15 @@ by section, as `tests/test_adapter_anthropic_api.py`.
   `output_tokens_details.reasoning_tokens` stays folded **inside**
   `output_tokens`, where the vendor already counts it and where Anthropic counts
   thinking output.
+* **A user turn can carry a PDF** (2026-11-04). A `DocumentBlock` in `message=`
+  or in a user turn of `history=` makes that turn's `content` a part list, in
+  the caller's order: `{"type": "input_file", "filename": ..., "file_data":
+  "data:application/pdf;base64,..."}` beside `{"type": "input_text", "text":
+  ...}`. A turn with no document stays a plain string. `filename` is the block's
+  `title` with `.pdf` added if it is missing, and an untitled block is sent as
+  `document.pdf`. A `cache_control` marker on the document is dropped and named
+  on the receipt, like any other breakpoint on this row. The cell rests on
+  offline evidence: no live call has been made (§2.2a).
 * **No `cache_control`, so the prompt is flattened.** `instructions=` is a
   string, not a block array. System blocks are joined with `flat_text` semantics
   (one blank line between them) and their breakpoints are dropped — named on the
@@ -1296,6 +1307,14 @@ section, as `tests/test_adapter_openai_api.py`.
   the flag streams the model's private reasoning into the answer a user reads.
   modelpass separates them: a thought part becomes a `ThinkingEvent`, is never a
   `text_delta`, and is never the text a schema is validated against.
+* **A user turn can carry a PDF** (2026-11-04). A `DocumentBlock` in `message=`
+  or in a user turn of `history=` makes that turn's `parts` a list in the
+  caller's order: `{"inline_data": {"data": <bytes>, "mime_type":
+  "application/pdf"}}` beside `{"text": ...}`. A turn with no document keeps its
+  single text part. The block's `title` is not sent: `google-genai` 1.73.1 raises
+  on `Blob.display_name` for the Gemini API. A `cache_control` marker is dropped
+  and named on the receipt, like any other breakpoint on this row. The cell
+  rests on offline evidence: no live call has been made (§2.2a).
 * **The assistant turn is called `model`.** A conversation sent with
   `role="assistant"` is not one this API understands.
 * **Tool results are `function_response` parts in a `user` turn**, sent after the
@@ -1490,11 +1509,17 @@ registry — `bridge.registry.row(runtime)` and `bridge.registry.note(runtime,
 capability)` — rather than this page.
 
 `document_input` is the 2026-11-03 cell: can a call carry a whole document (a
-PDF `DocumentBlock`) to the model. It is `supported` on `anthropic-api` only
-(§2.0a), and a **checked** `unsupported` on every other row, the API rows
-included. What was checked is modelpass's own adapters, which all render
-content as text, so the cell describes this library and not the vendor. A
-call that carries a document to such a runtime is refused before preflight.
+PDF `DocumentBlock`) to the model. It is `supported` on `anthropic-api` (§2.0a),
+`openai-api` (§2.0b) and `google-api` (§2.0d), and a **checked** `unsupported`
+on every other row, `openai-compatible` included. What was checked is
+modelpass's own adapters, which render content as text on those rows, so the
+cell describes this library and not the vendor. A call that carries a document
+to such a runtime is refused before preflight.
+
+On `openai-sdk` the refusal also has nothing to build on yet. Codex's input types
+have no file item, so a PDF has no route through a ChatGPT subscription; the
+evidence is in §2.2a and the request is
+[openai/codex#1797](https://github.com/openai/codex/issues/1797).
 
 `sampling_controls` and `max_output_tokens` are the R5 cells, added 2026-09-13
 and filled by ticket 1.7 — see §2.3. `cache_automatic` is the 2026-09-21 cell —
@@ -1581,6 +1606,8 @@ travels with the install.
 | 2026-09-13 | The four API runtimes | `anthropic` 0.97.0, `openai` 2.32.0, `google-genai` 1.73.1, typed surfaces | §2.0a–§2.0d, including every cell those sections leave open |
 | 2026-09-21 | `cache_automatic` | `openai` 2.32.0 typed surface; two recorded captures already in the tree | The one new cell, on three rows; five rows left `unverified` (§2.4) |
 | 2026-11-03 | `document_input` | `anthropic` 0.97.0 typed surface (`DocumentBlockParam`, `Base64PDFSourceParam`), installed; `tests/test_document_blocks.py::test_anthropic_api_sends_the_document_block_with_its_cache_control_in_order` against a fake client | `supported` on `anthropic-api`; a checked `unsupported` on the other seven rows, which render content as text and refuse a document before preflight. Live half: `tests/live/test_anthropic_api_live.py::test_one_pdf_document_question`, owner-run |
+| 2026-11-04 | `document_input` | `openai` 2.32.0 (`ResponseInputFileParam`) and `google-genai` 1.73.1 (`Part`, `Blob`) typed surfaces, installed; `tests/test_document_blocks_api.py`, with no client involved | `supported` on `openai-api` and `google-api`, offline evidence only. No live test exists for either yet |
+| 2026-11-04 | `document_input` on `openai-sdk` | `UserInput` and `ContentItem` in `codex-rs/protocol` on `openai/codex` main (latest release `rust-v0.166.0`); the `codex` 0.154.0 binary, which contains no `input_file` string; a third-party report on `openai/codex#1797` that `thread/inject_items` rejects `input_file` locally | Stays a checked `unsupported`. The route is closed in the Codex client. Revisit when `#1797` lands |
 
 #### The auth-mode findings, which are the reason this library exists
 

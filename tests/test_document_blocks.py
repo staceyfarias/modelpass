@@ -1,4 +1,4 @@
-"""PDF documents as message content, on ``anthropic-api`` only (2026-11-03).
+"""PDF documents as message content (2026-11-03).
 
 The consumer that asked: a RAG ingestion prototype sends a whole PDF to Claude,
 marks it as the cacheable prefix, and asks several questions against it. Before
@@ -11,8 +11,8 @@ Four promises, each held here:
    the Messages API's ``DocumentBlockParam`` with a ``Base64PDFSourceParam``
    source, and the ``anthropic-api`` adapter sends it in the caller's order with
    its ``cache_control`` intact.
-2. **Refused, never dropped.** Every other runtime renders content as text, so a
-   document there would vanish from the prompt and the model would answer a
+2. **Refused, never dropped.** A runtime with no document channel renders content
+   as text, so a document there would vanish from the prompt and the model would answer a
    question about a file it never saw. The bridge refuses such a call with
    ``CapabilityNotSupported`` before preflight and before any network, and the
    flattening adapters refuse again if one reaches them by another door.
@@ -21,6 +21,9 @@ Four promises, each held here:
 4. **No PDF bytes on disk or in logs.** The run log, the receipt, the event
    stream and ``repr`` carry counts, sizes and hashes; a durable conversation
    refuses documents rather than store one.
+
+The ``openai-api`` and ``google-api`` wire shapes are held in
+``test_document_blocks_api.py``.
 """
 
 from __future__ import annotations
@@ -331,7 +334,7 @@ def _bridge(tmp_path: Path, conn: Connection, script=()) -> tuple[Bridge, FakeAd
 @pytest.mark.parametrize(
     "runtime", [r for r in Runtime if r not in DOCUMENT_RUNTIMES], ids=lambda r: r.value
 )
-def test_every_runtime_but_anthropic_api_refuses_a_document_before_any_network(
+def test_a_runtime_with_no_document_channel_refuses_before_any_network(
     tmp_path, runtime
 ):
     bridge, fake = _bridge(tmp_path, _connection_for(runtime))
@@ -534,7 +537,7 @@ def test_a_managed_conversation_refuses_a_document_rather_than_store_it(tmp_path
 # --- 6. the capability cell ---------------------------------------------------------
 
 
-def test_document_input_is_supported_on_anthropic_api_and_nowhere_else():
+def test_document_input_is_supported_on_the_three_api_rows_and_nowhere_else():
     registry = CapabilityRegistry()
     assert Capability.DOCUMENT_INPUT.value == "document_input"
     for runtime in Runtime:
@@ -542,6 +545,15 @@ def test_document_input_is_supported_on_anthropic_api_and_nowhere_else():
         assert registry.support(runtime, Capability.DOCUMENT_INPUT) is expected, runtime
         note = registry.note(runtime, Capability.DOCUMENT_INPUT) or ""
         assert "2026-11-0" in note, runtime
+    note = registry.note(Runtime.OPENAI_SDK, Capability.DOCUMENT_INPUT) or ""
+    assert "never flattened, never dropped" in note
+    assert "openai/codex#1797" in note
+    note = registry.note(Runtime.OPENAI_API, Capability.DOCUMENT_INPUT) or ""
+    assert "test_openai_api_sends_the_document_as_an_" in note
+    assert "offline evidence only" in note
+    note = registry.note(Runtime.GOOGLE_API, Capability.DOCUMENT_INPUT) or ""
+    assert "test_google_api_sends_the_document_as_inline_" in note
+    assert "offline evidence only" in note
     note = registry.note(Runtime.ANTHROPIC_API, Capability.DOCUMENT_INPUT) or ""
     assert "anthropic 0.97.0" in note
     assert "DocumentBlockParam" in note and "Base64PDFSourceParam" in note

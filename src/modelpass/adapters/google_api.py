@@ -71,6 +71,9 @@ stays out of this ticket**: creating a cache object would make modelpass the
 owner of a billed, TTL'd, server-side resource nobody asked it to create, which
 is a feature with its own decision record and not a line in an adapter.
 
+**A document rides as an ``inline_data`` part** (2026-11-04), and a turn with no
+document keeps its single text part; see :func:`turn_parts`.
+
 **What it deliberately does not do.** Sessions, for the reason ticket 1.8 wrote
 into the bridge: an API endpoint holds no history. The three methods keep their
 own refusal anyway, worded exactly as the other three adapters' are. Note that

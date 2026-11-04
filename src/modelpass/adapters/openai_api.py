@@ -62,6 +62,8 @@ so an ambient ``OPENAI_API_KEY`` cannot bill an account nobody named.
   :attr:`~modelpass.types.Message.flat_text` semantics, and the bridge's own
   disclosure names the drop on the receipt. The adapter does not restate it:
   ticket 1.5 put that sentence in one place on purpose.
+* **A document makes a turn a part list** (2026-11-04). A turn with no document
+  stays the plain string it has always been; see :func:`turn_content`.
 * **Structured output must be *strict*.** ``text={"format": {"type":
   "json_schema", "strict": True, ...}}`` requires the subset
   :func:`~modelpass.schema.to_openai_strict` produces -- every property required,

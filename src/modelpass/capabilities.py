@@ -192,9 +192,10 @@ class Capability(StrEnum):
     #: (2026-11-03)? A request-shape question, like CACHE_BREAKPOINTS: it asks
     #: whether *modelpass* puts the file on this runtime's wire, not whether
     #: the vendor has a document feature somewhere. Every runtime but
-    #: ``anthropic-api`` renders content as text, so a document sent there
-    #: could only be dropped -- and a call that silently lost the file it was
-    #: about would answer a different question than the one asked. So
+    #: ``anthropic-api``, ``openai-api`` and ``google-api`` renders content as
+    #: text, so a document sent there could only be dropped -- and a call that
+    #: silently lost the file it was about would answer a different question
+    #: than the one asked. So
     #: ``unsupported`` here is a **refusal before the call**, never a drop:
     #: :meth:`Bridge.chat <modelpass.bridge.Bridge.chat>` raises
     #: :class:`~modelpass.errors.CapabilityNotSupported` before any network.
@@ -676,18 +677,17 @@ _AGENT_CEILING_NOTE = (
     "caller who wants shorter answers is not, and will not be"
 )
 
-#: Document input (2026-11-03). One ``supported`` cell and every other one a
+#: Document input (2026-11-03). Three ``supported`` cells and every other one a
 #: checked ``unsupported``, and "checked" means the same thing on every row:
 #: what was read is modelpass's own adapter, not the vendor. The agent runtimes
-#: render a message with ``Message.flat_text``, the OpenAI- and Gemini-shaped
-#: API adapters with their own ``flatten``, and all of them produce a string;
-#: there is no document channel in any of them, so a document could only be
-#: dropped. That is a fact about this library on that row, true whatever the
-#: vendor offers, and it is why the cell is ``unsupported`` rather than
-#: ``unverified`` even on the two Google agent rows that have no adapter at all
-#: (nothing there renders anything). A vendor that does take documents -- the
-#: OpenAI and Gemini APIs both have a file input -- moves its cell on its own
-#: ticket, with the same pair of evidence the ``anthropic-api`` cell below has.
+#: render a message with ``Message.flat_text``, ``openai-compatible`` with its
+#: own ``flatten``, and all of them produce a string; there is no document
+#: channel in any of them, so a document could only be dropped. That is a fact
+#: about this library on that row, true whatever the vendor offers, and it is
+#: why the cell is ``unsupported`` rather than ``unverified`` even on the two
+#: Google agent rows that have no adapter at all (nothing there renders
+#: anything). A row moves on its own ticket, with the same pair of evidence the
+#: ``supported`` cells below have.
 for _runtime in STATIC_TABLE:
     STATIC_TABLE[_runtime][Capability.DOCUMENT_INPUT] = Support.UNSUPPORTED
 #: ``anthropic-api``: the adapter hands a user turn's blocks to
@@ -707,15 +707,26 @@ _DOCUMENT_UNSUPPORTED_NOTE = (
     "(Message.flat_text, or the adapter's own flatten), so a DocumentBlock has no "
     "channel to travel in and could only be dropped. A call carrying one is "
     "refused before anything is sent -- never flattened, never dropped "
-    "(tests/test_document_blocks.py::test_every_runtime_but_anthropic_api_"
-    "refuses_a_document_before_any_network). Use an anthropic-api connection for "
-    "documents, or an openai-api or google-api one"
+    "(tests/test_document_blocks.py::test_a_runtime_with_no_document_channel_"
+    "refuses_before_any_network). Use an anthropic-api, openai-api or google-api "
+    "connection for documents"
+)
+
+#: ``openai-sdk`` has a second reason, and it is the vendor's client, not this
+#: library: adding a channel here has nothing to send through.
+_CODEX_DOCUMENT_NOTE = (
+    f"{_DOCUMENT_UNSUPPORTED_NOTE}. Read 2026-11-04: Codex has no channel to build "
+    "on either. UserInput and ContentItem in codex-rs/protocol on openai/codex main "
+    "(latest release rust-v0.166.0) carry no file item, the codex 0.154.0 binary "
+    "contains no input_file string, and a third-party report on openai/codex#1797 "
+    "has thread/inject_items rejecting input_file locally, before any model call. "
+    "Revisit when that issue lands"
 )
 
 #: Why a given cell says what it says, where the reason is not obvious.
 NOTES: dict[tuple[Runtime, Capability], str] = {
     (Runtime.ANTHROPIC_SDK, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
-    (Runtime.OPENAI_SDK, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
+    (Runtime.OPENAI_SDK, Capability.DOCUMENT_INPUT): _CODEX_DOCUMENT_NOTE,
     (Runtime.GOOGLE_CLI, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
     (Runtime.GOOGLE_SDK, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
     (Runtime.ANTHROPIC_SDK, Capability.SAMPLING_CONTROLS): _AGENT_SAMPLING_NOTE,
@@ -1387,7 +1398,7 @@ _API_RUNTIME_NOTES: dict[tuple[Runtime, Capability], str] = {
         "**supported** (2026-11-04), offline evidence only. A DocumentBlock in a user "
         "message reaches responses.create as {'type': 'input_file', 'filename': ..., "
         "'file_data': 'data:application/pdf;base64,...'}, in block order -- "
-        "tests/test_document_blocks.py::test_openai_api_sends_the_document_as_an_"
+        "tests/test_document_blocks_api.py::test_openai_api_sends_the_document_as_an_"
         "input_file_in_order. What the vendor takes: openai 2.32.0 (installed, read "
         "2026-11-04) types ResponseInputFileParam with file_data and filename. "
         "cache_control does not travel on this row. No live call has been made"
@@ -1396,7 +1407,7 @@ _API_RUNTIME_NOTES: dict[tuple[Runtime, Capability], str] = {
         "**supported** (2026-11-04), offline evidence only. A DocumentBlock in a user "
         "message reaches generate_content as a part {'inline_data': {'data': <bytes>, "
         "'mime_type': 'application/pdf'}}, in block order -- "
-        "tests/test_document_blocks.py::test_google_api_sends_the_document_as_inline_"
+        "tests/test_document_blocks_api.py::test_google_api_sends_the_document_as_inline_"
         "data_in_order, which also validates it with the SDK's Content model. "
         "google-genai 1.73.1 (installed, read 2026-11-04) raises on Blob.display_name "
         "for the Gemini API, so the block's title does not travel on this row, and "

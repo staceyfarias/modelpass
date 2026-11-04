@@ -5,7 +5,27 @@ work landed.
 
 ## Unreleased
 
+### Fixed
+
+- **The LangChain adapter no longer drops a standard `file` part** (2026-11-04).
+  A `{"type": "file", ...}` part fell through to the text fallback and vanished
+  from the prompt without a word. It now raises the same `ValueError` as a
+  document beside a part modelpass has no block for. It is not yet converted to
+  a `DocumentBlock`.
+
 ### Added
+
+- **PDF documents on `openai-api` and `google-api`** (2026-11-04).
+  `document_input` is now `supported` on both, with dated notes naming the SDK
+  read and the offline tests in `tests/test_document_blocks_api.py`. On
+  `openai-api` a turn carrying a document sends a part list with an `input_file`
+  item (a base64 `data:` URL plus `filename`). On `google-api` it sends an
+  `inline_data` part. Text-only turns are unchanged on both. `cache_control` does
+  not travel on either row and is named on the receipt, and `title` does not
+  travel on `google-api`. No live call has been made, and neither row has a live
+  test yet. `openai-sdk` stays a checked `unsupported`, and its note now records
+  why: Codex has no file input (`openai/codex#1797`). The unsupported rows'
+  capability note names the three runtimes that do take documents.
 
 - **PDF documents as message content, on `anthropic-api`** (2026-11-03). New
   `DocumentBlock(data, media_type="application/pdf", title=None,

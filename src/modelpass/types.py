@@ -456,9 +456,9 @@ class DocumentBlock:
     A document goes in a *user* message and nowhere else: a system prompt is
     instructions and an assistant turn is something the model said, and neither
     of those is a place a vendor reads a file. :class:`Message` refuses both at
-    construction. Only ``application/pdf`` is accepted, carried as base64 on
-    the wire, because that is the one shape the runtime that takes documents
-    (``anthropic-api``) was read to accept -- see
+    construction. Only ``application/pdf`` is accepted, because that is the one
+    type the runtimes that take documents (``anthropic-api``, ``openai-api``,
+    ``google-api``) were read to accept -- see
     :attr:`~modelpass.capabilities.Capability.DOCUMENT_INPUT`. Every other
     runtime refuses a call that carries one before anything is sent; a document
     is never flattened to text and never dropped.
@@ -468,7 +468,10 @@ class DocumentBlock:
     :class:`TextBlock` -- *everything up to and including this block is one
     cacheable prefix* -- which is the reason to send a document at all when
     several questions will be asked of it: mark the document, put the question
-    after it, and the second question reads the document from cache.
+    after it, and the second question reads the document from cache. That holds
+    on ``anthropic-api`` only; the other two rows drop the marker and the
+    receipt names the drop. ``title`` is sent as the ``filename`` on
+    ``openai-api`` and not at all on ``google-api``.
 
     **The bytes never leave memory through modelpass.** ``repr`` shows the
     title, size and SHA-256, never the content, and a record that has to name a

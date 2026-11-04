@@ -1404,7 +1404,8 @@ class Bridge:
         ``message`` (and a user turn in ``history``) may also carry a
         :class:`~modelpass.types.DocumentBlock` -- a PDF -- on a runtime whose
         :attr:`~modelpass.capabilities.Capability.DOCUMENT_INPUT` cell is
-        ``supported``, which today is ``anthropic-api`` alone (2026-11-03).
+        ``supported``, which today is ``anthropic-api``, ``openai-api`` and
+        ``google-api`` (2026-11-04).
         Everywhere else the call raises
         :class:`~modelpass.errors.CapabilityNotSupported` before preflight: a
         breakpoint can be flattened away honestly, a file cannot.
@@ -3021,8 +3022,8 @@ class Bridge:
                 adapter, resolved.runtime, Capability.MCP_SERVERS, call_options, registry
             )
         if any(m.documents for m in normalized):
-            # A document is refused, never flattened: every runtime but the one
-            # with a document channel renders content as text, and a call that
+            # A document is refused, never flattened: every runtime without a
+            # document channel renders content as text, and a call that
             # silently lost the file it was about would answer a different
             # question than the one asked (2026-11-03).
             self._require_for_request(
