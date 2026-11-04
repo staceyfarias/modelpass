@@ -13,10 +13,15 @@ Two rules shape this module.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import dataclasses
+import hashlib
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from .runtimes import Runtime
@@ -30,6 +35,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CACHE_TTLS",
     "CALLER_TOOL_SERVER",
+    "DOCUMENT_MEDIA_TYPES",
     "EVENT_TYPES",
     "REASONING_EFFORTS",
     "SAMPLING_FIELDS",
@@ -39,6 +45,7 @@ __all__ = [
     "AuthMode",
     "CacheControl",
     "ContentBlock",
+    "DocumentBlock",
     "FailoverEvent",
     "GuardStopEvent",
     "GuardWarningEvent",
@@ -357,9 +364,11 @@ class CacheControl:
 class TextBlock:
     """One span of text, optionally ending a cacheable prefix (R3).
 
-    **Text only, deliberately.** Images, documents and tool-result blocks stay
-    out of v1 -- they were out before this type existed and adding a marker for
-    prefix caching is not the occasion to let them in. What this vocabulary
+    **Text only, deliberately.** Images and tool-result blocks stay out -- they
+    were out before this type existed and adding a marker for prefix caching is
+    not the occasion to let them in. Documents arrived later as their own type,
+    :class:`DocumentBlock` (2026-11-03), on their own ticket and their own
+    capability cell; this class still carries text and nothing else. What this vocabulary
     exists for is the one thing a ``str`` could not carry: *where the cacheable
     prefix ends*. A caller that splits its system prompt into four blocks and
     marks the boundaries is making a billing decision, and before this the
@@ -397,10 +406,16 @@ class TextBlock:
             return cls(text=value)
         if isinstance(value, Mapping):
             kind = value.get("type", "text")
+            if kind == "document":
+                raise ValueError(
+                    "a 'document' block is not text: build it with "
+                    "DocumentBlock.coerce, or pass it in message content, where "
+                    "normalize_content reads it as a DocumentBlock"
+                )
             if kind != "text":
                 raise ValueError(
-                    f"modelpass carries text content blocks only, got {kind!r}: "
-                    "images and documents stay out of v1"
+                    "modelpass carries text content blocks only, plus documents as "
+                    f"DocumentBlock; got {kind!r}: images stay out of v1"
                 )
             raw = value.get("cache_control")
             return cls(
@@ -416,36 +431,254 @@ class TextBlock:
         return data
 
 
-#: The block union. One member today; named so the annotations read as the
-#: vocabulary rather than as the single type that currently fills it.
-ContentBlock = TextBlock
+#: The document media types modelpass carries (2026-11-03). One today, and
+#: written down as a tuple for the reason :data:`CACHE_TTLS` is: the refusal
+#: names what *is* accepted, and the second member is a one-line change here
+#: rather than a new sentence in three places.
+DOCUMENT_MEDIA_TYPES: tuple[str, ...] = ("application/pdf",)
+
+#: The file suffixes :meth:`DocumentBlock.from_path` reads, keyed to the media
+#: type each one becomes.
+_DOCUMENT_SUFFIXES: dict[str, str] = {".pdf": "application/pdf"}
+
+#: The keys a document block may carry on the wire. Anything else -- the
+#: Messages API's ``citations`` and ``context`` among them -- is refused rather
+#: than read and dropped, because a document whose citations setting vanished
+#: on the way in is the silent strip this vocabulary exists to end.
+_DOCUMENT_KEYS = frozenset({"type", "source", "title", "cache_control"})
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class DocumentBlock:
+    """A whole document -- today, one PDF -- sent as message content (2026-11-03).
+
+    **The second member of the block vocabulary, and a narrow one on purpose.**
+    A document goes in a *user* message and nowhere else: a system prompt is
+    instructions and an assistant turn is something the model said, and neither
+    of those is a place a vendor reads a file. :class:`Message` refuses both at
+    construction. Only ``application/pdf`` is accepted, carried as base64 on
+    the wire, because that is the one shape the runtime that takes documents
+    (``anthropic-api``) was read to accept -- see
+    :attr:`~modelpass.capabilities.Capability.DOCUMENT_INPUT`. Every other
+    runtime refuses a call that carries one before anything is sent; a document
+    is never flattened to text and never dropped.
+
+    ``data`` is the file's raw bytes, not base64: the encoding is a wire detail
+    and :meth:`to_dict` does it. ``cache_control`` means what it means on a
+    :class:`TextBlock` -- *everything up to and including this block is one
+    cacheable prefix* -- which is the reason to send a document at all when
+    several questions will be asked of it: mark the document, put the question
+    after it, and the second question reads the document from cache.
+
+    **The bytes never leave memory through modelpass.** ``repr`` shows the
+    title, size and SHA-256, never the content, and a record that has to name a
+    document writes :meth:`summary` instead of the block. A durable conversation
+    refuses documents outright, because replaying its history would mean
+    storing the file.
+    """
+
+    type: ClassVar[str] = "document"
+    data: bytes
+    media_type: str = "application/pdf"
+    title: str | None = None
+    cache_control: CacheControl | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.data, (bytearray, memoryview)):
+            object.__setattr__(self, "data", bytes(self.data))
+        if not isinstance(self.data, bytes):
+            raise TypeError(
+                f"DocumentBlock data must be bytes, got {type(self.data).__name__}"
+            )
+        if not self.data:
+            raise ValueError("DocumentBlock data must not be empty")
+        if self.media_type not in DOCUMENT_MEDIA_TYPES:
+            valid = ", ".join(repr(t) for t in DOCUMENT_MEDIA_TYPES)
+            raise ValueError(
+                f"DocumentBlock media_type must be one of: {valid}, got "
+                f"{self.media_type!r}"
+            )
+        if self.title is not None and not isinstance(self.title, str):
+            raise TypeError(
+                f"DocumentBlock title must be str or None, got {type(self.title).__name__}"
+            )
+        if self.cache_control is not None:
+            object.__setattr__(
+                self, "cache_control", CacheControl.coerce(self.cache_control)
+            )
+
+    @classmethod
+    def from_path(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        title: str | None = None,
+        cache_control: CacheControl | Mapping[str, Any] | None = None,
+    ) -> DocumentBlock:
+        """Read a document file. ``title`` defaults to the file name's stem.
+
+        The suffix decides the media type, and only ``.pdf`` is read: a file
+        modelpass would have to guess the type of is a file it refuses.
+        """
+        source = Path(path)
+        media_type = _DOCUMENT_SUFFIXES.get(source.suffix.lower())
+        if media_type is None:
+            valid = ", ".join(repr(s) for s in _DOCUMENT_SUFFIXES)
+            raise ValueError(
+                f"DocumentBlock.from_path reads {valid} files only, got {source.name!r}"
+            )
+        return cls(
+            data=source.read_bytes(),
+            media_type=media_type,
+            title=title if title is not None else source.stem,
+            cache_control=cache_control,  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def coerce(cls, value: DocumentBlock | Mapping[str, Any]) -> DocumentBlock:
+        """Accept a block, or the Messages API's base64 document mapping.
+
+        ``{"type": "document", "source": {"type": "base64", "media_type":
+        "application/pdf", "data": <base64>}, "title"?: ..., "cache_control"?:
+        ...}`` -- the shape :meth:`to_dict` writes. Other source kinds (a URL, a
+        file id, plain text) and other keys (``citations``, ``context``) are
+        refused, not ignored.
+        """
+        if isinstance(value, DocumentBlock):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError(f"cannot read a document block from {type(value).__name__}")
+        if value.get("type") != "document":
+            raise ValueError(
+                f"a document block has type 'document', got {value.get('type')!r}"
+            )
+        extra = sorted(str(k) for k in set(value) - _DOCUMENT_KEYS)
+        if extra:
+            raise ValueError(
+                "modelpass does not carry these document block keys: "
+                f"{', '.join(extra)}"
+            )
+        source = value.get("source")
+        if not isinstance(source, Mapping) or source.get("type") != "base64":
+            kind = source.get("type") if isinstance(source, Mapping) else source
+            raise ValueError(
+                "a document block's source must be base64 ({'type': 'base64', "
+                f"'media_type': ..., 'data': ...}}), got source type {kind!r}"
+            )
+        encoded = source.get("data")
+        if not isinstance(encoded, str):
+            raise TypeError(
+                "a document block's source data must be a base64 str, got "
+                f"{type(encoded).__name__}"
+            )
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("a document block's source data is not valid base64") from None
+        raw = value.get("cache_control")
+        return cls(
+            data=data,
+            media_type=str(source.get("media_type", "")),
+            title=value.get("title"),
+            cache_control=CacheControl.coerce(raw) if raw is not None else None,
+        )
+
+    @property
+    def size_bytes(self) -> int:
+        """The document's size, in bytes of the file (not of its base64)."""
+        return len(self.data)
+
+    @property
+    def sha256(self) -> str:
+        """The file's SHA-256, hex. What a record says instead of the content."""
+        return hashlib.sha256(self.data).hexdigest()
+
+    def summary(self) -> dict[str, Any]:
+        """The block as a record may hold it: everything but the bytes.
+
+        ``{"type": "document", "media_type", "title", "bytes", "sha256"}`` --
+        enough to say which file a run read, and nothing a reader could rebuild
+        the file from.
+        """
+        return {
+            "type": self.type,
+            "media_type": self.media_type,
+            "title": self.title,
+            "bytes": self.size_bytes,
+            "sha256": self.sha256,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        """The Messages API wire shape, base64 standard alphabet, no newlines."""
+        data: dict[str, Any] = {
+            "type": self.type,
+            "source": {
+                "type": "base64",
+                "media_type": self.media_type,
+                "data": base64.b64encode(self.data).decode("ascii"),
+            },
+        }
+        if self.title is not None:
+            data["title"] = self.title
+        if self.cache_control is not None:
+            data["cache_control"] = self.cache_control.to_dict()
+        return data
+
+    def __repr__(self) -> str:
+        return (
+            f"DocumentBlock(title={self.title!r}, media_type={self.media_type!r}, "
+            f"bytes={self.size_bytes}, sha256={self.sha256!r}, "
+            f"cache_control={self.cache_control!r})"
+        )
+
+
+#: The block union: text, and since 2026-11-03 a document. Annotations say
+#: ``ContentBlock`` wherever either may appear and ``TextBlock`` wherever only
+#: text may -- a system prompt, an assistant turn.
+ContentBlock = TextBlock | DocumentBlock
+
+
+def _coerce_block(value: ContentBlock | Mapping[str, Any] | str) -> ContentBlock:
+    """One block, dispatched on its class or its ``type`` key."""
+    if isinstance(value, DocumentBlock):
+        return value
+    if isinstance(value, Mapping) and value.get("type") == "document":
+        return DocumentBlock.coerce(value)
+    return TextBlock.coerce(value)
 
 
 def normalize_content(
-    content: str | Iterable[TextBlock | Mapping[str, Any] | str],
-) -> str | tuple[TextBlock, ...]:
+    content: str | ContentBlock | Iterable[ContentBlock | Mapping[str, Any] | str],
+) -> str | tuple[ContentBlock, ...]:
     """Coerce message or system-prompt content into its stored shape.
 
     A ``str`` stays a ``str`` -- byte-for-byte, so nothing about an existing
-    caller's prompt moves. Anything iterable becomes a tuple of
-    :class:`TextBlock`, which is the only way a breakpoint survives the trip.
+    caller's prompt moves. Anything iterable becomes a tuple of blocks, which is
+    the only way a breakpoint survives the trip: a ``{"type": "document"}``
+    mapping or a :class:`DocumentBlock` becomes a document, and everything else
+    goes through :meth:`TextBlock.coerce`, which refuses images. *Where* a
+    document may appear is :class:`Message`'s question, not this function's.
     """
     if isinstance(content, str):
         return content
-    if isinstance(content, (TextBlock, Mapping)):
-        return (TextBlock.coerce(content),)
-    if isinstance(content, Iterable):
-        return tuple(TextBlock.coerce(b) for b in content)
+    if isinstance(content, (TextBlock, DocumentBlock, Mapping)):
+        return (_coerce_block(content),)
+    if isinstance(content, Iterable) and not isinstance(content, (bytes, bytearray)):
+        return tuple(_coerce_block(b) for b in content)
     raise TypeError(
-        "content must be str or a sequence of text content blocks, got "
+        "content must be str or a sequence of text or document content blocks, got "
         f"{type(content).__name__}"
     )
 
 
 def count_cache_breakpoints(
-    content: str | Iterable[TextBlock] | None,
+    content: str | Iterable[ContentBlock] | None,
 ) -> int:
-    """How many explicit cache breakpoints this content carries. ``0`` for text."""
+    """How many explicit cache breakpoints this content carries. ``0`` for text.
+
+    Documents count: a breakpoint on a document is the common case, not an
+    edge -- it is what makes the second question about a file read from cache.
+    """
     if content is None or isinstance(content, str):
         return 0
     return sum(1 for b in content if getattr(b, "cache_control", None) is not None)
@@ -458,12 +691,14 @@ def count_cache_breakpoints(
 class Message:
     """A single conversation message.
 
-    ``content`` is **either** a ``str`` or a tuple of :class:`TextBlock`, which
-    is the second accepted shape the original v1 note promised rather than a
-    revision of the wire format: a string message serializes exactly as it
-    always did. Blocks exist for one reason -- carrying ``cache_control``
-    breakpoints (R3) -- and the vocabulary is text-only; image and document
-    blocks were out of v1 before this and stay out.
+    ``content`` is **either** a ``str`` or a tuple of :data:`ContentBlock`,
+    which is the second accepted shape the original v1 note promised rather
+    than a revision of the wire format: a string message serializes exactly as
+    it always did. Blocks first existed for one reason -- carrying
+    ``cache_control`` breakpoints (R3) -- and were text-only. Since 2026-11-03 a
+    *user* message may also carry a :class:`DocumentBlock`; a system or
+    assistant message that carries one is refused here, at construction, with a
+    ``ValueError``. Images stay out.
 
     **Read the text with :attr:`text`, never by assuming ``content`` is one.**
     That property is what keeps every existing consumer working, and it is what
@@ -472,7 +707,7 @@ class Message:
     """
 
     role: Role
-    content: str | tuple[TextBlock, ...]
+    content: str | tuple[ContentBlock, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", Role(self.role))
@@ -482,21 +717,31 @@ class Message:
             object.__setattr__(self, "content", normalize_content(self.content))
         except TypeError:
             raise TypeError(
-                "message content must be str or a sequence of text content "
-                f"blocks, got {type(self.content).__name__}"
+                "message content must be str or a sequence of text or document "
+                f"content blocks, got {type(self.content).__name__}"
             ) from None
+        if self.role is not Role.USER and self.documents:
+            raise ValueError(
+                f"a document can only be sent in a user message; this {self.role.value} "
+                "message carries one. Put the document in the user turn that asks "
+                "about it (system prompts and assistant turns are text only)"
+            )
 
     @property
     def text(self) -> str:
-        """The message's text, blocks concatenated. Always a ``str``.
+        """The message's text, text blocks concatenated. Always a ``str``.
 
         Blocks are joined with nothing between them: a breakpoint is a marker
         *inside* one prompt, not a separator between two, so inserting anything
-        here would change the bytes a caller wrote.
+        here would change the bytes a caller wrote. **Documents contribute no
+        characters**: a :class:`DocumentBlock` is a file, not text, and is read
+        with :attr:`documents`. A runtime that renders this property onto a
+        string wire therefore cannot carry a document, which is why such a call
+        is refused before it is sent rather than rendered without one.
         """
         if isinstance(self.content, str):
             return self.content
-        return "".join(block.text for block in self.content)
+        return "".join(b.text for b in self.content if isinstance(b, TextBlock))
 
     @property
     def flat_text(self) -> str:
@@ -509,17 +754,28 @@ class Message:
         intact and no separator is ever inserted. Two joins, one reason each;
         picking one for both would either glue words on the agent runtimes or
         change the bytes a caller wrote on the API ones (2026-09-13).
+
+        Text blocks only, as with :attr:`text`: documents contribute nothing.
         """
         if isinstance(self.content, str):
             return self.content
-        return "\n\n".join(block.text for block in self.content if block.text)
+        return "\n\n".join(
+            b.text for b in self.content if isinstance(b, TextBlock) and b.text
+        )
 
     @property
-    def blocks(self) -> tuple[TextBlock, ...]:
+    def blocks(self) -> tuple[ContentBlock, ...]:
         """The message as blocks, a plain string wrapped in one unmarked block."""
         if isinstance(self.content, str):
             return (TextBlock(self.content),)
         return self.content
+
+    @property
+    def documents(self) -> tuple[DocumentBlock, ...]:
+        """The documents this message carries, in order. Empty for text."""
+        if isinstance(self.content, str):
+            return ()
+        return tuple(b for b in self.content if isinstance(b, DocumentBlock))
 
     @property
     def cache_breakpoints(self) -> int:

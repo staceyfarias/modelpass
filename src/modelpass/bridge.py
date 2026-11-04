@@ -133,6 +133,7 @@ from .tools import ToolDef, normalize_tools
 from .types import (
     AgentEvent,
     AuthMode,
+    ContentBlock,
     FailoverEvent,
     Message,
     ReceiptEvent,
@@ -852,6 +853,7 @@ class Bridge:
             )
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
+        receipt = self._with_documents(request, receipt)
         receipt = self._with_reasoning_disclosure(request, receipt)
         receipt = self._with_prompt_cache(request, receipt)
         return self._with_sampling_disclosure(request, receipt)
@@ -1157,6 +1159,25 @@ class Bridge:
         )
 
     @staticmethod
+    def _with_documents(request: RunRequest | SessionRequest, receipt: Receipt) -> Receipt:
+        """Record how many documents this call carries, and their size (2026-11-03).
+
+        Counts and bytes only -- never a title, never a hash, never content: a
+        receipt travels in the event stream and into the run log, and a
+        document's identity is the caller's to record. A call that reaches this
+        step on a runtime without a document channel does not exist; the
+        gate in :meth:`_plan` refused it.
+        """
+        documents = getattr(request, "documents", ())
+        if not documents:
+            return receipt
+        return replace(
+            receipt,
+            documents=len(documents),
+            document_bytes=sum(d.size_bytes for d in documents),
+        )
+
+    @staticmethod
     def _with_prompt_cache(
         request: RunRequest | SessionRequest, receipt: Receipt
     ) -> Receipt:
@@ -1331,7 +1352,7 @@ class Bridge:
         self,
         *,
         connection: Connection | str,
-        message: str | Sequence[TextBlock],
+        message: str | Sequence[ContentBlock],
         system_prompt: str | Sequence[TextBlock] | None = None,
         history: Iterable[Message | Mapping[str, Any]] | None = None,
         model: str | None = None,
@@ -1379,6 +1400,15 @@ class Bridge:
         :attr:`~modelpass.capabilities.Capability.CACHE_BREAKPOINTS`, and where
         they do not, the content is flattened to text and the receipt says so by
         name rather than dropping them quietly.
+
+        ``message`` (and a user turn in ``history``) may also carry a
+        :class:`~modelpass.types.DocumentBlock` -- a PDF -- on a runtime whose
+        :attr:`~modelpass.capabilities.Capability.DOCUMENT_INPUT` cell is
+        ``supported``, which today is ``anthropic-api`` alone (2026-11-03).
+        Everywhere else the call raises
+        :class:`~modelpass.errors.CapabilityNotSupported` before preflight: a
+        breakpoint can be flattened away honestly, a file cannot.
+        ``system_prompt`` stays text-only.
 
         **Keep ``system_prompt`` here rather than concatenating it into
         ``message``.** It is the front of the cached prefix, and holding it
@@ -1597,7 +1627,7 @@ class Bridge:
         self,
         *,
         connection: Connection | str,
-        message: str | Sequence[TextBlock],
+        message: str | Sequence[ContentBlock],
         system_prompt: str | Sequence[TextBlock] | None = None,
         history: Iterable[Message | Mapping[str, Any]] | None = None,
         model: str | None = None,
@@ -1693,7 +1723,7 @@ class Bridge:
     async def aask(
         self,
         connection: Connection | str,
-        message: str | Sequence[TextBlock],
+        message: str | Sequence[ContentBlock],
         *,
         system_prompt: str | Sequence[TextBlock] | None = None,
         history: Iterable[Message | Mapping[str, Any]] | None = None,
@@ -1751,7 +1781,7 @@ class Bridge:
     def ask(
         self,
         connection: Connection | str,
-        message: str | Sequence[TextBlock],
+        message: str | Sequence[ContentBlock],
         *,
         system_prompt: str | Sequence[TextBlock] | None = None,
         history: Iterable[Message | Mapping[str, Any]] | None = None,
@@ -2914,7 +2944,7 @@ class Bridge:
         self,
         *,
         connection: Connection | str,
-        message: str | Sequence[TextBlock],
+        message: str | Sequence[ContentBlock],
         system_prompt: str | Sequence[TextBlock] | None = None,
         history: Iterable[Message | Mapping[str, Any]] | None = None,
         model: str | None = None,
@@ -2989,6 +3019,14 @@ class Bridge:
         if servers:
             self._require_for_request(
                 adapter, resolved.runtime, Capability.MCP_SERVERS, call_options, registry
+            )
+        if any(m.documents for m in normalized):
+            # A document is refused, never flattened: every runtime but the one
+            # with a document channel renders content as text, and a call that
+            # silently lost the file it was about would answer a different
+            # question than the one asked (2026-11-03).
+            self._require_for_request(
+                adapter, resolved.runtime, Capability.DOCUMENT_INPUT, call_options, registry
             )
 
         normalized_schema: dict[str, Any] | None = None
@@ -3076,6 +3114,7 @@ class Bridge:
             receipt = replace(receipt, notes=(*receipt.notes, _note))
         receipt = self._with_cache_disclosure(plan.adapter, plan.request, receipt)
         receipt = self._with_cache_breakpoints(plan.request, receipt)
+        receipt = self._with_documents(plan.request, receipt)
         receipt = self._with_reasoning_disclosure(plan.request, receipt)
         receipt = self._with_prompt_cache(plan.request, receipt)
         receipt = self._with_sampling_disclosure(plan.request, receipt)
@@ -3449,6 +3488,17 @@ class Bridge:
                     primary.options,
                     target_registry,
                 )
+            if primary.documents:
+                # The second connection must be able to read the file the first
+                # was asked about; one that would flatten it is refused here,
+                # before it runs, like every other gate in this block.
+                self._require_for_request(
+                    adapter,
+                    target.runtime,
+                    Capability.DOCUMENT_INPUT,
+                    primary.options,
+                    target_registry,
+                )
             if primary.schema is not None:
                 # The second connection has to be able to answer the same
                 # question the first one was asked. A failover that silently
@@ -3511,7 +3561,7 @@ def default_bridge() -> Bridge:
 def chat(
     *,
     connection: Connection | str,
-    message: str,
+    message: str | Sequence[ContentBlock],
     **kwargs: Any,
 ) -> Iterator[AgentEvent]:
     """Module-level convenience for :meth:`Bridge.chat` on the default bridge."""

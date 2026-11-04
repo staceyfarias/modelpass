@@ -135,6 +135,7 @@ from ..types import (
     CALLER_TOOL_SERVER,
     AgentEvent,
     AuthMode,
+    ContentBlock,
     SessionInfo,
     TerminalEvent,
     TerminalStatus,
@@ -158,6 +159,7 @@ from .base import (
     SessionHandle,
     SessionRequest,
     native_run,
+    refuse_documents,
 )
 
 __all__ = ["SDK_VERSION_READ", "OpenAIAPIAdapter", "token_usage"]
@@ -269,7 +271,9 @@ def token_usage(usage: Any) -> TokenUsage:
 # --- request assembly ------------------------------------------------------------
 
 
-def flatten(blocks: Sequence[TextBlock]) -> str:
+def flatten(
+    blocks: Sequence[ContentBlock], *, runtime: Runtime = Runtime.OPENAI_API
+) -> str:
     """Blocks as one string, with :attr:`~modelpass.types.Message.flat_text`
     semantics.
 
@@ -281,7 +285,13 @@ def flatten(blocks: Sequence[TextBlock]) -> str:
     dropped; the bridge's own disclosure names the drop on the receipt (R3), and
     this function does not restate it.
     """
-    return "\n\n".join(block.text for block in blocks if block.text)
+    # A document has no text to join, and this runtime has no channel for one:
+    # refused rather than joined into nothing (2026-11-03). The bridge refuses
+    # such a call before it gets here; this is the second lock.
+    refuse_documents(runtime, blocks)
+    return "\n\n".join(
+        block.text for block in blocks if isinstance(block, TextBlock) and block.text
+    )
 
 
 def instructions_param(request: RunRequest) -> str | None:

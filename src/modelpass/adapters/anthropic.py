@@ -176,6 +176,7 @@ from .base import (
     RunStream,
     SessionHandle,
     SessionRequest,
+    refuse_documents,
 )
 
 __all__ = ["AnthropicAdapter", "AnthropicSessionHandle"]
@@ -568,6 +569,9 @@ def split_messages(messages: Sequence[Any]) -> tuple[str | None, str]:
     passed through verbatim -- wrapping "Reply with exactly OK" in a transcript
     envelope changes what the model is asked, so we do not.
     """
+    # flat_text joins text blocks only; a document would vanish from the prompt.
+    # The bridge refuses that call first -- this is the second lock (2026-11-03).
+    refuse_documents(Runtime.ANTHROPIC_SDK, messages)
     system_parts = [m.flat_text for m in messages if m.role.value == "system"]
     turns = [m for m in messages if m.role.value != "system"]
 

@@ -87,17 +87,26 @@ import queue
 import threading
 import time
 import weakref
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from ..capabilities import Capability, Support, VerifyReport
 from ..connections import Connection
-from ..errors import AdapterNotImplemented
+from ..errors import AdapterNotImplemented, CapabilityNotSupported
 from ..preflight import CacheEligibility, ModelListProbe, PreflightPlan, Receipt
 from ..runtimes import Runtime
 from ..tools import ToolDef
-from ..types import AgentEvent, Message, Sampling, SessionInfo, SessionKind, TextBlock
+from ..types import (
+    AgentEvent,
+    ContentBlock,
+    DocumentBlock,
+    Message,
+    Sampling,
+    SessionInfo,
+    SessionKind,
+    TextBlock,
+)
 
 __all__ = [
     "Adapter",
@@ -111,9 +120,36 @@ __all__ = [
     "cancel_run",
     "close_async_run",
     "native_run",
+    "refuse_documents",
     "run_canceller",
     "threaded_run",
 ]
+
+
+def refuse_documents(runtime: Runtime, items: Iterable[Any]) -> None:
+    """Refuse a document an adapter that renders text was about to lose.
+
+    The bridge already refuses a call carrying a
+    :class:`~modelpass.types.DocumentBlock` on any runtime whose
+    ``document_input`` cell is not ``supported``, before anything is sent. This
+    is the second lock, for the adapters that flatten content to a string --
+    :attr:`~modelpass.types.Message.flat_text` and :attr:`~modelpass.types.
+    Message.text` join text blocks only, so a document reaching one of them by
+    any other door (a direct adapter call, a test harness, a future code path)
+    would vanish from the prompt without a word. ``items`` may be messages or
+    blocks; the first document found raises.
+    """
+    for item in items:
+        if isinstance(item, DocumentBlock) or (
+            isinstance(item, Message) and item.documents
+        ):
+            raise CapabilityNotSupported(
+                str(runtime),
+                str(Capability.DOCUMENT_INPUT),
+                "unsupported",
+                "this adapter renders message content as text and cannot carry a "
+                "document; it refused rather than send the prompt without it",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,20 +301,33 @@ class RunRequest:
         blocks: list[TextBlock] = []
         for message in self.messages:
             if message.role.value == "system":
-                blocks.extend(message.blocks)
+                # Text only by construction: Message refuses a document in any
+                # role but user, so a system message's blocks are all text.
+                blocks.extend(b for b in message.blocks if isinstance(b, TextBlock))
         return tuple(blocks)
 
     @property
-    def conversation_blocks(self) -> tuple[tuple[str, tuple[TextBlock, ...]], ...]:
+    def conversation_blocks(self) -> tuple[tuple[str, tuple[ContentBlock, ...]], ...]:
         """The non-system turns as ``(role, blocks)`` pairs (R3).
 
         The per-message half of the same answer: an adapter with a real
         ``messages=`` array renders each turn's blocks -- breakpoints and all --
         rather than the flattened transcript the two CLI runtimes need.
+
+        A user turn's blocks may include a :class:`~modelpass.types.DocumentBlock`
+        (2026-11-03). Only a runtime whose ``document_input`` cell is
+        ``supported`` ever receives one -- the bridge refuses the call
+        otherwise -- and an adapter that flattens must call
+        :func:`refuse_documents` rather than trust that.
         """
         return tuple(
             (m.role.value, m.blocks) for m in self.messages if m.role.value != "system"
         )
+
+    @property
+    def documents(self) -> tuple[DocumentBlock, ...]:
+        """Every document this run carries, in message order (2026-11-03)."""
+        return tuple(d for m in self.messages for d in m.documents)
 
     @property
     def cache_breakpoints(self) -> int:

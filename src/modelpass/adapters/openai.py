@@ -389,7 +389,14 @@ from ..types import (
     VendorEvent,
 )
 from ._mcp_result import flatten_mcp_result
-from .base import Adapter, InFlight, RunRequest, RunStream, SessionRequest
+from .base import (
+    Adapter,
+    InFlight,
+    RunRequest,
+    RunStream,
+    SessionRequest,
+    refuse_documents,
+)
 from .codex_appserver import (
     THREAD_ITEMS_LIST_METHOD,
     THREAD_LIST_METHOD,
@@ -3846,6 +3853,10 @@ class OpenAIAdapter(Adapter):
         the first ``next()``, as they always have; what is built here is only the
         run's own cancel state, so the stream can be cancelled alone.
         """
+        # Every Codex transport renders content with flat_text, which joins text
+        # blocks only: a document would vanish from the prompt. The bridge
+        # refuses that call first -- this is the second lock (2026-11-03).
+        refuse_documents(self.runtime, request.messages)
         run = _CodexRun()
         self._runs.add(run)
         return RunStream(self._run(request, run), run.cancel)

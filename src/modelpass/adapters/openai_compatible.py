@@ -289,11 +289,11 @@ def messages_param(request: RunRequest) -> list[dict[str, Any]]:
     implements it. That is this whole module's tie-breaker, applied once more.
     """
     out: list[dict[str, Any]] = []
-    system = flatten(request.system_blocks)
+    system = flatten(request.system_blocks, runtime=Runtime.OPENAI_COMPATIBLE)
     if system:
         out.append({"role": "system", "content": system})
     out.extend(
-        {"role": role, "content": flatten(blocks)}
+        {"role": role, "content": flatten(blocks, runtime=Runtime.OPENAI_COMPATIBLE)}
         for role, blocks in request.conversation_blocks
     )
     return out

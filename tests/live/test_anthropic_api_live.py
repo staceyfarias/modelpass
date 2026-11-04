@@ -1,6 +1,6 @@
 """Live drive of the ``anthropic-api`` adapter. **Spends real money.**
 
-Four calls against the real Messages API, and they are the four things a fake
+Five calls against the real Messages API, and they are the five things a fake
 transport cannot answer no matter how carefully it is written:
 
 1. a short chat -- the model really answers, and the usage really comes back;
@@ -11,6 +11,8 @@ transport cannot answer no matter how carefully it is written:
 4. one cache breakpoint, twice -- and the second call really reads the prefix
    back, which is the only observation that distinguishes "the marker was sent"
    from "the marker worked".
+5. one PDF document (2026-11-03) -- the model really reads the file and
+   answers from it, which confirms the ``document_input`` cell's offline evidence.
 
 Everything else about this adapter is pinned by
 ``tests/test_adapter_anthropic_api.py``, which drives a fake and runs by
@@ -59,6 +61,7 @@ from modelpass.store import ConnectionStore
 from modelpass.types import (
     AuthMode,
     CacheControl,
+    DocumentBlock,
     Message,
     Role,
     StructuredOutputEvent,
@@ -260,3 +263,59 @@ def test_cache_breakpoint_is_read_back_on_the_second_call(bridge):
         "the second call did not read the prefix back; cache_read_input_tokens "
         f"was {second_usage.usage.cached_input_tokens}"
     )
+
+
+def _tiny_pdf(text: str) -> bytes:
+    """A minimal, valid one-page PDF showing ``text``, with a correct xref."""
+    stream = f"BT /F1 24 Tf 72 720 Td ({text}) Tj ET".encode("latin-1")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        xref,
+    )
+    return bytes(out)
+
+
+def test_one_pdf_document_question(bridge):
+    """document_input (2026-11-03): the vendor really reads the PDF modelpass sent.
+
+    A one-page PDF whose only content is a code word the model cannot guess.
+    An answer containing it is the observation the offline test cannot make:
+    the document block was not merely well-formed, it was read.
+    """
+    document = DocumentBlock(
+        data=_tiny_pdf("The code word is PERIWINKLE-42."),
+        title="code word",
+        cache_control=CacheControl(),
+    )
+    events = list(
+        bridge.chat(
+            connection="live-api",
+            message=[
+                document,
+                TextBlock("What is the code word in this document? Reply with it only."),
+            ],
+            options={"max_output_tokens": 32},
+        )
+    )
+    terminal = _terminal(events)
+    assert terminal.status is TerminalStatus.OK
+    assert events[0].receipt.documents == 1
+    text = "".join(e.text for e in events if isinstance(e, TextDeltaEvent))
+    assert "PERIWINKLE" in text.upper()

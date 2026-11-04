@@ -187,6 +187,18 @@ class Capability(StrEnum):
     # :func:`~modelpass.prompt_cache.effort_cache_continuity`, because two
     # models on one runtime disagree about it.
     REASONING_EFFORT_PER_TURN = "reasoning_effort_per_turn"
+    #: Can a call carry a whole document -- today, one PDF as a
+    #: :class:`~modelpass.types.DocumentBlock` in a user message -- to the model
+    #: (2026-11-03)? A request-shape question, like CACHE_BREAKPOINTS: it asks
+    #: whether *modelpass* puts the file on this runtime's wire, not whether
+    #: the vendor has a document feature somewhere. Every runtime but
+    #: ``anthropic-api`` renders content as text, so a document sent there
+    #: could only be dropped -- and a call that silently lost the file it was
+    #: about would answer a different question than the one asked. So
+    #: ``unsupported`` here is a **refusal before the call**, never a drop:
+    #: :meth:`Bridge.chat <modelpass.bridge.Bridge.chat>` raises
+    #: :class:`~modelpass.errors.CapabilityNotSupported` before any network.
+    DOCUMENT_INPUT = "document_input"
 
 
 class Support(StrEnum):
@@ -664,8 +676,44 @@ _AGENT_CEILING_NOTE = (
     "caller who wants shorter answers is not, and will not be"
 )
 
+#: Document input (2026-11-03). One ``supported`` cell and every other one a
+#: checked ``unsupported``, and "checked" means the same thing on every row:
+#: what was read is modelpass's own adapter, not the vendor. The agent runtimes
+#: render a message with ``Message.flat_text``, the OpenAI- and Gemini-shaped
+#: API adapters with their own ``flatten``, and all of them produce a string;
+#: there is no document channel in any of them, so a document could only be
+#: dropped. That is a fact about this library on that row, true whatever the
+#: vendor offers, and it is why the cell is ``unsupported`` rather than
+#: ``unverified`` even on the two Google agent rows that have no adapter at all
+#: (nothing there renders anything). A vendor that does take documents -- the
+#: OpenAI and Gemini APIs both have a file input -- moves its cell on its own
+#: ticket, with the same pair of evidence the ``anthropic-api`` cell below has.
+for _runtime in STATIC_TABLE:
+    STATIC_TABLE[_runtime][Capability.DOCUMENT_INPUT] = Support.UNSUPPORTED
+#: ``anthropic-api``: the adapter hands a user turn's blocks to
+#: ``messages.create`` through ``DocumentBlock.to_dict()``, which is the
+#: vendor's own ``DocumentBlockParam`` with a ``Base64PDFSourceParam`` source.
+#: Its note names the SDK read and the offline test.
+STATIC_TABLE[Runtime.ANTHROPIC_API][Capability.DOCUMENT_INPUT] = Support.SUPPORTED
+
+#: The note every runtime but ``anthropic-api`` carries for ``document_input``.
+_DOCUMENT_UNSUPPORTED_NOTE = (
+    "unsupported (2026-11-03), a checked absence in modelpass rather than a claim "
+    "about the vendor: this runtime's adapter renders message content as text "
+    "(Message.flat_text, or the adapter's own flatten), so a DocumentBlock has no "
+    "channel to travel in and could only be dropped. A call carrying one is "
+    "refused before anything is sent -- never flattened, never dropped "
+    "(tests/test_document_blocks.py::test_every_runtime_but_anthropic_api_"
+    "refuses_a_document_before_any_network). Use an anthropic-api connection for "
+    "documents"
+)
+
 #: Why a given cell says what it says, where the reason is not obvious.
 NOTES: dict[tuple[Runtime, Capability], str] = {
+    (Runtime.ANTHROPIC_SDK, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
+    (Runtime.OPENAI_SDK, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
+    (Runtime.GOOGLE_CLI, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
+    (Runtime.GOOGLE_SDK, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
     (Runtime.ANTHROPIC_SDK, Capability.SAMPLING_CONTROLS): _AGENT_SAMPLING_NOTE,
     (Runtime.ANTHROPIC_SDK, Capability.MAX_OUTPUT_TOKENS): _AGENT_CEILING_NOTE,
     (Runtime.OPENAI_SDK, Capability.SAMPLING_CONTROLS): _AGENT_SAMPLING_NOTE,
@@ -1312,6 +1360,28 @@ _GOOGLE_API_LIVE_HALF = (
 
 #: Where a runtime's own reason differs from the shared one.
 _API_RUNTIME_NOTES: dict[tuple[Runtime, Capability], str] = {
+    (Runtime.ANTHROPIC_API, Capability.DOCUMENT_INPUT): (
+        "**supported** (2026-11-03), on the pair of evidence this row's rule asks "
+        "for. What modelpass does: a DocumentBlock in a user message reaches "
+        "messages.create as {'type': 'document', 'source': {'type': 'base64', "
+        "'media_type': 'application/pdf', 'data': ...}, 'title'?, 'cache_control'?}, "
+        "in the caller's block order, breakpoint intact -- "
+        "tests/test_document_blocks.py::test_anthropic_api_sends_the_document_"
+        "block_with_its_cache_control_in_order, against a fake client. What the "
+        "vendor takes: anthropic 0.97.0 (installed, read 2026-11-03) types "
+        "DocumentBlockParam as {source: Required[Base64PDFSourceParam | "
+        "PlainTextSourceParam | ContentBlockSourceParam | URLPDFSourceParam], type: "
+        "Required[Literal['document']], cache_control: CacheControlEphemeralParam, "
+        "citations, context, title}, and Base64PDFSourceParam as {data: base64, "
+        "media_type: Required[Literal['application/pdf']], type: "
+        "Required[Literal['base64']]}. modelpass sends the base64 PDF source only "
+        "and refuses citations/context rather than dropping them. The live half is "
+        "tests/live/test_anthropic_api_live.py::test_one_pdf_document_question "
+        "(marker `live`, owner-run)"
+    ),
+    (Runtime.OPENAI_API, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
+    (Runtime.GOOGLE_API, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
+    (Runtime.OPENAI_COMPATIBLE, Capability.DOCUMENT_INPUT): _DOCUMENT_UNSUPPORTED_NOTE,
     (Runtime.ANTHROPIC_API, Capability.CACHE_AUTOMATIC): (
         "**unverified, and never consulted, 2026-09-21.** CACHE_BREAKPOINTS is "
         "'supported' on this row -- ticket 1.6 moved it on 2026-09-13 with the "

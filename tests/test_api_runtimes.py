@@ -14,6 +14,7 @@ connection construction rather than at import.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -275,10 +276,13 @@ def test_an_api_runtime_takes_a_key_and_not_a_subscription(runtime):
 #: schema at all, which is a checked absence and not an open question;
 #: ``anthropic-api`` does have one, and whether modelpass puts a caller's
 #: breakpoint through it correctly is what ticket 1.6's drive answers.
+#:
+#: ``document_input`` joins it on every row but ``anthropic-api`` (2026-11-03):
+#: a checked absence in modelpass's own adapters, which render content as text.
 EXPECTED_UNSUPPORTED_BY_RUNTIME = {
-    Runtime.OPENAI_API: {Capability.CACHE_BREAKPOINTS},
-    Runtime.OPENAI_COMPATIBLE: {Capability.CACHE_BREAKPOINTS},
-    Runtime.GOOGLE_API: {Capability.CACHE_BREAKPOINTS},
+    Runtime.OPENAI_API: {Capability.CACHE_BREAKPOINTS, Capability.DOCUMENT_INPUT},
+    Runtime.OPENAI_COMPATIBLE: {Capability.CACHE_BREAKPOINTS, Capability.DOCUMENT_INPUT},
+    Runtime.GOOGLE_API: {Capability.CACHE_BREAKPOINTS, Capability.DOCUMENT_INPUT},
 }
 
 
@@ -337,7 +341,10 @@ def test_every_cell_that_is_not_unverified_carries_dated_evidence(runtime):
     for capability in Capability:
         note = registry.note(runtime, capability) or ""
         assert note, f"{runtime.value}/{capability.value} has no note"
-        assert "2026-09-13" in note
+        # Dated, not dated one particular day: the 2026-09-13 pass filled these
+        # rows, and a cell added later (document_input, 2026-11-03) carries the
+        # date of its own evidence rather than borrowing that one.
+        assert re.search(r"20\d\d-\d\d-\d\d", note), note
         if registry.support(runtime, capability) is not Support.UNVERIFIED:
             continue
         if runtime in DRIVEN:

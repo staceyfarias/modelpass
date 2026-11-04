@@ -1079,6 +1079,12 @@ class Receipt:
     #: every plain-string call, which is every call written before this existed.
     cache_breakpoints_requested: int = 0
     cache_breakpoints_honoured: int = 0
+    #: How many :class:`~modelpass.types.DocumentBlock` this call carries and
+    #: their total size in bytes of the files (2026-11-03). Both ``0`` for every
+    #: call without one, which is every call written before documents existed.
+    #: Counts only: a receipt is not where a document's title or hash belongs.
+    documents: int = 0
+    document_bytes: int = 0
     #: What the connection's ``promptCache`` asked for, and how this runtime
     #: meets it (2026-09-21). Both ``None`` on every connection that stated
     #: nothing, which is every connection written before the key existed.
@@ -1383,6 +1389,8 @@ class Receipt:
             "cache": self.cache.to_dict() if self.cache is not None else None,
             "cache_breakpoints_requested": self.cache_breakpoints_requested,
             "cache_breakpoints_honoured": self.cache_breakpoints_honoured,
+            "documents": self.documents,
+            "document_bytes": self.document_bytes,
             "prompt_cache_requested": self.prompt_cache_requested,
             "prompt_cache_disposition": self.prompt_cache_disposition,
             "reasoning_requested": self.reasoning_requested,

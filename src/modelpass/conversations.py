@@ -246,7 +246,18 @@ class ConversationStore:
             _text(system_prompt, "system_prompt", empty=True)
         if mode not in ("history", "native"):
             raise ConversationError("mode must be 'history' or 'native'")
-        seeds = [Message.coerce(m).to_dict() for m in seed_history]
+        seeded = [Message.coerce(m) for m in seed_history]
+        if any(m.documents for m in seeded):
+            # The store keeps every turn so history mode can replay it, and
+            # replaying a document means writing the file into the store.
+            # Refused until documents have a durable form of their own
+            # (2026-11-03).
+            raise ConversationError(
+                "A managed conversation cannot hold a document: its history is "
+                "stored to be replayed, and modelpass does not write document "
+                "bytes to disk. Send documents with Bridge.chat/ask instead"
+            )
+        seeds = [m.to_dict() for m in seeded]
         if any(m["role"] == "system" for m in seeds):
             raise ConversationError("Use system_prompt for instructions, not seed_history")
         if mode == "native":

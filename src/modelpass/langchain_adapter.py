@@ -80,6 +80,8 @@ from .errors import SubpassError
 from .runtimes import Runtime
 from .schema import to_openai_strict
 from .types import (
+    ContentBlock,
+    DocumentBlock,
     FailoverEvent,
     GuardWarningEvent,
     ReceiptEvent,
@@ -253,6 +255,13 @@ def _flatten_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "document" for b in content):
+            # Joining the text would drop the file without a word (2026-11-03).
+            raise ValueError(
+                "modelpass cannot carry a document part beside a content part it has "
+                "no block for (an image, a tool-use part); send the document with "
+                "text parts only"
+            )
         parts: list[str] = []
         for block in content:
             if isinstance(block, str):
@@ -263,7 +272,7 @@ def _flatten_content(content: Any) -> str:
     return str(content)
 
 
-def _convert_content(content: Any) -> str | tuple[TextBlock, ...]:
+def _convert_content(content: Any) -> str | tuple[ContentBlock, ...]:
     """LangChain message content as modelpass content (R3).
 
     **This is the path a downstream agent host and a retrieval service are on.**
@@ -283,15 +292,26 @@ def _convert_content(content: Any) -> str | tuple[TextBlock, ...]:
 
     Whether the markers then reach the vendor is a runtime question, and the
     receipt answers it. What ends here is the *silent* strip.
+
+    A ``{"type": "document", "source": {"type": "base64", ...}}`` part -- the
+    Anthropic spelling ``langchain-anthropic`` takes -- becomes a
+    :class:`~modelpass.types.DocumentBlock` (2026-11-03). One modelpass cannot
+    read raises rather than falling back, because the fallback joins text and
+    would send the prompt without the file. Whether the connection's runtime
+    takes documents is the bridge's question, and it refuses before any call
+    where the answer is no.
     """
     if isinstance(content, str):
         return content
     if not isinstance(content, list) or not content:
         return _flatten_content(content)
-    blocks: list[TextBlock] = []
+    blocks: list[ContentBlock] = []
     for part in content:
         if isinstance(part, str):
             blocks.append(TextBlock(part))
+            continue
+        if isinstance(part, dict) and part.get("type") == "document":
+            blocks.append(DocumentBlock.coerce(part))
             continue
         if not isinstance(part, dict) or part.get("type") != "text":
             return _flatten_content(content)
@@ -663,7 +683,7 @@ class ChatSubpass(BaseChatModel):
 
     def _split_for_chat(
         self, messages: Sequence[BaseMessage]
-    ) -> tuple[str | tuple[TextBlock, ...] | None, list[dict], str | tuple[TextBlock, ...]]:
+    ) -> tuple[str | tuple[TextBlock, ...] | None, list[dict], str | tuple[ContentBlock, ...]]:
         """Split a LangChain list into ``(system_prompt, history, message)``.
 
         ``Bridge.chat`` takes the new user turn on its own and everything before
