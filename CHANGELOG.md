@@ -18,6 +18,11 @@ work landed.
 
 ### Added
 
+- **`Sampling(reasoning_effort=...)` now works per call on `anthropic-sdk` and
+  `openai-sdk`** (2026-11-05). It beats the connection's `reasoning` for that call
+  and reaches the receipt and the run log. Before, it was dropped with a note.
+  Sessions are unchanged.
+
 - **Prompt cache modes** (2026-11-04). `promptCache` now picks a mode. `"default"`
   has modelpass mark the system prompt and the repeated turns on `anthropic-api`, at
   5 minutes. `"custom"` leaves every breakpoint to `PROMPT_CACHE_MARKER` in your

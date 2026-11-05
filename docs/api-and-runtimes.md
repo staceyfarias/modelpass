@@ -1961,8 +1961,9 @@ it can be read before spending. What a vendor did with a value it accepted is no
 knowable here and is not claimed. The run-log keys are additive; a line written
 before they existed reads back as empty.
 
-**Sampling on an agent runtime is not an error.** Every field is dropped, every
-drop gets a sentence, and the run proceeds. That is the asymmetry with `tools=`,
+**Sampling on an agent runtime is not an error.** Every field but `reasoning_effort`
+is dropped, every drop gets a sentence, and the run proceeds. `reasoning_effort`
+reaches a stateless call as that call's level (2026-11-05). That is the asymmetry with `tools=`,
 which refuses: asking a runtime to run a tool it cannot run has no sensible
 outcome but a refusal, whereas "send what it takes, say what happened to the
 rest" is available here.

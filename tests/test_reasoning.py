@@ -8,6 +8,8 @@ axes, and hold the substitution reporting that keeps a portable ladder honest.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from modelpass.capabilities import CapabilityRegistry, Support
@@ -18,8 +20,10 @@ from modelpass.reasoning import (
     Effort,
     ReasoningDisposition,
     plan_reasoning,
+    stated_reasoning,
 )
 from modelpass.runtimes import Runtime
+from modelpass.types import Sampling
 
 # --- 1. the ladder is depth, and only depth ------------------------------------
 
@@ -1077,3 +1081,90 @@ def test_max_is_rejected_by_every_openai_model_probed():
 
     for model in ("gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-pro"):
         assert "max" not in model_efforts(Runtime.OPENAI_API, model)
+
+
+# --- a call's own level on the agent runtimes (2026-11-05) -------------------------
+
+
+def _agent_run(connection, **kwargs):
+    from modelpass.bridge import Bridge
+    from modelpass.testing import FakeAdapter
+
+    adapter = FakeAdapter(runtime=connection.runtime)
+    bridge = Bridge(
+        registry=CapabilityRegistry(), adapters={connection.runtime: adapter}, env={}
+    )
+    events = list(bridge.chat(connection=connection, message="hi", **kwargs))
+    return adapter.requests[-1], events[0].receipt
+
+
+def _plain_sub(runtime, **kwargs):
+    return replace(_sub(runtime), reasoning=None, **kwargs)
+
+
+@pytest.mark.parametrize("runtime", [Runtime.ANTHROPIC_SDK, Runtime.OPENAI_SDK])
+def test_a_call_can_set_effort_on_an_agent_runtime(runtime):
+    request, receipt = _agent_run(
+        _plain_sub(runtime), sampling=Sampling(reasoning_effort="xhigh")
+    )
+    assert stated_reasoning(request.connection).runtime_value == "xhigh"
+    assert receipt.reasoning_requested == "xhigh"
+    assert receipt.reasoning_applied == "xhigh"
+
+
+@pytest.mark.parametrize("runtime", [Runtime.ANTHROPIC_SDK, Runtime.OPENAI_SDK])
+def test_a_calls_effort_beats_the_connection_and_leaves_it_alone(runtime):
+    connection = _sub(runtime)
+    request, receipt = _agent_run(connection, sampling=Sampling(reasoning_effort="low"))
+    assert request.connection.reasoning == "low"
+    assert receipt.reasoning_requested == "low"
+    assert connection.reasoning == "high"
+
+
+@pytest.mark.parametrize("runtime", [Runtime.ANTHROPIC_SDK, Runtime.OPENAI_SDK])
+def test_a_calls_effort_is_not_reported_dropped(runtime):
+    request, receipt = _agent_run(
+        _plain_sub(runtime), sampling=Sampling(reasoning_effort="high")
+    )
+    assert request.sampling.reasoning_effort is None
+    assert not any("reasoning_effort" in note for note in receipt.sampling_notes)
+
+
+@pytest.mark.parametrize("runtime", [Runtime.ANTHROPIC_SDK, Runtime.OPENAI_SDK])
+def test_the_other_sampling_fields_are_still_dropped(runtime):
+    _, receipt = _agent_run(
+        _plain_sub(runtime), sampling=Sampling(reasoning_effort="high", temperature=0.2)
+    )
+    assert any("temperature" in note for note in receipt.sampling_notes)
+
+
+def test_a_call_with_no_effort_keeps_the_connections_level():
+    request, receipt = _agent_run(
+        _sub(Runtime.ANTHROPIC_SDK), sampling=Sampling(temperature=0.2)
+    )
+    assert request.connection.reasoning == "high"
+    assert receipt.reasoning_requested == "high"
+
+
+def test_a_rung_the_runtime_lacks_moves_and_says_so_on_a_call():
+    _, receipt = _agent_run(
+        _plain_sub(Runtime.ANTHROPIC_SDK), sampling=Sampling(reasoning_effort="minimal")
+    )
+    assert receipt.reasoning_requested == "minimal"
+    assert receipt.reasoning_applied == "low"
+
+
+def test_an_api_runtime_keeps_a_calls_effort_in_sampling():
+    from modelpass.bridge import _with_call_reasoning
+    from modelpass.connections import Connection, CredentialRef
+    from modelpass.types import AuthMode
+
+    connection = Connection(
+        name="api",
+        runtime=Runtime.ANTHROPIC_API,
+        auth_mode=AuthMode.API_KEY,
+        credential_ref=CredentialRef.parse("env:ANTHROPIC_API_KEY"),
+    )
+    sampling = Sampling(reasoning_effort="high")
+    moved = _with_call_reasoning(connection, sampling, CapabilityRegistry())
+    assert moved == (connection, sampling)

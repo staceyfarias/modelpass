@@ -1428,8 +1428,7 @@ One dial, one vocabulary, and a receipt that says what the runtime was actually 
 bridge.chat(connection="claude-sub", message="...")   # the connection's standing level
 ```
 
-The level is a connection key, because on the agent runtimes it is not a per-call
-setting on the wire:
+The level is a connection key:
 
 ```toml
 [connections.claude-sub]
@@ -1464,10 +1463,16 @@ effect. `max` is refused for a weaker and stated reason — one vendor types it 
 level and another types it beside `ultra`, and a name two vendors disagree about is not
 portable.
 
-**On an API runtime you can also set it per call**, through `Sampling(reasoning_effort=
-"high")`. On the two subscription runtimes you cannot: they take no sampling at all, so
-the connection key is the route, and a `Sampling` that names effort there is dropped with
-a note saying which key does work.
+**You can also set it per call**, through `Sampling(reasoning_effort="high")`, on every
+runtime that takes a level. It beats the connection's level for that call, and the stored
+connection does not change. The two subscription runtimes take no other sampling field,
+so anything else in that `Sampling` is dropped with a note. A failover target uses its own
+connection's level.
+
+**Sessions work differently.** `send(reasoning=...)` changes the level for one turn on
+`openai-sdk`. `anthropic-sdk` fixes the level when the session opens, because
+`claude-agent-sdk` has no way to change it afterwards, so its sessions use the connection
+key.
 
 ### Did it actually do anything?
 

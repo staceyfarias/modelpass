@@ -221,11 +221,13 @@ _AGENT_SOURCE = (
     "adapters/openai.py or adapters/codex_appserver.py, and neither CLI accepts "
     f"one (grep, {SAMPLING_RULES_READ}). A Sampling on these runtimes is not an "
     "error -- every field is dropped and named on the receipt. "
-    "**Reasoning effort is the exception and is NOT dropped**: it is reachable "
-    "here, just not through Sampling. Set the connection's 'reasoning' key and "
-    "it travels as ClaudeAgentOptions.effort or TurnStartParams.effort "
-    "(claude-agent-sdk 0.2.148, codex 0.154.0, wired 2026-09-21); the receipt "
-    "reports it on reasoning_requested / reasoning_applied / reasoning_value"
+    "**Reasoning effort is the exception and is NOT dropped**: set the "
+    "connection's 'reasoning' key, or Sampling.reasoning_effort on one stateless "
+    "call, and it travels as ClaudeAgentOptions.effort or TurnStartParams.effort "
+    "(claude-agent-sdk 0.2.148, codex 0.154.0, wired 2026-09-21; per call "
+    "2026-11-05). The bridge moves a call's level onto the request's connection "
+    "before these rules run, so it never reaches them. The receipt reports it on "
+    "reasoning_requested / reasoning_applied / reasoning_value"
 )
 
 #: The same absence, one degree less certain: no adapter for these two exists,

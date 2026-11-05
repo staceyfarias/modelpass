@@ -937,8 +937,10 @@ class Sampling:
     ``reasoning_effort`` is one abstract dial across vendors -- see
     :data:`REASONING_EFFORTS`. What it becomes on the wire is per runtime and per
     model: ``output_config.effort`` on ``anthropic-api``, ``reasoning_effort`` on
-    the OpenAI models that have one, nothing at all on a model that cannot
-    reason, in which case it is reported dropped rather than quietly ignored.
+    the OpenAI models that have one, ``ClaudeAgentOptions.effort`` and
+    ``TurnStartParams.effort`` on the two agent runtimes, nothing at all on a model
+    that cannot reason, in which case it is reported dropped rather than quietly
+    ignored.
     Some models make it *exclusive* with the sampling fields -- Anthropic's
     adaptive-thinking families remove temperature, top_p and top_k from a
     thinking request -- and that too is reported, because a judge configured at

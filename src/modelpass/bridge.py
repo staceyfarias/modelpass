@@ -507,6 +507,35 @@ def _with_standing_reasoning(
     base = sampling or Sampling()
     return replace(base, reasoning_effort=stated)
 
+
+def _with_call_reasoning(
+    connection: Connection, sampling: Sampling | None, registry: CapabilityRegistry
+) -> tuple[Connection, Sampling | None]:
+    """Carry a call's effort to a runtime that reads it off the connection (2026-11-05).
+
+    The two agent runtimes take no sampling, so their adapters read the level from
+    the connection. A stateless call builds its options fresh, so a level named on
+    one call can reach them too: it goes on this request's copy of the connection,
+    and the stored connection does not change. Every reader of the level then
+    agrees, the receipt and the run log included. Taken out of the sampling, because
+    leaving it there would report it dropped on a run where it was applied.
+
+    Raises :class:`~modelpass.errors.InvalidConnection` for a level the runtime
+    cannot take, the same refusal the connection key gets.
+    """
+    if sampling is None or sampling.reasoning_effort is None:
+        return connection, sampling
+    runtime = connection.runtime
+    takes_sampling = (
+        registry.support(runtime, Capability.SAMPLING_CONTROLS) is not Support.UNSUPPORTED
+    )
+    if takes_sampling or not registry.supports(runtime, Capability.REASONING_EFFORT):
+        return connection, sampling
+    return (
+        replace(connection, reasoning=sampling.reasoning_effort),
+        replace(sampling, reasoning_effort=None),
+    )
+
 class Bridge:
     """Entry point. Owns a connection store, a capability registry and adapters.
 
@@ -2908,6 +2937,7 @@ class Bridge:
             # point of putting a model on the receipt is that a rejected model is
             # diagnosable from what was printed before the run.
             plan = replace(plan, model=model, model_source="requested for this call")
+        connection, sampling = _with_call_reasoning(connection, sampling, self.registry)
         sampling = _with_standing_reasoning(connection, sampling)
         arranged, cache_notes = arrange_prompt_cache(messages, connection, self.registry)
         return RunRequest(
