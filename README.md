@@ -687,14 +687,12 @@ maxInputTokens = 200000              # optional; the model's usable input window
                                      # is unknown -- there is no table of model sizes
                                      # here and nothing guesses one. Nothing in
                                      # modelpass reads it; it is for the tools that do.
-promptCache   = "auto"               # optional; ask for prompt caching. "auto" (or
-                                     # "default") = the vendor's own lifetime, "none"
-                                     # = off where it can be turned off, or name a
-                                     # lifetime the runtime accepts. Omit it and the
-                                     # runtime's default stands: on anthropic-api that
-                                     # is caching on (see below).
-promptCachePlacement = ["system", "turns"]  # optional; what modelpass marks by itself
-promptCacheMarkers   = "use"         # optional; "use" | "ignore" your own markers
+promptCache   = "default"            # optional; "default" = modelpass places the
+                                     # breakpoints, "custom" = your markers do, "none"
+                                     # = off where it can be turned off. Omit it and
+                                     # the default mode applies (see below).
+promptCacheTurns = false             # optional; stop marking the repeated turns
+promptCacheTime  = "1h"              # optional; "auto" or a lifetime the runtime accepts
 
   # Spend guards. NO DEFAULTS -- see "Guards" below. A connection with no
   # [guards] table genuinely has nothing bounding one run's spend, and the file
@@ -1654,7 +1652,7 @@ Read it as `is None`, never as falsy.
 
 ```toml
 [connections.production-judge]
-promptCache = "default"   # or a lifetime this runtime accepts, e.g. "1h"
+promptCache = "default"   # or "custom" or "none"
 ```
 
 Read back as `connection.prompt_cache`. It is the **standing** half of prompt
@@ -1684,7 +1682,10 @@ these runtimes cache whether or not anyone asks. `anthropic-api` would not, so
 modelpass caches there by default, to match them. `promptCache = "none"` is how
 to turn that off.
 
-**The lifetime is the vendor's word, not modelpass's.** `"default"` means the
+**A lifetime in `promptCache` still works.** `promptCache = "1h"` means the default
+mode at that lifetime, the same as `promptCacheTime = "1h"`. Naming both is refused.
+
+**The lifetime is the vendor's word, not modelpass's.** `"auto"` means the
 vendor's own, and is distinguishable from every explicit value. An explicit one
 is checked against what that runtime accepts, read off the SDK installed here —
 `anthropic` types `'5m'`/`'1h'`, `openai` types `'in-memory'`/`'24h'`. There is
@@ -1692,44 +1693,42 @@ no house vocabulary and no translation between them, because nobody published
 one. A lifetime a runtime does not take is refused when the connection is built,
 not by a 400 halfway through a run.
 
-### Where the breakpoints go
+### The three cache modes
 
-`promptCache` says how long. On `anthropic-api`, three things say where, and you
-can use any of them or none. **You do not have to set anything.** A connection
-with no cache settings caches the system prompt and the repeated turns at
-Anthropic's default lifetime.
+`promptCache` picks one of three modes. On `anthropic-api` they decide where the
+breakpoints go. **You do not have to set anything:** the default mode applies when
+the key is absent.
+
+| Mode | Who places the breakpoints | Lifetime unless you set one |
+| --- | --- | --- |
+| `"default"` | modelpass: the end of the system prompt, and the repeated turns | 5 minutes |
+| `"custom"` | You, with markers in your prompts. A call with none is not cached | `"auto"`, the vendor's own |
+| `"none"` | Nobody. Caching is off, and any marker or breakpoint on the call is removed | Not applicable |
+
+Two more keys adjust them:
 
 ```toml
 [connections.claude-api]
-promptCache = "1h"                    # optional: "none" | "auto" | "5m" | "1h"
+promptCache      = "default"   # optional: "default" | "custom" | "none"
+promptCacheTurns = false       # optional: stop marking the repeated turns
+promptCacheTime  = "1h"        # optional: "auto" | "5m" | "1h"
 ```
+
+**In the default mode** the system prompt is always marked. That is the minimum.
+`promptCacheTurns = false` turns off the turns, and the breakpoint goes on the
+message before the current turn, so a one-shot call pays no cache write for its
+question. `promptCacheTime` changes the lifetime on both. Markers in your prompts
+are removed in this mode, and the receipt says how many. A `cache_control` you set
+on a block in code still reaches the vendor, beside the automatic breakpoints.
 
 Caching costs more on a call that writes and less on a call that reads. Anthropic
 charges 1.25 times the input price for a 5-minute write and 2 times for a 1-hour
-write. So a system prompt that is long enough to cache, sent once and never
-again within the lifetime, costs more than it would uncached. For a connection
-that only makes one-off calls, set `promptCache = "none"`.
+write. So a system prompt long enough to cache, sent once and not again within the
+lifetime, costs more than it would uncached. For a connection that only makes
+one-off calls, set `promptCache = "none"`.
 
-To choose the placement, set either of these:
-
-```toml
-promptCachePlacement = ["system", "turns"]   # what modelpass marks by itself
-promptCacheMarkers   = "use"                 # or "ignore"
-```
-
-| Setting | What it does on `anthropic-api` |
-| --- | --- |
-| `promptCache = "none"` | Sends no `cache_control`, and removes any marker or breakpoint on the call |
-| `promptCache` not set, or `"auto"` | Caching on at the vendor's lifetime. `"default"` means the same as `"auto"` |
-| `promptCache = "5m"` or `"1h"` | Caching on, with that lifetime on every breakpoint that does not pin its own |
-| `promptCachePlacement` has `"system"` | Marks the end of the system prompt, unless you marked it yourself |
-| `promptCachePlacement` has `"turns"` | Marks the message before the current turn, so a one-shot call pays no cache write for its question |
-| `promptCachePlacement` not set | Marks both, unless the call carries your own markers, which replace them |
-| `promptCachePlacement = []` | Marks nothing by itself; only your markers count |
-| `promptCacheMarkers = "ignore"` | Removes your markers and `cache_control`, so only the placement decides |
-
-**You can also mark a prompt yourself.** Put `PROMPT_CACHE_MARKER` where the stable
-part of a prompt ends:
+**In the custom mode** you put `PROMPT_CACHE_MARKER` where the stable part of a
+prompt ends:
 
 ```python
 from modelpass import PROMPT_CACHE_MARKER
@@ -1737,31 +1736,28 @@ from modelpass import PROMPT_CACHE_MARKER
 system_prompt = f"{instructions}{PROMPT_CACHE_MARKER}{todays_context}"
 ```
 
-On `anthropic-api` the text before the marker becomes a cached prefix. It works
-with no cache settings at all, in a system prompt or a message. **Your markers
-replace the automatic placement for that call**, at the same lifetime, and the
-receipt says so. A `cache_control` you put on a block counts the same way. To keep
-the automatic breakpoints beside your own, state them, for example
-`promptCachePlacement = ["turns"]`. Only `promptCache = "none"` or
-`promptCacheMarkers = "ignore"` stops your markers from counting. On every other
-runtime the marker is removed and the rest of the prompt is sent as written, so
-you can change vendor without editing your prompts. The receipt says how many
-were removed. The marker is the same string GoTo Agents renders its
+The text before the marker becomes a cached prefix, in a system prompt or a
+message. modelpass marks nothing by itself, so a call with no markers is not
+cached, and the receipt says so. `promptCacheTime` sets the lifetime here too.
+
+On every other runtime the marker is removed and the rest of the prompt is sent as
+written, so you can change vendor without editing your prompts. The receipt says
+how many were removed. The marker is the same string GoTo Agents renders its
 `{PROMPT_CACHE_MARKER}` template variable to.
 
-A call stays inside the vendor's rules. It carries at most four breakpoints, and
-a slot is kept for the turn when `"turns"` is on. Later ones are dropped and the
-receipt says how many. A lifetime you pin on a block beats the connection's, and
-a shorter pin caps the breakpoints after it, because the vendor refuses a longer
-lifetime after a shorter one. Text below the model's minimum cacheable length is
-not cached, and the vendor reports no error for that.
+A call stays inside the vendor's rules. It carries at most four breakpoints, and a
+slot is kept for the turn when turns are on. Later ones are dropped and the receipt
+says how many. A lifetime you pin on a block beats the connection's. The vendor
+refuses a longer lifetime after a shorter one, so a shorter pin caps the breakpoints
+after it and a 1-hour pin raises the ones before it. Text below the model's minimum
+cacheable length is not cached, and the vendor reports no error for that.
 
-**Every other runtime caches on its own.** `promptCachePlacement` and
-`promptCacheMarkers` have no effect there and the receipt says so, so a connection
-can move to another vendor with them still set. A lifetime is different: it is
-refused when the connection is built if the runtime does not take it, and
-`"none"` is refused where caching cannot be stopped. Subscriptions take `"auto"`
-and nothing else.
+**Every other runtime caches on its own.** `promptCacheTurns` has no effect there
+and the receipt says so, and `"custom"` is accepted, so a connection can move to
+another vendor with them still set. A lifetime is different: it is refused when the
+connection is built if the runtime does not take it, and `"none"` is refused where
+caching cannot be stopped. Subscriptions take `"default"`, `"custom"` and `"auto"`,
+and no named lifetime.
 
 ### What is safe to share between threads
 

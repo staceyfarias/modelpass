@@ -290,9 +290,12 @@ def turn_breakpoint(
     if len(placed) >= MAX_CACHE_BREAKPOINTS:
         return messages
     control: dict[str, Any] = {"type": "ephemeral"}
-    # A longer lifetime may not follow a shorter one, so a caller's shorter pin
-    # earlier in the prompt decides this one.
-    if ttl and (ttl != LONGEST_CACHE_TTL or all(c.get("ttl") == ttl for c in placed)):
+    # A longer lifetime may not follow a shorter one, so a caller's longest pin
+    # after this one raises it, and a caller's shorter pin before it decides it.
+    current = (block.get("cache_control") or {} for block in messages[-1]["content"])
+    if any(pin.get("ttl") == LONGEST_CACHE_TTL for pin in current):
+        control["ttl"] = LONGEST_CACHE_TTL
+    elif ttl and (ttl != LONGEST_CACHE_TTL or all(c.get("ttl") == ttl for c in placed)):
         control["ttl"] = ttl
     marked = {**blocks[index], "cache_control": control}
     content = [*blocks[:index], marked, *blocks[index + 1 :]]
@@ -742,8 +745,8 @@ class AnthropicAPIAdapter(Adapter):
         detail = "modelpass pins no TTL on anthropic-api; the endpoint's own default applies"
         if standing:
             detail = (
-                f"the connection's promptCache puts {standing!r} on every breakpoint "
-                "that does not pin its own"
+                f"the connection's cache settings put {standing!r} on every "
+                "breakpoint that does not pin its own"
             )
         elif pinned:
             detail = (
@@ -833,9 +836,9 @@ class AnthropicAPIAdapter(Adapter):
         system = system_param(request)
         if system is not None:
             params["system"] = system
-        if request.cache_turns:
-            ttl = cache_rules(request.connection).ttl
-            params["messages"] = turn_breakpoint(messages, system, ttl)
+        rules = cache_rules(request.connection)
+        if rules.turns:
+            params["messages"] = turn_breakpoint(messages, system, rules.ttl)
         if request.tools:
             params["tools"] = tool_params(request.tools)
         config = output_config(request)

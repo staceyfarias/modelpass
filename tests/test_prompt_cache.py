@@ -199,18 +199,19 @@ def test_the_default_note_names_what_is_marked_and_how_to_stop_it():
     assert "promptCache 'none' turns it off" in note
 
 
-def test_the_default_note_follows_a_stated_placement():
-    assert "marks the repeated turns on" in default_cache_note(
-        api(prompt_cache_placement=["turns"])
-    )
-    assert "marks only what you marked" in default_cache_note(
-        api(prompt_cache_placement=[])
-    )
+def test_the_default_note_names_the_lifetime():
+    assert "at a 5m lifetime" in default_cache_note(api())
+
+
+def test_the_default_note_follows_turns_being_off():
+    note = default_cache_note(api(prompt_cache_turns=False))
+    assert "marks the system prompt on" in note
 
 
 def test_no_default_note_once_promptcache_is_stated():
     assert default_cache_note(api(prompt_cache="none")) is None
     assert default_cache_note(api(prompt_cache="1h")) is None
+    assert default_cache_note(api(prompt_cache_time="1h")) is None
 
 
 def test_no_default_note_where_modelpass_does_nothing():
@@ -360,16 +361,20 @@ def test_the_vendor_default_is_a_named_word_rather_than_an_absence():
     assert VENDOR_DEFAULT == "default"
 
 
-def test_unspecified_lifetime_reads_back_as_no_ttl():
+def test_the_default_mode_has_a_lifetime_where_breakpoints_travel():
     """Three states, and this is the middle one.
 
     Key absent -> nothing stated. ``"default"`` -> caching asked for, lifetime
-    not named, ``plan.ttl is None``. ``"1h"`` -> a lifetime named. The same
-    unset-versus-zero discipline ``maxInputTokens`` uses.
+    not named. ``"1h"`` -> a lifetime named. The same unset-versus-zero discipline
+    ``maxInputTokens`` uses.
     """
     plan = plan_prompt_cache(VENDOR_DEFAULT, Runtime.ANTHROPIC_API, name="c")
     assert plan.requested == VENDOR_DEFAULT
-    assert plan.ttl is None
+    assert plan.ttl == "5m"
+
+
+def test_the_default_mode_names_no_lifetime_where_the_vendor_decides():
+    assert plan_prompt_cache(VENDOR_DEFAULT, Runtime.OPENAI_API, name="c").ttl is None
 
 
 def test_a_named_lifetime_reads_back_exactly():
@@ -381,7 +386,7 @@ def test_a_named_lifetime_reads_back_exactly():
 def test_the_default_and_a_named_lifetime_are_distinguishable():
     default = plan_prompt_cache(VENDOR_DEFAULT, Runtime.ANTHROPIC_API, name="c")
     named = plan_prompt_cache("5m", Runtime.ANTHROPIC_API, name="c")
-    assert default.ttl is None and named.ttl == "5m"
+    assert default.ttl == named.ttl == "5m"
     assert default.requested != named.requested
 
 
@@ -411,7 +416,7 @@ def test_an_unknown_lifetime_is_refused_and_the_message_lists_the_real_ones():
         plan_prompt_cache("30m", Runtime.ANTHROPIC_API, name="c")
     message = str(caught.value)
     assert "'5m', '1h'" in message
-    assert "'default'" in message
+    assert "'auto'" in message
 
 
 def test_a_runtime_that_takes_no_lifetime_says_so_without_blaming_the_vendor():

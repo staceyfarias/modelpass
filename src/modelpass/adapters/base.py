@@ -231,10 +231,6 @@ class RunRequest:
     #: The messages as the caller wrote them, markers and all. A failover target
     #: arranges these for itself: ``messages`` are arranged for this connection.
     written_messages: tuple[Message, ...] = ()
-    #: Whether this call's re-sent turns get a cache breakpoint (2026-11-04). The
-    #: bridge decides from the messages as written, because the caller's own
-    #: breakpoints can replace it. An adapter that places one reads this.
-    cache_turns: bool = False
 
     @property
     def runtime(self) -> Runtime:

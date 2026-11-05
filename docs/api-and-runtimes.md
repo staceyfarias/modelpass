@@ -785,7 +785,7 @@ A connection may state that it wants prompt caching:
 runtime       = "anthropic-api"
 authMode      = "api_key"
 credentialRef = "env:ANTHROPIC_API_KEY"
-promptCache   = "default"   # optional; "default" = the vendor's own lifetime
+promptCache   = "default"   # optional; "default" | "custom" | "none" (§1.9a)
 ```
 
 Read back as `Connection.prompt_cache`, a `str | None`.
@@ -839,11 +839,11 @@ Three states, and they are all distinguishable:
 
 | the file says | `prompt_cache` | `plan.ttl` | means |
 | --- | --- | --- | --- |
-| nothing | `None` | — | **nothing stated.** Nothing about the connection's behaviour changes. This is not "caching off" |
-| `promptCache = "default"` or `"auto"` | as written | `None` | caching asked for, **lifetime unspecified** — the vendor's own applies |
+| nothing | `None` | no plan | **nothing stated.** The default mode applies, which on `anthropic-api` is caching on (§1.9a). This is not "caching off" |
+| `promptCache = "default"` | `"default"` | `"5m"` on `anthropic-api`, otherwise `None` | the default mode, asked for |
+| `promptCache = "custom"` | `"custom"` | `None` | the caller places the breakpoints, at the vendor's own lifetime |
 | `promptCache = "none"` | `"none"` | `None` | caching off. Refused on a runtime that caches on its own (§1.9a) |
-| key absent | `None` | no plan | nothing stated, so the runtime's default stands. On `anthropic-api` that is caching on (§1.9a) |
-| `promptCache = "1h"` | `"1h"` | `"1h"` | caching asked for at a named lifetime |
+| `promptCache = "1h"` | `"1h"` | `"1h"` | the default mode at a named lifetime |
 
 A consumer must read `is None`, not falsiness, for the same reason
 `maxInputTokens` requires it.
@@ -865,12 +865,12 @@ that the vendor has no lever.
 
 Two things. On `openai-api`, a named lifetime is sent as
 `prompt_cache_retention`, which is a typed field of that SDK's Responses
-request. `"default"` sends nothing, because the wire has no way to say "cache at
-whatever you normally do" other than by not saying anything.
+request. `"default"` and `"auto"` send nothing, because the wire has no way to say
+"cache at whatever you normally do" other than by not saying anything.
 
-On `anthropic-api`, a named lifetime goes on every breakpoint that does not pin
-its own, and breakpoints are placed as §1.9a describes (2026-11-04). Before that
-date the lifetime was accepted and never sent.
+On `anthropic-api`, the lifetime goes on every breakpoint that does not pin its
+own, and breakpoints are placed as §1.9a describes (2026-11-04). Before that date a
+named lifetime was accepted and never sent.
 
 Everywhere else `promptCache` is a **declaration**, in the same way `retry =
 "never"` is a stance rather than a retry loop.
@@ -892,6 +892,70 @@ disposition; the bench's accounts page prints the sentence, and says *nothing
 stated* rather than *off* for a connection that asked for nothing on a runtime
 where modelpass does nothing. An additive config key under the store's 0.1
 compatibility policy.
+
+### 1.9a The three modes, `promptCacheTurns`, `promptCacheTime` and the prompt marker (2026-11-04)
+
+```toml
+promptCache      = "default"  # "default" | "custom" | "none", or a lifetime
+promptCacheTurns = false      # optional
+promptCacheTime  = "1h"       # optional; "auto" or a lifetime the runtime accepts
+```
+
+Read back as `Connection.prompt_cache_turns` (`bool | None`) and
+`Connection.prompt_cache_time` (`str | None`). `prompt_cache.cache_rules` is the one
+reading of all three.
+
+| Mode | `system` | `turns` | Lifetime when none is stated | Caller's markers |
+| --- | --- | --- | --- | --- |
+| absent or `"default"` | always | unless `promptCacheTurns = false` | `"5m"` on `anthropic-api` | removed |
+| `"custom"` | never | never | `"auto"` | become breakpoints |
+| `"none"` | never | never | not applicable | removed |
+
+A lifetime in `promptCache` means the default mode at that lifetime, which is how
+the key read before this section existed. `promptCacheTime` beside one is
+`InvalidConnection`.
+
+The default lifetime is stated on the wire rather than left to the vendor, so it
+does not move if the vendor's does (`prompt_cache.DEFAULT_CACHE_TIMES`). `"auto"`
+sends no `ttl`.
+
+* The system breakpoint goes on the last system text, unless a system block already
+  carries one.
+* The turn breakpoint goes on the last cacheable block of the message before the
+  current turn, each round of a tool loop. It is placed by the adapter on a copy of
+  the request, so it moves and never accumulates. A call with no earlier message
+  gets none.
+
+**A `cache_control` on a block is not a marker.** It is honoured in `"default"` and
+`"custom"`, beside anything modelpass places, and removed only by `"none"`.
+
+**`PROMPT_CACHE_MARKER`** (`"<<<PROMPT_CACHE_MARKER>>>"`) in any text ends a
+cacheable prefix in `"custom"`. `Bridge` resolves markers in `_build_request` through
+`prompt_cache.arrange_prompt_cache`, so no adapter ever sees one. The text is split
+into blocks, every byte but the marker kept, with a breakpoint on the block before
+each marker. A stretch of only whitespace gets no block, and a marker with no text
+before it marks nothing. Everywhere else the marker is removed in place, so the text
+is what it would have been without it, and `Receipt.notes` gives the count. Session
+prompts and turns take no breakpoints, so their markers are always removed.
+
+`RunRequest.written_messages` keeps the messages as written, and a failover target
+arranges those for itself rather than inheriting another runtime's result.
+
+| Rule | What modelpass does |
+| --- | --- |
+| At most four breakpoints | The first ones are kept, three when turns are on, and `Receipt.notes` counts the rest |
+| A longer lifetime may not follow a shorter one | A caller's shorter pin caps every unpinned breakpoint after it, and a caller's `"1h"` pin raises every unpinned breakpoint before it |
+| `promptCacheTurns = true` beside `"custom"` or `"none"` | `InvalidConnection`, because those modes mark nothing |
+| `promptCacheTime` beside `"none"` | `InvalidConnection`, because there is nothing to set |
+
+`promptCacheTurns` and `"custom"` are not refused for the runtime's sake. A connection
+can move to another vendor with them set, and a note says what they did. `"none"` is
+refused where `cache_automatic` is `supported`, because caching there cannot be
+stopped.
+
+`receipt.cache_breakpoints_requested` counts what the arranged call carries, which
+includes the system breakpoint and excludes the turn's. `Receipt.cache.ttl` is the
+lifetime the connection puts on a breakpoint.
 
 ---
 
@@ -925,70 +989,6 @@ machine is never on its own enough to start a spend:
 
 Only the first three spend money; the fourth spends electricity.
 
-
-### 1.9a Placing breakpoints: `promptCachePlacement`, `promptCacheMarkers` and the prompt marker (2026-11-04)
-
-```toml
-promptCache          = "1h"                 # "none" | "auto" | "default" | a lifetime
-promptCachePlacement = ["system", "turns"]  # optional
-promptCacheMarkers   = "use"                # optional; "use" | "ignore"
-```
-
-Read back as `Connection.prompt_cache_placement` (`tuple[str, ...] | None`) and
-`Connection.prompt_cache_markers` (`str | None`).
-
-**Caching is on by default where breakpoints travel.** A connection on
-`anthropic-api` with no `promptCache` caches at the vendor's lifetime, as if it
-said `"auto"`. Only `"none"` turns it off.
-
-**`promptCachePlacement`** names what modelpass marks by itself. `None` means both,
-unless the call carries the caller's own breakpoints: a `PROMPT_CACHE_MARKER` that
-marks some text, or a `cache_control` on a block. Those replace both on that call,
-whatever `promptCache` says, the lifetime still applies, and `Receipt.notes` says
-so. `[]` means only the caller's own. A stated list keeps its breakpoints beside
-the caller's.
-
-* `"system"` puts a breakpoint on the last system text, unless a system block
-  already carries one.
-* `"turns"` puts a breakpoint on the last cacheable block of the message before
-  the current turn, each round of a tool loop. It is placed by the adapter on a
-  copy of the request, so it moves and never accumulates. A call with no earlier
-  message gets none.
-
-**`promptCacheMarkers = "ignore"`** removes the caller's markers and
-`cache_control` before placement, on the call as well as in the text.
-
-**`PROMPT_CACHE_MARKER`** (`"<<<PROMPT_CACHE_MARKER>>>"`) in any text ends a
-cacheable prefix. `Bridge` resolves markers in `_build_request` through
-`prompt_cache.arrange_prompt_cache`, so no adapter ever sees one. Where
-`cache_breakpoints` is `supported` the text is split into blocks, every byte but
-the marker kept, with a breakpoint on the block before each marker. A stretch of
-only whitespace gets no block, and a marker with no text before it marks nothing.
-Everywhere else the marker is removed in place, so the text is what it would have
-been without it, and `Receipt.notes` gives the count. Session prompts and turns
-take no breakpoints, so their markers are always removed.
-
-`RunRequest.written_messages` keeps the messages as written, and a failover target
-arranges those for itself rather than inheriting another runtime's result.
-
-| Rule | What modelpass does |
-| --- | --- |
-| At most four breakpoints | The first ones are kept, three when `"turns"` is on, and `Receipt.notes` counts the rest. `cache_control` blocks on a call with no marker, no lifetime and no stated placement are left as they were sent |
-| A longer lifetime may not follow a shorter one | A caller's pin stays on its block and caps every unpinned breakpoint after it |
-| `"none"` beside a placement or `"use"` | `InvalidConnection`, because the two contradict |
-
-`promptCachePlacement` and `promptCacheMarkers` are not checked against the runtime.
-A connection can move to another vendor with them set, and a note says they had no
-effect. `promptCache = "none"` is checked: it is refused where
-`cache_automatic` is `supported`, because caching there cannot be stopped.
-
-`RunRequest.cache_turns` carries the decision about the `"turns"` breakpoint to the
-adapter, because only the bridge sees the messages as written. It is `False` on a
-`RunRequest` built by hand.
-
-`receipt.cache_breakpoints_requested` counts what the arranged call carries, which
-includes a `"system"` breakpoint and excludes the `"turns"` one. `Receipt.cache.ttl`
-is the connection's lifetime.
 
 ### 2.0 The four API-key runtimes (2026-09-13)
 

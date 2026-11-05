@@ -27,7 +27,7 @@ from .errors import (
     InvalidGuards,
     RuntimeGated,
 )
-from .prompt_cache import check_cache_placement, plan_prompt_cache
+from .prompt_cache import check_cache_turns, connection_cache_plan
 from .reasoning import plan_reasoning
 from .runtimes import API_RUNTIMES, EXPERIMENTAL_RUNTIMES, VENDOR_OF, Runtime, parse_runtime
 from .types import AuthMode, parse_auth_mode
@@ -727,12 +727,13 @@ class Connection:
     max_input_tokens: int | None = None
     #: Whether this connection asks for prompt caching, and at what lifetime
     #: (config key ``promptCache``, 2026-09-21). ``None`` -- the key absent --
-    #: means **nothing is stated**, so the runtime's default stands. On
-    #: ``anthropic-api`` that default is caching on at the vendor's lifetime
-    #: (2026-11-04), and ``"none"`` is how to turn it off.
+    #: means **nothing is stated**, and the default mode applies.
     #:
-    #: ``"default"`` asks for caching at whatever lifetime the vendor uses.
-    #: Anything else names a lifetime, **in the vendor's own spelling**, and is
+    #: Three modes (2026-11-04). ``"default"`` has modelpass place the
+    #: breakpoints where a runtime takes them. ``"custom"`` leaves them to the
+    #: caller's markers. ``"none"`` turns caching off where it can be turned off.
+    #: Anything else names a lifetime, which means the default mode at that
+    #: lifetime, **in the vendor's own spelling**, and is
     #: checked against what the connection's runtime accepts
     #: (:data:`~modelpass.prompt_cache.PROMPT_CACHE_TTLS`). There is no house
     #: vocabulary because the two runtimes that take a lifetime do not share
@@ -776,17 +777,15 @@ class Connection:
     #: An additive key under the store's 0.1 compatibility policy. Last in the
     #: field order, so no older field's positional shape moves.
     reasoning: str | None = None
-    #: Where modelpass places its own breakpoints (config key
-    #: ``promptCachePlacement``, 2026-11-04): a list drawn from ``"system"`` and
-    #: ``"turns"``. ``None`` means both, unless ``promptCache`` is ``"none"`` or
-    #: the call carries the caller's own breakpoints, which then replace them. An
-    #: empty list means only the caller's own, and a stated list keeps its
-    #: breakpoints beside the caller's.
-    prompt_cache_placement: tuple[str, ...] | None = None
-    #: Whether the caller's markers and ``cache_control`` count (config key
-    #: ``promptCacheMarkers``, 2026-11-04): ``"use"``, the default, or
-    #: ``"ignore"``, which removes them so only the placement decides.
-    prompt_cache_markers: str | None = None
+    #: Whether the default mode marks the repeated turns (config key
+    #: ``promptCacheTurns``, 2026-11-04). ``None`` and ``True`` mean it does. The
+    #: system prompt is always marked in that mode.
+    prompt_cache_turns: bool | None = None
+    #: The lifetime on a breakpoint that pins none (config key
+    #: ``promptCacheTime``, 2026-11-04): ``"auto"`` for the vendor's own, or a
+    #: lifetime the runtime accepts. ``None`` means ``"5m"`` in the default mode on
+    #: ``anthropic-api``, and ``"auto"`` everywhere else.
+    prompt_cache_time: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -888,24 +887,11 @@ class Connection:
                     "not guess one"
                 )
 
-        if self.prompt_cache is not None:
-            # Resolved as well as validated: plan_prompt_cache raises for a
-            # runtime that cannot meet the ask and for a lifetime it does not
-            # take, so a Connection that exists carries a promptCache somebody
-            # can act on.
-            plan_prompt_cache(
-                self.prompt_cache, self.runtime, name=str(self.name)
-            )
-        object.__setattr__(
-            self,
-            "prompt_cache_placement",
-            check_cache_placement(
-                self.prompt_cache_placement,
-                self.prompt_cache_markers,
-                self.prompt_cache,
-                name=str(self.name),
-            ),
-        )
+        # Resolved as well as validated: planning raises for a runtime that
+        # cannot meet the ask and for a lifetime it does not take, so a Connection
+        # that exists carries a promptCache somebody can act on.
+        connection_cache_plan(self)
+        check_cache_turns(self.prompt_cache_turns, self.prompt_cache, name=str(self.name))
 
         if self.reasoning is not None:
             # Resolved as well as validated, exactly as promptCache is: the

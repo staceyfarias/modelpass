@@ -18,19 +18,19 @@ work landed.
 
 ### Added
 
-- **Prompt cache placement, markers and `"none"`** (2026-11-04).
-  `promptCachePlacement` (`"system"`, `"turns"`) places breakpoints on
-  `anthropic-api` without the caller writing any, and `promptCacheMarkers =
-  "ignore"` removes the caller's own. `PROMPT_CACHE_MARKER` in a prompt ends a
-  cacheable prefix on `anthropic-api` and is removed on every other runtime.
-  `promptCache` also takes `"auto"`, the same as `"default"`, and `"none"`, which
-  is refused where caching cannot be stopped. **Changed behaviour:** every
-  connection on `anthropic-api` now caches the system prompt and the repeated
-  turns at the vendor's lifetime, with or without `promptCache`, unless it says
-  `"none"`. Before, modelpass placed nothing. This changes what calls cost, and
-  the receipt says so. A call's own markers or `cache_control` replace both
-  placements unless `promptCachePlacement` is stated. Not yet run against the
-  vendor.
+- **Prompt cache modes** (2026-11-04). `promptCache` now picks a mode. `"default"`
+  has modelpass mark the system prompt and the repeated turns on `anthropic-api`, at
+  5 minutes. `"custom"` leaves every breakpoint to `PROMPT_CACHE_MARKER` in your
+  prompts, at the vendor's own lifetime, and a call with no markers is not cached.
+  `"none"` turns caching off, and is refused where it cannot be stopped.
+  `promptCacheTurns = false` stops marking the turns, and `promptCacheTime` sets the
+  lifetime in either mode. A lifetime in `promptCache` still works, and means the
+  default mode at that lifetime. A marker is removed outside `"custom"`, on every
+  runtime, so a prompt can change vendor unedited. **Changed behaviour:** every
+  connection on `anthropic-api` now caches, with or without `promptCache`, unless it
+  says `"none"` or `"custom"`. Before, modelpass placed nothing. `promptCache =
+  "default"` there now means 5 minutes on the wire rather than nothing sent. This
+  changes what calls cost, and the receipt says so. Not yet run against the vendor.
 
 - **Which file types a model reads is now the vendor's to say** (2026-11-04).
   `DocumentBlock.media_type` takes any well-formed `type/subtype` and

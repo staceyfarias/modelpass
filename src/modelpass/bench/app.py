@@ -44,7 +44,7 @@ from ..errors import PreflightFailed, SubpassError
 from ..manage import ConnectionPlan, Credential
 from ..models import ModelChoice, models_for
 from ..preflight import SCRUB_RULES, Receipt, env_names_to_scrub
-from ..prompt_cache import default_cache_note, plan_prompt_cache
+from ..prompt_cache import connection_cache_plan, default_cache_note
 from ..retry import classify_terminal
 from ..runlog import run_log_for
 from ..runtimes import Runtime
@@ -164,12 +164,9 @@ def _prompt_cache_note(connection: Connection) -> str | None:
     ``Connection.__post_init__``, but the page's job is to show a connection
     rather than to be the second place that refuses one.
     """
-    if connection.prompt_cache is None:
-        return default_cache_note(connection)
     try:
-        return plan_prompt_cache(
-            connection.prompt_cache, connection.runtime, name=connection.name
-        ).note
+        plan = connection_cache_plan(connection)
+        return plan.note if plan else default_cache_note(connection)
     except SubpassError as exc:  # pragma: no cover - defensive
         return str(exc)
 
@@ -652,8 +649,8 @@ def create_app(
                     timeout_seconds=previous.timeout_seconds,
                     max_input_tokens=previous.max_input_tokens,
                     prompt_cache=previous.prompt_cache,
-                    prompt_cache_placement=previous.prompt_cache_placement,
-                    prompt_cache_markers=previous.prompt_cache_markers,
+                    prompt_cache_turns=previous.prompt_cache_turns,
+                    prompt_cache_time=previous.prompt_cache_time,
                     verified_capabilities=previous.verified_capabilities,
                 )
                 if (

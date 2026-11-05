@@ -303,13 +303,14 @@ def _connection_for(runtime: Runtime) -> Connection:
     )
 
 
-def _api_connection() -> Connection:
+def _api_connection(**kwargs) -> Connection:
     return Connection(
         name="api",
         runtime=Runtime.ANTHROPIC_API,
         auth_mode=AuthMode.API_KEY,
         credential_ref=CredentialRef.parse("env:MODELPASS_TEST_ANTHROPIC_KEY"),
         model="claude-opus-5",
+        **kwargs,
     )
 
 
@@ -484,7 +485,7 @@ def test_a_question_after_a_cached_document_keeps_the_document_first_on_every_tu
 def test_the_receipt_counts_documents_and_bytes_and_nothing_written_carries_the_file(tmp_path):
     bridge, fake = _bridge(
         tmp_path,
-        _api_connection(),
+        _api_connection(prompt_cache="custom"),
         script=[TextDeltaEvent("answer"), usage(input_tokens=10, output_tokens=2)],
     )
     events = list(

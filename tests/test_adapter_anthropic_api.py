@@ -249,10 +249,12 @@ def connection(
     base_url: str | None = None,
     credential_ref: str = f"env:{KEY_VAR}",
     guards: Guards | None = None,
+    prompt_cache: str | None = None,
 ) -> Connection:
     return Connection(
         name=name,
         runtime=Runtime.ANTHROPIC_API,
+        prompt_cache=prompt_cache,
         auth_mode=AuthMode.API_KEY,
         credential_ref=CredentialRef.parse(credential_ref),
         model=model,
@@ -551,7 +553,7 @@ def test_conversation_blocks_keep_their_order_their_roles_and_their_markers():
         Message(role=Role.USER, content="three"),
     )
     factory = Factory([text_round("ok")])
-    drive(run_request(messages=messages), factory)
+    drive(run_request(connection(prompt_cache="custom"), messages=messages), factory)
     assert factory.clients[0].calls[0]["messages"] == [
         {
             "role": "user",
@@ -590,7 +592,10 @@ def test_cache_eligibility_reports_the_callers_own_ttl_rather_than_claiming_a_pi
         role=Role.SYSTEM,
         content=[TextBlock("x" * 9000, cache_control=CacheControl(ttl="1h"))],
     )
-    request = run_request(messages=(system, Message(role=Role.USER, content="go")))
+    request = run_request(
+        connection(prompt_cache="custom"),
+        messages=(system, Message(role=Role.USER, content="go")),
+    )
     eligibility = adapter(Factory()).cache_eligibility(request)
     assert eligibility.explicit_breakpoints == 1
     assert eligibility.ttl is None
@@ -637,7 +642,7 @@ def test_the_tool_result_goes_back_as_one_user_message_after_the_assistant_turn(
     factory = Factory(
         [tool_round("call_1", "look_up", {"topic": "x"}), text_round("done")]
     )
-    drive(run_request(tools=(tool,)), factory)
+    drive(run_request(connection(prompt_cache="custom"), tools=(tool,)), factory)
     second = factory.clients[0].calls[1]["messages"]
     assert second[-2] == {
         "role": "assistant",

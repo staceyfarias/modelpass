@@ -51,7 +51,7 @@ from .connections import Connection, CredentialKind, Guards
 from .errors import ConfigError, SubpassError
 from .manage import Credential, binding_from_receipt, receipt_for
 from .preflight import Receipt
-from .prompt_cache import default_cache_note, plan_prompt_cache
+from .prompt_cache import connection_cache_plan, default_cache_note
 from .runtimes import VENDOR_OF, Runtime
 from .store import ConnectionStore
 from .types import AuthMode, Message, Role
@@ -1047,16 +1047,14 @@ def _list(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:
             default_cache = default_cache_note(connection)
             if default_cache is not None:
                 print(f"      cache     {default_cache}", file=out)
-            if connection.prompt_cache is not None:
-                plan = plan_prompt_cache(
-                    connection.prompt_cache,
-                    connection.runtime,
-                    name=connection.name,
-                )
+            plan = connection_cache_plan(connection)
+            if plan is not None:
                 lifetime = plan.ttl or "the vendor's own lifetime"
                 stated = (
                     "prompt caching off"
                     if plan.off
+                    else f"prompt caching left to your markers at {lifetime}"
+                    if plan.custom
                     else f"prompt caching requested at {lifetime}"
                 )
                 print(
@@ -1064,14 +1062,9 @@ def _list(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:
                     f"-- {plan.disposition.value} on {connection.runtime.value}",
                     file=out,
                 )
-            if connection.prompt_cache_placement is not None:
-                placed = ", ".join(connection.prompt_cache_placement) or "nothing"
-                print(f"      cache     modelpass places: {placed}", file=out)
-            if connection.prompt_cache_markers is not None:
-                print(
-                    f"      cache     markers: {connection.prompt_cache_markers}",
-                    file=out,
-                )
+            if connection.prompt_cache_turns is not None:
+                turns = "on" if connection.prompt_cache_turns else "off"
+                print(f"      cache     repeated turns: {turns}", file=out)
             if connection.retry == "never":
                 print(
                     '      retry     never -- every retryable verdict here reads "no"',

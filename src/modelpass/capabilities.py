@@ -1594,7 +1594,7 @@ _API_RUNTIME_NOTES: dict[tuple[Runtime, Capability], str] = {
         "no test anyone can write today observes a *lifetime*: proving a 1h pin "
         "needs two live calls more than five minutes apart still reading cache, "
         "which tests/live/test_anthropic_api_live.py does not do and no fake can. "
-        "Moving it is that drive. Since 2026-11-04 the connection's promptCache "
+        "Moving it is that drive. Since 2026-11-04 the connection's cache "
         "lifetime goes on every breakpoint that does not pin its own "
         "(tests/test_prompt_cache_placement.py), which is still a statement about "
         "the request and not about what the vendor kept"

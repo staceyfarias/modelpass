@@ -122,10 +122,9 @@ from .prompt_cache import (
     EffortCacheContinuity,
     PromptCacheDisposition,
     arrange_prompt_cache,
-    cache_rules,
+    connection_cache_plan,
     default_cache_note,
     effort_cache_continuity,
-    plan_prompt_cache,
     strip_prompt_cache_markers,
 )
 from .reasoning import stated_reasoning
@@ -1248,8 +1247,11 @@ class Bridge:
         """
         if request.cache_notes:
             receipt = replace(receipt, notes=(*receipt.notes, *request.cache_notes))
-        stated = request.connection.prompt_cache
-        if stated is None:
+        try:
+            plan = connection_cache_plan(request.connection)
+        except SubpassError:  # pragma: no cover - defensive: refused at build
+            return receipt
+        if plan is None:
             default = default_cache_note(request.connection)
             if default is None:
                 return receipt
@@ -1258,12 +1260,6 @@ class Bridge:
                 notes=(*receipt.notes, default),
                 prompt_cache_disposition=PromptCacheDisposition.EXPLICIT.value,
             )
-        try:
-            plan = plan_prompt_cache(
-                stated, request.connection.runtime, name=request.connection.name
-            )
-        except SubpassError:  # pragma: no cover - defensive: refused at build
-            return receipt
         return replace(
             receipt,
             notes=(*receipt.notes, plan.note),
@@ -2927,7 +2923,6 @@ class Bridge:
             schema_name=schema_name,
             cache_notes=cache_notes,
             written_messages=messages,
-            cache_turns=cache_rules(connection, self.registry, messages).turns,
         )
 
     def _resolve_failover(

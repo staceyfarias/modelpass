@@ -123,7 +123,7 @@ from ..preflight import (
     api_preflight,
     resolve_credential,
 )
-from ..prompt_cache import plan_prompt_cache
+from ..prompt_cache import connection_cache_plan
 from ..retry import vendor_error_facts
 from ..runtimes import Runtime
 from ..sampling_rules import plan_sampling
@@ -734,13 +734,9 @@ def prompt_cache_retention(request: RunRequest) -> str | None:
     on what a caller considers one workload, and inventing a key from a
     connection name would be modelpass deciding that for everybody.
     """
-    stated = request.connection.prompt_cache
-    if stated is None:
-        return None
     try:
-        return plan_prompt_cache(
-            stated, request.connection.runtime, name=request.connection.name
-        ).ttl
+        plan = connection_cache_plan(request.connection)
+        return plan.ttl if plan else None
     except SubpassError:  # pragma: no cover - defensive: refused at build
         return None
 
