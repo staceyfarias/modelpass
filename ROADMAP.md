@@ -91,3 +91,58 @@ adds about 1,000 tokens (the form and a minimal setup), not the ~60K a bare
 - A RAGauge complete-grading run on a subscription connection reaches a pace
   set by the account's cap, with the overhead per call known rather than
   guessed.
+
+## Keep the vendor SDKs and API libraries current (proposed 2026-11-05)
+
+**Why.** Modelpass depends on packages it does not control, and nothing tells
+anyone when they move. The desktop apps update themselves, but none of these
+packages do. All three API libraries are now a major version behind, so their
+caps in `pyproject.toml` block an upgrade until someone evaluates it.
+
+**Measured (2026-11-05):**
+
+| Package | Runtime | Declared | Installed | Latest |
+| --- | --- | --- | --- | --- |
+| `claude-agent-sdk` | `anthropic-sdk` | `>=0.2.159` | 0.2.178, with CLI 2.1.318 | 0.2.178 |
+| `@openai/codex` (npm, on `PATH`) | `openai-sdk` | not declared | 0.151.0 | 0.166.0 |
+| `openai-codex` (pip) | `openai-sdk` | no version | 0.154.0 | 0.163.0 |
+| `anthropic` | `anthropic-api` | `>=0.40,<1` | 0.97.0 | 2.5.0 |
+| `openai` | `openai-api`, `openai-compatible` | `>=2,<3` | 2.32.0 | 3.46.0 |
+| `google-genai` | `google-api` | `>=1,<2` | 1.73.1 | 2.34.0 |
+
+**What is known about `anthropic`, from reading the packages and Anthropic's
+upgrade guide:**
+
+- 1.x no longer accepts `temperature`, `top_p` or `top_k` as arguments, and moves
+  the HTTP layer from `httpx` to `httpx2`.
+- 2.x sends API version `2026-10-21`, where a request carrying any of those three
+  fields returns a 400 on every model. `Sampling` on `anthropic-api` would have to
+  drop them and say so, which is a change callers can see.
+- Per-message effort is typed only in 2.x. 0.125.0 and 1.0.0 have neither the beta
+  name nor the message type, and 1.17.0 has the beta name only.
+
+**Not yet read:** the `openai` 3.x and `google-genai` 2.x changes. Nothing here
+says those upgrades are safe or unsafe.
+
+**Proposed work:**
+
+1. **Evaluate the subscription SDKs on each release that matters.** Move
+   `claude-agent-sdk` and the Codex CLI forward, and confirm the receipt still names
+   the binary and its version. Check for new controls, such as a `set_effort` on
+   `ClaudeSDKClient`.
+2. **Evaluate each API library across its major version.** One library at a time:
+   read its migration guide, list what breaks, and decide whether to raise the cap.
+   Each is its own change, because each can alter what callers see.
+3. **Re-read what Modelpass recorded from the old versions.** Every
+   `SDK_VERSION_READ` and every dated capability note was read off a specific
+   version, so each one moves with that package or is marked as older than it.
+4. **Make the check repeatable.** One command or script that prints declared,
+   installed and latest for every package above, so this table does not have to be
+   rebuilt by hand.
+
+**Done when:**
+
+- Each package above has a recorded decision: upgraded, or held with the reason.
+- The `pyproject.toml` caps match those decisions, and the suite passes on them.
+- Live tests have been run by the owner on anything upgraded.
+- Installed and latest versions can be listed with one command.

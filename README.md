@@ -128,8 +128,9 @@ drives what you already have.
 
 ### The vendor CLI, on your `PATH`
 
-The Python extras pull in each vendor's SDK, but the SDK drives a **native CLI binary**
-that you install separately. modelpass resolves it from `PATH`.
+The Python extras pull in each vendor's SDK, but the SDK drives a **native CLI binary**.
+Install the CLI as well, because you log in with it. Which copy modelpass then runs
+differs by vendor: see [Updating the subscription SDKs](#updating-the-subscription-sdks).
 
 | Runtime | Install | Login | Credential lands in |
 | --- | --- | --- | --- |
@@ -359,6 +360,33 @@ receipt is the answer and the shell is not.
 > call launches, because modelpass went looking for a config value, is the ambient
 > influence this project refuses. Point it somewhere specific with
 > `options={"codex_bin": ...}` if you mean to.
+
+### Updating the subscription SDKs
+
+**Nothing updates these for you.** A desktop app updates itself, and that has no effect
+on what modelpass runs. The two vendors also work differently, so the upgrade that
+matters is not the same one:
+
+| Runtime | What modelpass runs | Upgrade it with |
+| --- | --- | --- |
+| `anthropic-sdk` | The `claude` binary bundled inside `claude-agent-sdk` | `pip install -U claude-agent-sdk` |
+| `openai-sdk` | The `codex` on your `PATH` | `npm install -g @openai/codex@latest` |
+
+On Anthropic, upgrading the `claude` you type does not change modelpass, because the
+pip package carries its own copy. On Codex it is the other way round: upgrading the
+`PATH` install does change modelpass, and `pip install -U openai-codex` does not, unless
+you point `options={"codex_bin": ...}` at the binary that package ships.
+
+Upgrade when a run fails with a "requires a newer version" error, when you want a model
+or feature your current version lacks, or as a periodic habit. Then confirm what
+modelpass will actually use. This starts no run and spends nothing:
+
+```
+$ modelpass check <connection>
+```
+
+The receipt names the binary and its version. If it still shows the old one, the
+upgrade went to a different install than the one modelpass runs.
 
 ### Keeping modelpass's runs out of your own coding sessions
 
