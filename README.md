@@ -690,8 +690,9 @@ maxInputTokens = 200000              # optional; the model's usable input window
 promptCache   = "auto"               # optional; ask for prompt caching. "auto" (or
                                      # "default") = the vendor's own lifetime, "none"
                                      # = off where it can be turned off, or name a
-                                     # lifetime the runtime accepts. Omit it and nothing
-                                     # is stated -- which is NOT "caching off" (see below).
+                                     # lifetime the runtime accepts. Omit it and the
+                                     # runtime's default stands: on anthropic-api that
+                                     # is caching on (see below).
 promptCachePlacement = ["system", "turns"]  # optional; what modelpass marks by itself
 promptCacheMarkers   = "use"         # optional; "use" | "ignore" your own markers
 
@@ -1679,8 +1680,9 @@ explaining sentence in `receipt.notes`. `modelpass list --verbose` prints the
 same thing.
 
 **Omitting the key states nothing, and that is not "caching off."** Most of
-these runtimes cache whether or not anyone asks; a connection with no
-`promptCache` has simply not said anything about it.
+these runtimes cache whether or not anyone asks. `anthropic-api` would not, so
+modelpass caches there by default, to match them. `promptCache = "none"` is how
+to turn that off.
 
 **The lifetime is the vendor's word, not modelpass's.** `"default"` means the
 vendor's own, and is distinguishable from every explicit value. An explicit one
@@ -1693,15 +1695,22 @@ not by a 400 halfway through a run.
 ### Where the breakpoints go
 
 `promptCache` says how long. On `anthropic-api`, three things say where, and you
-can use any of them or none. Asking for caching is enough on its own:
+can use any of them or none. **You do not have to set anything.** A connection
+with no cache settings caches the system prompt and the repeated turns at
+Anthropic's default lifetime.
 
 ```toml
 [connections.claude-api]
-promptCache = "auto"                  # "none" | "auto" | "5m" | "1h"
+promptCache = "1h"                    # optional: "none" | "auto" | "5m" | "1h"
 ```
 
-That caches the system prompt and the repeated turns at Anthropic's default
-lifetime. To choose, set either of these beside it:
+Caching costs more on a call that writes and less on a call that reads. Anthropic
+charges 1.25 times the input price for a 5-minute write and 2 times for a 1-hour
+write. So a system prompt that is long enough to cache, sent once and never
+again within the lifetime, costs more than it would uncached. For a connection
+that only makes one-off calls, set `promptCache = "none"`.
+
+To choose the placement, set either of these:
 
 ```toml
 promptCachePlacement = ["system", "turns"]   # what modelpass marks by itself
@@ -1711,10 +1720,11 @@ promptCacheMarkers   = "use"                 # or "ignore"
 | Setting | What it does on `anthropic-api` |
 | --- | --- |
 | `promptCache = "none"` | Sends no `cache_control`, and removes any marker or breakpoint on the call |
-| `promptCache = "auto"` | Caching on at the vendor's lifetime. `"default"` means the same |
+| `promptCache` not set, or `"auto"` | Caching on at the vendor's lifetime. `"default"` means the same as `"auto"` |
 | `promptCache = "5m"` or `"1h"` | Caching on, with that lifetime on every breakpoint that does not pin its own |
 | `promptCachePlacement` has `"system"` | Marks the end of the system prompt, unless you marked it yourself |
 | `promptCachePlacement` has `"turns"` | Marks the message before the current turn, so a one-shot call pays no cache write for its question |
+| `promptCachePlacement` not set | Marks both, unless the call carries your own markers, which replace them |
 | `promptCachePlacement = []` | Marks nothing by itself; only your markers count |
 | `promptCacheMarkers = "ignore"` | Removes your markers and `cache_control`, so only the placement decides |
 
@@ -1728,7 +1738,12 @@ system_prompt = f"{instructions}{PROMPT_CACHE_MARKER}{todays_context}"
 ```
 
 On `anthropic-api` the text before the marker becomes a cached prefix. It works
-with no cache settings at all, in a system prompt or a message. On every other
+with no cache settings at all, in a system prompt or a message. **Your markers
+replace the automatic placement for that call**, at the same lifetime, and the
+receipt says so. A `cache_control` you put on a block counts the same way. To keep
+the automatic breakpoints beside your own, state them, for example
+`promptCachePlacement = ["turns"]`. Only `promptCache = "none"` or
+`promptCacheMarkers = "ignore"` stops your markers from counting. On every other
 runtime the marker is removed and the rest of the prompt is sent as written, so
 you can change vendor without editing your prompts. The receipt says how many
 were removed. The marker is the same string GoTo Agents renders its

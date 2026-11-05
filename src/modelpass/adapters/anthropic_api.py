@@ -833,9 +833,9 @@ class AnthropicAPIAdapter(Adapter):
         system = system_param(request)
         if system is not None:
             params["system"] = system
-        rules = cache_rules(request.connection)
-        if rules.turns:
-            params["messages"] = turn_breakpoint(messages, system, rules.ttl)
+        if request.cache_turns:
+            ttl = cache_rules(request.connection).ttl
+            params["messages"] = turn_breakpoint(messages, system, ttl)
         if request.tools:
             params["tools"] = tool_params(request.tools)
         config = output_config(request)

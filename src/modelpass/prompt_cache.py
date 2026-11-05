@@ -85,6 +85,7 @@ __all__ = [
     "arrange_prompt_cache",
     "cache_rules",
     "check_cache_placement",
+    "default_cache_note",
     "effort_cache_continuity",
     "observed_effort_continuity",
     "plan_prompt_cache",
@@ -95,8 +96,9 @@ __all__ = [
 #: named value rather than an empty string, a ``True`` or a ``0``, because it has
 #: to be distinguishable from *both* an explicit lifetime *and* from the key
 #: being absent, and those are three states rather than two. Absent means nobody
-#: has said anything and nothing changes; ``"default"`` means somebody asked for
-#: caching and declined to name a lifetime; ``"1h"`` means somebody named one.
+#: has said anything, so the runtime's default stands, which on ``anthropic-api``
+#: is caching on (:func:`default_cache_note`); ``"default"`` means somebody asked
+#: for caching and declined to name a lifetime; ``"1h"`` means somebody named one.
 #: The same unset-versus-zero discipline ``maxInputTokens`` uses, one type along.
 VENDOR_DEFAULT = "default"
 
@@ -352,6 +354,9 @@ class CacheRules:
     turns: bool = False
     #: Honour the caller's markers and ``cache_control``. ``False`` removes them.
     use_markers: bool = True
+    #: The call carries the caller's own breakpoints and no placement was stated,
+    #: so modelpass marks nothing by itself on this call.
+    gave_way: bool = False
 
     @property
     def limit(self) -> int:
@@ -359,22 +364,64 @@ class CacheRules:
         return MAX_CACHE_BREAKPOINTS - (1 if self.turns else 0)
 
 
-def cache_rules(connection: Any, registry: CapabilityRegistry | None = None) -> CacheRules:
-    """Read a connection's three cache settings. Never raises: they were checked."""
+def cache_rules(
+    connection: Any,
+    registry: CapabilityRegistry | None = None,
+    written: tuple[Message, ...] = (),
+) -> CacheRules:
+    """Read a connection's three cache settings. Never raises: they were checked.
+
+    Caching is on unless the connection says ``"none"``. A placement nobody stated
+    means both, and gives way to the caller's own breakpoints when ``written``, the
+    call's messages as the caller wrote them, carries any.
+    """
     registry = registry or DEFAULT_REGISTRY
     takes = registry.supports(connection.runtime, Capability.CACHE_BREAKPOINTS)
     stated = connection.prompt_cache
     off = stated == NO_CACHE
+    use_markers = not off and connection.prompt_cache_markers != "ignore"
     placement = connection.prompt_cache_placement
+    gave_way = False
     if placement is None:
-        placement = CACHE_PLACEMENTS if stated is not None and not off else ()
+        gave_way = takes and use_markers and _caller_marked(written)
+        placement = CACHE_PLACEMENTS if takes and not off and not gave_way else ()
     return CacheRules(
         takes_breakpoints=takes,
         off=off,
         ttl=None if stated in (None, NO_CACHE, AUTO, VENDOR_DEFAULT) else stated,
         system="system" in placement,
         turns="turns" in placement,
-        use_markers=not off and connection.prompt_cache_markers != "ignore",
+        use_markers=use_markers,
+        gave_way=gave_way,
+    )
+
+
+def default_cache_note(
+    connection: Any, registry: CapabilityRegistry | None = None
+) -> str | None:
+    """The sentence for a connection caching by default, or ``None``.
+
+    ``None`` where ``promptCache`` is stated, because :func:`plan_prompt_cache`
+    has the sentence then, and where the runtime takes no breakpoints, because
+    modelpass does nothing there. Default caching changes what a call costs, so it
+    is said rather than left to be found on an invoice.
+    """
+    rules = cache_rules(connection, registry)
+    if connection.prompt_cache is not None or not rules.takes_breakpoints:
+        return None
+    marked = " and ".join(
+        label
+        for label, on in (
+            ("the system prompt", rules.system),
+            ("the repeated turns", rules.turns),
+        )
+        if on
+    )
+    return (
+        f"prompt caching on by default at the vendor's own cache lifetime: modelpass "
+        f"marks {marked or 'only what you marked'} on {connection.runtime.value}, and "
+        f"your own markers replace that unless promptCachePlacement is set. "
+        f"promptCache {NO_CACHE!r} turns it off"
     )
 
 
@@ -431,6 +478,14 @@ def _marker_count(message: Message) -> int:
         for block in message.content
         if isinstance(block, TextBlock)
     )
+
+
+def _caller_marked(messages: tuple[Message, ...]) -> bool:
+    """Whether the caller's own markers or ``cache_control`` leave a breakpoint.
+
+    A marker with no text before it marks nothing, so it does not count.
+    """
+    return any(_expand_markers(m, split=True).cache_breakpoints for m in messages)
 
 
 def _split_block(block: TextBlock) -> list[TextBlock]:
@@ -525,14 +580,14 @@ def arrange_prompt_cache(
 ) -> tuple[tuple[Message, ...], tuple[str, ...]]:
     """Resolve a call's markers and placement. Returns the messages and any notes.
 
-    The one place a marker is read, so no adapter ever sees one. A connection
-    that stated nothing and a prompt with no marker come back untouched.
+    The one place a marker is read, so no adapter ever sees one. ``messages`` are
+    the caller's, as written.
 
     The turn's breakpoint is not placed here. It moves every round of a tool
     loop, so :mod:`modelpass.adapters.anthropic_api` places it at send time, and
     :attr:`CacheRules.limit` keeps a slot free for it.
     """
-    rules = cache_rules(connection, registry)
+    rules = cache_rules(connection, registry, messages)
     runtime = connection.runtime.value
     notes: list[str] = []
 
@@ -566,6 +621,11 @@ def arrange_prompt_cache(
                 f"{markers + breakpoints} prompt cache marker(s) and breakpoint(s) "
                 f"removed: {why}"
             )
+    if rules.gave_way:
+        notes.append(
+            "modelpass placed no cache breakpoints of its own: this call carries "
+            "yours. Set promptCachePlacement to have both"
+        )
     if rules.system:
         messages = _mark_system(messages)
 

@@ -136,6 +136,8 @@
         {% if c.prompt_cache %}
           requested: <code>{{ c.prompt_cache }}</code>
           <span class="muted small">&mdash; {{ c.prompt_cache_note }}</span>
+        {% elif c.prompt_cache_note %}
+          <span class="muted">{{ c.prompt_cache_note }}</span>
         {% else %}
           <span class="muted">nothing stated &mdash; no <code>promptCache</code> is
           set. That is not &ldquo;caching off&rdquo;: most runtimes here cache

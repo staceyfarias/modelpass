@@ -8,7 +8,9 @@
    removed, so a prompt can move between vendors unedited.
 2. **``promptCachePlacement`` places breakpoints nobody wrote.** ``"system"``
    marks the end of the system prompt and ``"turns"`` the end of the re-sent
-   turns. Asking for caching places both, so nobody has to think about it.
+   turns. A connection on ``anthropic-api`` gets both unless it says otherwise,
+   so nobody has to think about it, and the caller's own breakpoints replace
+   them.
 3. **``promptCacheMarkers = "ignore"`` lets the placement alone decide.**
 4. **``promptCache = "none"`` turns caching off** where it can be turned off.
 5. **The lifetime reaches the wire.** It goes on every breakpoint that does not
@@ -89,6 +91,7 @@ def params(connection: Connection, *messages: Message) -> dict:
         messages=arranged,
         plan=plan_launch(connection, ENV),
         model="claude-opus-5-5",
+        cache_turns=cache_rules(connection, written=messages).turns,
     )
     from modelpass.adapters.anthropic_api import conversation_param
 
@@ -145,8 +148,16 @@ def test_a_trailing_marker_caches_the_whole_prompt():
 
 
 def test_a_leading_marker_has_nothing_to_mark():
-    wire = params(claude(), system(f"{M}text"), user("hi"))
+    connection = claude(prompt_cache_placement=[])
+    wire = params(connection, system(f"{M}text"), user("hi"))
     assert wire["system"] == [{"type": "text", "text": "text"}]
+
+
+def test_a_marker_that_marks_nothing_leaves_the_default_placement_alone():
+    wire = params(claude(), system(f"{M}text"), user("hi"))
+    assert wire["system"] == [
+        {"type": "text", "text": "text", "cache_control": {"type": "ephemeral"}}
+    ]
 
 
 def test_a_block_keeps_its_own_breakpoint_when_a_marker_splits_it():
@@ -154,13 +165,6 @@ def test_a_block_keeps_its_own_breakpoint_when_a_marker_splits_it():
     wire = params(claude(), system((block,)), user("hi"))
     assert wire["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert wire["system"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
-
-
-def test_a_prompt_with_no_marker_and_no_settings_comes_back_untouched():
-    messages = (system("instructions"), user("hi"))
-    arranged, notes = arrange_prompt_cache(messages, claude())
-    assert arranged == messages
-    assert notes == ()
 
 
 @pytest.mark.parametrize("connection", [gpt(), subscription()])
@@ -215,10 +219,94 @@ def test_asking_for_caching_places_the_system_and_turn_breakpoints():
     assert (rules.system, rules.turns) == (True, True)
 
 
-def test_a_connection_that_states_nothing_places_nothing():
+def test_a_connection_that_states_nothing_caches_by_default():
     rules = cache_rules(claude())
+    assert (rules.system, rules.turns) == (True, True)
+    wire = params(claude(), system("s"), user("a"), assistant("b"), user("c"))
+    assert controls(wire) == [{"type": "ephemeral"}] * 2
+
+
+def test_a_default_one_shot_with_no_system_prompt_sends_no_breakpoint():
+    assert controls(params(claude(), user("only this"))) == []
+
+
+@pytest.mark.parametrize("build", [gpt, subscription])
+def test_the_default_applies_only_where_breakpoints_travel(build):
+    rules = cache_rules(build())
     assert (rules.system, rules.turns) == (False, False)
-    assert controls(params(claude(), system("s"), user("a"), assistant("b"), user("c"))) == []
+    arranged, notes = arrange_prompt_cache((system("s"), user("hi")), build())
+    assert arranged[0].cache_breakpoints == 0
+    assert notes == ()
+
+
+def test_the_bridge_gives_a_default_call_both_breakpoints():
+    request, _ = run_through_bridge(
+        claude(),
+        message="c",
+        system_prompt="s",
+        history=[user("a"), assistant("b")],
+    )
+    assert request.cache_breakpoints == 1
+    assert request.cache_turns is True
+
+
+# --- your own breakpoints replace the automatic ones --------------------------------
+
+
+def test_a_marker_replaces_the_automatic_placement():
+    wire = params(claude(), system(f"stable{M}volatile"), user("a"), assistant("b"), user("c"))
+    assert controls(wire) == [{"type": "ephemeral"}]
+    assert "cache_control" not in wire["messages"][1]["content"][-1]
+
+
+def test_a_marker_in_a_message_stops_the_system_breakpoint_too():
+    wire = params(claude(), system("instructions"), user(f"shared{M}question"))
+    assert wire["system"] == [{"type": "text", "text": "instructions"}]
+    assert len(controls(wire)) == 1
+
+
+def test_a_callers_cache_control_replaces_the_automatic_placement():
+    block = TextBlock("text", cache_control=CacheControl())
+    wire = params(claude(), system("s"), user((block,)), assistant("b"), user("c"))
+    assert controls(wire) == [{"type": "ephemeral"}]
+
+
+def test_a_marker_replaces_the_placement_when_a_lifetime_is_stated():
+    connection = claude(prompt_cache="1h")
+    wire = params(connection, system(f"a{M}b"), user("c"), assistant("d"), user("e"))
+    assert controls(wire) == [{"type": "ephemeral", "ttl": "1h"}]
+
+
+def test_a_stated_placement_keeps_its_breakpoints_beside_a_marker():
+    connection = claude(prompt_cache_placement=["turns"])
+    wire = params(connection, system(f"a{M}b"), user("c"), assistant("d"), user("e"))
+    assert len(controls(wire)) == 2
+
+
+def test_the_receipt_says_the_markers_replaced_the_placement():
+    _, notes = arrange_prompt_cache((system(f"a{M}b"), user("hi")), claude())
+    assert notes == (
+        "modelpass placed no cache breakpoints of its own: this call carries yours. "
+        "Set promptCachePlacement to have both",
+    )
+
+
+def test_a_call_with_no_markers_of_its_own_gets_no_such_note():
+    _, notes = arrange_prompt_cache((system("s"), user("hi")), claude())
+    assert notes == ()
+
+
+def test_the_bridge_leaves_the_turn_alone_when_a_marker_replaces_it():
+    request, _ = run_through_bridge(
+        claude(),
+        message="c",
+        system_prompt=f"a{M}b",
+        history=[user("a"), assistant("b")],
+    )
+    assert request.cache_turns is False
+
+
+# --- where the breakpoints go, one at a time ----------------------------------------
 
 
 def test_system_placement_marks_the_end_of_the_system_prompt():
@@ -412,7 +500,7 @@ def test_a_call_never_passes_the_vendors_limit_of_four():
 
 def test_a_turn_keeps_a_slot_when_there_are_too_many_markers():
     prompt = M.join("abcdefg")
-    connection = claude(prompt_cache="auto")
+    connection = claude(prompt_cache_placement=["turns"])
     messages = (system(prompt), user("a"), assistant("b"), user("c"))
     arranged, notes = arrange_prompt_cache(messages, connection)
     assert arranged[0].cache_breakpoints == 3
@@ -422,9 +510,8 @@ def test_a_turn_keeps_a_slot_when_there_are_too_many_markers():
 
 def test_breakpoints_a_caller_sent_with_no_settings_are_left_for_the_vendor_to_judge():
     blocks = tuple(TextBlock(c, cache_control=CacheControl()) for c in "abcde")
-    arranged, notes = arrange_prompt_cache((user(blocks),), claude())
+    arranged, _ = arrange_prompt_cache((user(blocks),), claude())
     assert arranged[0].cache_breakpoints == 5
-    assert notes == ()
 
 
 # --- 6. the settings themselves ----------------------------------------------------

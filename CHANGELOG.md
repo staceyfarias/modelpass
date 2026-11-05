@@ -24,9 +24,12 @@ work landed.
   "ignore"` removes the caller's own. `PROMPT_CACHE_MARKER` in a prompt ends a
   cacheable prefix on `anthropic-api` and is removed on every other runtime.
   `promptCache` also takes `"auto"`, the same as `"default"`, and `"none"`, which
-  is refused where caching cannot be stopped. **Changed behaviour:** a connection
-  with `promptCache` set on `anthropic-api` now gets both placements unless it
-  sets `promptCachePlacement`. Before, it placed nothing. Not yet run against the
+  is refused where caching cannot be stopped. **Changed behaviour:** every
+  connection on `anthropic-api` now caches the system prompt and the repeated
+  turns at the vendor's lifetime, with or without `promptCache`, unless it says
+  `"none"`. Before, modelpass placed nothing. This changes what calls cost, and
+  the receipt says so. A call's own markers or `cache_control` replace both
+  placements unless `promptCachePlacement` is stated. Not yet run against the
   vendor.
 
 - **Which file types a model reads is now the vendor's to say** (2026-11-04).

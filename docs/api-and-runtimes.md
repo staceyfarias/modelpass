@@ -842,6 +842,7 @@ Three states, and they are all distinguishable:
 | nothing | `None` | — | **nothing stated.** Nothing about the connection's behaviour changes. This is not "caching off" |
 | `promptCache = "default"` or `"auto"` | as written | `None` | caching asked for, **lifetime unspecified** — the vendor's own applies |
 | `promptCache = "none"` | `"none"` | `None` | caching off. Refused on a runtime that caches on its own (§1.9a) |
+| key absent | `None` | no plan | nothing stated, so the runtime's default stands. On `anthropic-api` that is caching on (§1.9a) |
 | `promptCache = "1h"` | `"1h"` | `"1h"` | caching asked for at a named lifetime |
 
 A consumer must read `is None`, not falsiness, for the same reason
@@ -883,11 +884,14 @@ that for everybody.
 
 Notes from placing and removing breakpoints (§1.9a) go in `Receipt.notes`.
 `Receipt.prompt_cache_requested` and `Receipt.prompt_cache_disposition`, both
-`None` on every connection that stated nothing, plus one sentence in
-`Receipt.notes`. `modelpass list --verbose` prints the request and its
+`None` on a connection that stated nothing, plus one sentence in
+`Receipt.notes`. On `anthropic-api` a connection that stated nothing still caches,
+so the request stays `None`, the disposition reads `"explicit"`, and the sentence
+says it is on by default. `modelpass list --verbose` prints the request and its
 disposition; the bench's accounts page prints the sentence, and says *nothing
-stated* rather than *off* for a connection that asked for nothing. An additive
-config key under the store's 0.1 compatibility policy.
+stated* rather than *off* for a connection that asked for nothing on a runtime
+where modelpass does nothing. An additive config key under the store's 0.1
+compatibility policy.
 
 ---
 
@@ -933,10 +937,16 @@ promptCacheMarkers   = "use"                # optional; "use" | "ignore"
 Read back as `Connection.prompt_cache_placement` (`tuple[str, ...] | None`) and
 `Connection.prompt_cache_markers` (`str | None`).
 
-**`promptCachePlacement`** names what modelpass marks by itself. `None` means both
-when `promptCache` asks for caching and neither otherwise, so a connection that
-states nothing behaves as it did. `[]` means only the caller's own. Stated without
-`promptCache`, it caches at the vendor's lifetime.
+**Caching is on by default where breakpoints travel.** A connection on
+`anthropic-api` with no `promptCache` caches at the vendor's lifetime, as if it
+said `"auto"`. Only `"none"` turns it off.
+
+**`promptCachePlacement`** names what modelpass marks by itself. `None` means both,
+unless the call carries the caller's own breakpoints: a `PROMPT_CACHE_MARKER` that
+marks some text, or a `cache_control` on a block. Those replace both on that call,
+whatever `promptCache` says, the lifetime still applies, and `Receipt.notes` says
+so. `[]` means only the caller's own. A stated list keeps its breakpoints beside
+the caller's.
 
 * `"system"` puts a breakpoint on the last system text, unless a system block
   already carries one.
@@ -963,7 +973,7 @@ arranges those for itself rather than inheriting another runtime's result.
 
 | Rule | What modelpass does |
 | --- | --- |
-| At most four breakpoints | The first ones are kept, three when `"turns"` is on, and `Receipt.notes` counts the rest. A call with no settings and no marker is left as it was sent |
+| At most four breakpoints | The first ones are kept, three when `"turns"` is on, and `Receipt.notes` counts the rest. `cache_control` blocks on a call with no marker, no lifetime and no stated placement are left as they were sent |
 | A longer lifetime may not follow a shorter one | A caller's pin stays on its block and caps every unpinned breakpoint after it |
 | `"none"` beside a placement or `"use"` | `InvalidConnection`, because the two contradict |
 
@@ -971,6 +981,10 @@ arranges those for itself rather than inheriting another runtime's result.
 A connection can move to another vendor with them set, and a note says they had no
 effect. `promptCache = "none"` is checked: it is refused where
 `cache_automatic` is `supported`, because caching there cannot be stopped.
+
+`RunRequest.cache_turns` carries the decision about the `"turns"` breakpoint to the
+adapter, because only the bridge sees the messages as written. It is `False` on a
+`RunRequest` built by hand.
 
 `receipt.cache_breakpoints_requested` counts what the arranged call carries, which
 includes a `"system"` breakpoint and excludes the `"turns"` one. `Receipt.cache.ttl`

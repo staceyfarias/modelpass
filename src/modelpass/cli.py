@@ -51,7 +51,7 @@ from .connections import Connection, CredentialKind, Guards
 from .errors import ConfigError, SubpassError
 from .manage import Credential, binding_from_receipt, receipt_for
 from .preflight import Receipt
-from .prompt_cache import plan_prompt_cache
+from .prompt_cache import default_cache_note, plan_prompt_cache
 from .runtimes import VENDOR_OF, Runtime
 from .store import ConnectionStore
 from .types import AuthMode, Message, Role
@@ -1040,9 +1040,13 @@ def _list(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:
                 else f"{connection.max_input_tokens:,} input tokens (as configured)"
             )
             print(f"      window    {window}", file=out)
-            # Only when the connection stated something. Unlike the window
-            # above, silence here is not a hazard: a connection that asked for
-            # nothing is not at risk of misreading an answer it never got.
+            # Only when the connection stated something, or when modelpass
+            # caches by default. Unlike the window above, silence is otherwise no
+            # hazard: a connection that asked for nothing is not at risk of
+            # misreading an answer it never got.
+            default_cache = default_cache_note(connection)
+            if default_cache is not None:
+                print(f"      cache     {default_cache}", file=out)
             if connection.prompt_cache is not None:
                 plan = plan_prompt_cache(
                     connection.prompt_cache,

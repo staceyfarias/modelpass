@@ -379,8 +379,8 @@ class TextBlock:
     batch scraping tool lost the same thing.
 
     ``cache_control`` on a block means "everything up to and including this
-    block is one cacheable prefix". modelpass adds or removes one only when the
-    connection or a prompt marker says to
+    block is one cacheable prefix". modelpass adds or removes one only by the
+    connection's cache rules or a prompt marker
     (:func:`~modelpass.prompt_cache.arrange_prompt_cache`), and never moves one;
     whether a runtime *honours* it is
     :attr:`~modelpass.capabilities.Capability.CACHE_BREAKPOINTS`, and a runtime

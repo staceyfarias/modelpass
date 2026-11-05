@@ -44,7 +44,7 @@ from ..errors import PreflightFailed, SubpassError
 from ..manage import ConnectionPlan, Credential
 from ..models import ModelChoice, models_for
 from ..preflight import SCRUB_RULES, Receipt, env_names_to_scrub
-from ..prompt_cache import plan_prompt_cache
+from ..prompt_cache import default_cache_note, plan_prompt_cache
 from ..retry import classify_terminal
 from ..runlog import run_log_for
 from ..runtimes import Runtime
@@ -165,7 +165,7 @@ def _prompt_cache_note(connection: Connection) -> str | None:
     rather than to be the second place that refuses one.
     """
     if connection.prompt_cache is None:
-        return None
+        return default_cache_note(connection)
     try:
         return plan_prompt_cache(
             connection.prompt_cache, connection.runtime, name=connection.name

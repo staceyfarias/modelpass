@@ -1086,8 +1086,9 @@ class Receipt:
     documents: int = 0
     document_bytes: int = 0
     #: What the connection's ``promptCache`` asked for, and how this runtime
-    #: meets it (2026-09-21). Both ``None`` on every connection that stated
-    #: nothing, which is every connection written before the key existed.
+    #: meets it (2026-09-21). Both ``None`` on a connection that stated nothing,
+    #: except on ``anthropic-api``, where modelpass caches by default: there the
+    #: request stays ``None`` and the disposition reads ``"explicit"``.
     #:
     #: Two fields rather than one, because the interesting thing is not that
     #: caching was requested but **which of two very different things that

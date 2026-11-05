@@ -727,9 +727,9 @@ class Connection:
     max_input_tokens: int | None = None
     #: Whether this connection asks for prompt caching, and at what lifetime
     #: (config key ``promptCache``, 2026-09-21). ``None`` -- the key absent --
-    #: means **nothing is stated**, which is what every connection written
-    #: before this key existed means and what nearly all of them will keep
-    #: meaning. Nothing about such a connection's behaviour moves.
+    #: means **nothing is stated**, so the runtime's default stands. On
+    #: ``anthropic-api`` that default is caching on at the vendor's lifetime
+    #: (2026-11-04), and ``"none"`` is how to turn it off.
     #:
     #: ``"default"`` asks for caching at whatever lifetime the vendor uses.
     #: Anything else names a lifetime, **in the vendor's own spelling**, and is
@@ -778,8 +778,10 @@ class Connection:
     reasoning: str | None = None
     #: Where modelpass places its own breakpoints (config key
     #: ``promptCachePlacement``, 2026-11-04): a list drawn from ``"system"`` and
-    #: ``"turns"``. ``None`` means both when ``promptCache`` asks for caching and
-    #: neither otherwise; an empty list means only the caller's own.
+    #: ``"turns"``. ``None`` means both, unless ``promptCache`` is ``"none"`` or
+    #: the call carries the caller's own breakpoints, which then replace them. An
+    #: empty list means only the caller's own, and a stated list keeps its
+    #: breakpoints beside the caller's.
     prompt_cache_placement: tuple[str, ...] | None = None
     #: Whether the caller's markers and ``cache_control`` count (config key
     #: ``promptCacheMarkers``, 2026-11-04): ``"use"``, the default, or

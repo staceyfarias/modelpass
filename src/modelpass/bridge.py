@@ -120,7 +120,10 @@ from .preflight import PreflightPlan, Receipt, plan_launch
 from .prompt_cache import (
     PROMPT_CACHE_MARKER,
     EffortCacheContinuity,
+    PromptCacheDisposition,
     arrange_prompt_cache,
+    cache_rules,
+    default_cache_note,
     effort_cache_continuity,
     plan_prompt_cache,
     strip_prompt_cache_markers,
@@ -1232,11 +1235,13 @@ class Bridge:
         the answer comes from the *table*, so an adapter that has never heard of
         the key still produces a receipt that reports it.
 
-        Silent on every connection that stated nothing, which is the difference
-        from the sampling step: a required field nobody set is a fact about a
-        run, but a caching request nobody made is not -- and a line reading
-        "prompt caching: not requested" on every receipt ever printed would be
-        noise standing where a disclosure should be.
+        Silent on a connection that stated nothing, which is the difference from
+        the sampling step: a required field nobody set is a fact about a run, but
+        a caching request nobody made is not -- and a line reading "prompt
+        caching: not requested" on every receipt ever printed would be noise
+        standing where a disclosure should be. The exception is a runtime where
+        modelpass itself caches by default, because that changes what a call
+        costs. ``prompt_cache_requested`` stays ``None`` there: nobody asked.
 
         Cannot refuse. The refusal happened when the connection was built; by
         the time a request exists, the plan is known to be meetable.
@@ -1245,7 +1250,14 @@ class Bridge:
             receipt = replace(receipt, notes=(*receipt.notes, *request.cache_notes))
         stated = request.connection.prompt_cache
         if stated is None:
-            return receipt
+            default = default_cache_note(request.connection)
+            if default is None:
+                return receipt
+            return replace(
+                receipt,
+                notes=(*receipt.notes, default),
+                prompt_cache_disposition=PromptCacheDisposition.EXPLICIT.value,
+            )
         try:
             plan = plan_prompt_cache(
                 stated, request.connection.runtime, name=request.connection.name
@@ -2915,6 +2927,7 @@ class Bridge:
             schema_name=schema_name,
             cache_notes=cache_notes,
             written_messages=messages,
+            cache_turns=cache_rules(connection, self.registry, messages).turns,
         )
 
     def _resolve_failover(

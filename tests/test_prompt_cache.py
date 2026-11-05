@@ -43,6 +43,7 @@ from modelpass.prompt_cache import (
     PROMPT_CACHE_TTLS,
     VENDOR_DEFAULT,
     PromptCacheDisposition,
+    default_cache_note,
     plan_prompt_cache,
 )
 from modelpass.runtimes import Runtime
@@ -166,10 +167,19 @@ def test_a_connection_that_says_nothing_writes_no_key():
 
 
 def test_a_connection_that_says_nothing_puts_nothing_on_the_receipt(store):
-    store.add(api(name="plain"))
+    store.add(openai(name="plain"))
     receipt = _bridge(store).preflight("plain")
     assert receipt.prompt_cache_requested is None
     assert receipt.prompt_cache_disposition is None
+
+
+def test_caching_by_default_is_reported_and_is_not_reported_as_a_request(store):
+    """Nobody asked, so ``requested`` stays empty. It still changes the bill."""
+    store.add(api(name="plain"))
+    receipt = _bridge(store).preflight("plain")
+    assert receipt.prompt_cache_requested is None
+    assert receipt.prompt_cache_disposition == "explicit"
+    assert any("prompt caching on by default" in note for note in receipt.notes)
 
 
 def test_a_connection_that_says_nothing_adds_no_note(store):
@@ -178,9 +188,34 @@ def test_a_connection_that_says_nothing_adds_no_note(store):
     A disclosure printed on every receipt ever produced is noise standing where
     a disclosure should be.
     """
-    store.add(api(name="plain"))
+    store.add(openai(name="plain"))
     receipt = _bridge(store).preflight("plain")
     assert not any("prompt caching" in note for note in receipt.notes)
+
+
+def test_the_default_note_names_what_is_marked_and_how_to_stop_it():
+    note = default_cache_note(api())
+    assert "the system prompt and the repeated turns" in note
+    assert "promptCache 'none' turns it off" in note
+
+
+def test_the_default_note_follows_a_stated_placement():
+    assert "marks the repeated turns on" in default_cache_note(
+        api(prompt_cache_placement=["turns"])
+    )
+    assert "marks only what you marked" in default_cache_note(
+        api(prompt_cache_placement=[])
+    )
+
+
+def test_no_default_note_once_promptcache_is_stated():
+    assert default_cache_note(api(prompt_cache="none")) is None
+    assert default_cache_note(api(prompt_cache="1h")) is None
+
+
+def test_no_default_note_where_modelpass_does_nothing():
+    assert default_cache_note(openai()) is None
+    assert default_cache_note(subscription()) is None
 
 
 # --- 2. outcome one: the runtime takes an instruction -----------------------------
@@ -729,10 +764,17 @@ def test_the_bench_detail_shows_the_request(bench):
 
 def test_the_bench_detail_says_nothing_stated_rather_than_off(bench):
     """A page reading "caching: off" would be wrong on most of these runtimes."""
-    _, client, _ = bench([api(name="plain")])
+    _, client, _ = bench([openai(name="plain")])
     body = client.get("/").get_data(as_text=True)
     assert "nothing stated" in body
     assert "promptCache" in body
+
+
+def test_the_bench_detail_says_when_caching_is_on_by_default(bench):
+    _, client, _ = bench([api(name="plain")])
+    body = client.get("/").get_data(as_text=True)
+    assert "prompt caching on by default" in body
+    assert "nothing stated" not in body
 
 
 def test_a_bench_edit_does_not_withdraw_the_request(bench):
