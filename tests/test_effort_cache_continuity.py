@@ -32,17 +32,48 @@ from modelpass.types import TokenUsage
 
 @pytest.mark.parametrize(
     "model",
-    ["claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5"],
+    [
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ],
 )
-def test_the_three_documented_anthropic_models_are_supported(model):
+def test_the_documented_anthropic_models_are_supported(model):
     """The vendor's sentence, and nothing wider than it.
 
-    "On Claude Fable 5.1, Claude Mythos 5.1, and Claude Opus 5, use a
-    per-message effort change, which keeps the prompt cache."
+    "On Claude Fable 5.1, Claude Mythos 5.1, Claude Opus 5.5, Claude Opus 5, Claude
+    Sonnet 5.5, and Claude Haiku 5.5, use a per-message effort change, which keeps
+    the prompt cache."
     """
     verdict = effort_cache_continuity(Runtime.ANTHROPIC_API, model)
     assert verdict.capability is EffortCacheContinuity.SUPPORTED
     assert verdict.mechanism is ContinuityMechanism.ANTHROPIC_PER_MESSAGE_EFFORT
+    assert verdict.reachable is False
+
+
+@pytest.mark.parametrize(
+    ("model", "limit"),
+    [("claude-sonnet-5-5", "between_tools"), ("claude-haiku-5-5", "thinking disabled")],
+)
+def test_a_models_documented_limit_is_on_its_detail(model, limit):
+    assert limit in effort_cache_continuity(Runtime.ANTHROPIC_API, model).detail
+
+
+def test_a_model_with_no_documented_limit_claims_none():
+    detail = effort_cache_continuity(Runtime.ANTHROPIC_API, "claude-opus-5-5").detail
+    assert "between_tools" not in detail
+    assert "thinking disabled" not in detail
+
+
+def test_a_point_release_of_a_listed_model_is_not_the_listed_model():
+    """``claude-opus-5-5`` is on the list on its own evidence, not through 5."""
+    assert (
+        effort_cache_continuity(Runtime.ANTHROPIC_API, "claude-sonnet-5-6").capability
+        is EffortCacheContinuity.UNKNOWN
+    )
 
 
 def test_a_model_the_vendor_names_as_lacking_it_is_unsupported():

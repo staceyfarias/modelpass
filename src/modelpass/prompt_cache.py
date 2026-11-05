@@ -801,17 +801,30 @@ _UNSUPPORTED = EffortCacheContinuity.UNSUPPORTED
 _UNKNOWN = EffortCacheContinuity.UNKNOWN
 
 #: The Anthropic models whose documentation states that a per-message effort
-#: change keeps the cache, read off the vendor's own effort page on 2026-09-22:
-#: *"Claude Fable 5.1 also supports changing effort mid-conversation with a
-#: per-message ``output_config``, which preserves the prompt cache"*, the same
-#: sentence for Claude Opus 5, and *"On Claude Fable 5.1, Claude Mythos 5.1, and
-#: Claude Opus 5, use a per-message effort change, which keeps the prompt
-#: cache."*
+#: change keeps the cache, read off the vendor's own effort page on 2026-11-05:
+#: *"On Claude Fable 5.1, Claude Mythos 5.1, Claude Opus 5.5, Claude Opus 5, Claude
+#: Sonnet 5.5, and Claude Haiku 5.5, use a per-message effort change, which keeps
+#: the prompt cache."* First read 2026-09-22, when the sentence named three.
 _ANTHROPIC_PER_MESSAGE_MODELS: tuple[str, ...] = (
     "claude-fable-5-1",
     "claude-mythos-5-1",
+    "claude-opus-5-5",
     "claude-opus-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
 )
+
+#: Where the same page limits one of those models. A level that differs from the
+#: one in effect returns a 400 in these cases, read 2026-11-05.
+_ANTHROPIC_PER_MESSAGE_LIMITS: dict[str, str] = {
+    "claude-sonnet-5-5": (
+        "; not with between_tools, where a differing per-message effort returns 400"
+    ),
+    "claude-haiku-5-5": (
+        "; not with thinking disabled, where a differing per-message effort returns "
+        "400"
+    ),
+}
 
 #: Per ``(runtime, model family)``, what is established. The family token is
 #: matched the way :mod:`modelpass.sampling_rules` matches one -- longest
@@ -827,8 +840,8 @@ _CONTINUITY: dict[Runtime, tuple[tuple[str, EffortContinuity], ...]] = {}
 
 
 #: The models Anthropic's effort page lists as supporting effort **and** which
-#: are not among the three above, read off that page's ``supportedModels`` front
-#: matter on 2026-09-22. These are the pairs the documented negative actually
+#: are not among the six above, read off that page's ``supportedModels`` front
+#: matter on 2026-11-05. These are the pairs the documented negative actually
 #: covers: they take an effort setting, they do not take a per-message one, and
 #: the vendor says what changing the top-level value does to the cache.
 #:
@@ -851,34 +864,37 @@ _ANTHROPIC_NO_PER_MESSAGE_MODELS: tuple[str, ...] = (
 
 
 def _anthropic_api_rows() -> tuple[tuple[str, EffortContinuity], ...]:
-    """The three documented models, and the ones the documented negative covers.
+    """The documented models, and the ones the documented negative covers.
 
     Both halves come from the vendor rather than from inference. The positive is
-    *"On Claude Fable 5.1, Claude Mythos 5.1, and Claude Opus 5, use a
-    per-message effort change, which keeps the prompt cache"*; the negative is
+    the sentence quoted on :data:`_ANTHROPIC_PER_MESSAGE_MODELS`; the negative is
     *"Changing the ``output_config.effort`` value always invalidates message
     blocks"* on the prompt-caching page, together with the 400 the effort page
     quotes for models without per-message effort -- which names Claude Fable 5
-    explicitly. Both read 2026-09-22.
+    explicitly. Both read 2026-11-05.
     """
-    supported = EffortContinuity(
-        capability=_SUPPORTED,
-        mechanism=ContinuityMechanism.ANTHROPIC_PER_MESSAGE_EFFORT,
-        # The vendor ships it; the installed SDK cannot express it. anthropic
-        # 0.97.0's BetaMessageParam types role as Literal["user", "assistant"]
-        # with no per-message output_config, and the package carries no beta
-        # literal for mid-conversation-output-config-2026-07-01 (read
-        # 2026-09-22). modelpass would have to hand-roll the wire shape.
-        reachable=False,
-        detail=(
-            "vendor-documented: a role='system' message with empty content and "
-            "output_config.effort keeps the cached prefix (beta header "
-            "mid-conversation-output-config-2026-07-01; platform.claude.com "
-            "effort and prompt-caching pages, read 2026-09-22). modelpass "
-            "cannot send it -- anthropic 0.97.0 types message roles as "
-            "user|assistant with no per-message output_config"
-        ),
-    )
+
+    def supported(model: str) -> EffortContinuity:
+        return EffortContinuity(
+            capability=_SUPPORTED,
+            mechanism=ContinuityMechanism.ANTHROPIC_PER_MESSAGE_EFFORT,
+            # The vendor ships it; the installed SDK cannot express it. anthropic
+            # 0.97.0's BetaMessageParam types role as Literal["user", "assistant"]
+            # with no per-message output_config, and the package carries no beta
+            # literal for mid-conversation-output-config-2026-07-01 (read
+            # 2026-09-22). modelpass would have to hand-roll the wire shape.
+            reachable=False,
+            detail=(
+                "vendor-documented: a role='system' message with empty content and "
+                "output_config.effort keeps the cached prefix (beta header "
+                "mid-conversation-output-config-2026-07-01; platform.claude.com "
+                "effort and prompt-caching pages, read 2026-11-05"
+                f"{_ANTHROPIC_PER_MESSAGE_LIMITS.get(model, '')}). modelpass "
+                "cannot send it -- anthropic 0.97.0 types message roles as "
+                "user|assistant with no per-message output_config"
+            ),
+        )
+
     unsupported = EffortContinuity(
         capability=_UNSUPPORTED,
         mechanism=None,
@@ -888,13 +904,13 @@ def _anthropic_api_rows() -> tuple[tuple[str, EffortContinuity], ...]:
             "value always invalidates message blocks' (prompt-caching page), "
             "and this model has no per-message effort -- those return 400 "
             "'output_config.effort requires a model that supports per-turn "
-            "effort', with Claude Fable 5 named (effort page, read 2026-09-22). "
+            "effort', with Claude Fable 5 named (effort page, read 2026-11-05). "
             "Setting effort to the model's own default is the documented "
             "exception and invalidates nothing"
         ),
     )
     return tuple(
-        [(model, supported) for model in _ANTHROPIC_PER_MESSAGE_MODELS]
+        [(model, supported(model)) for model in _ANTHROPIC_PER_MESSAGE_MODELS]
         + [(model, unsupported) for model in _ANTHROPIC_NO_PER_MESSAGE_MODELS]
     )
 
@@ -980,7 +996,7 @@ def _same_model(name: str, token: str) -> bool:
     inheriting the family's rules is the desired behaviour.
 
     A cache-continuity guarantee is not a family property. It was documented for
-    three named models, and the next model in the line is exactly the case where
+    named models, and the next model in the line is exactly the case where
     inheriting silently would produce the thing this whole type refuses -- a
     ``supported`` claim about a pair nobody established. Under the family
     matcher, an unreleased ``claude-opus-5-1`` would inherit ``claude-opus-5``'s
@@ -1014,7 +1030,7 @@ def effort_cache_continuity(
     function does not move when the source improves.
 
     Model-specific on purpose. Continuity differs *within* one vendor and
-    runtime -- Anthropic documents it for three models and documents its absence
+    runtime -- Anthropic documents it for six models and documents its absence
     for the rest -- so a runtime-level answer would be wrong for most pairs it
     covered.
     """
