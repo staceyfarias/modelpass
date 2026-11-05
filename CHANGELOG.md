@@ -21,8 +21,10 @@ work landed.
 - **`effort_cache_continuity` knows the current Anthropic models** (2026-11-05).
   Opus 5.5, Sonnet 5.5 and Haiku 5.5 now read `supported`, from the vendor's effort
   page, and were `unknown` before. `reachable` stays `False`: `anthropic` 0.97.0
-  cannot send the per-message form, so `anthropic-api` still changes effort with the
-  top-level setting, which restarts the cache.
+  cannot type the per-message form, so `anthropic-api` still changes effort with the
+  top-level setting, which the vendor documents as restarting the cache. On
+  `claude-haiku-5-5` a top-level change kept the cache in five of five live runs
+  (2026-11-05), so that is not a safe thing to rely on either way.
 
 - **`Sampling(reasoning_effort=...)` now works per call on `anthropic-sdk` and
   `openai-sdk`** (2026-11-05). It beats the connection's `reasoning` for that call
