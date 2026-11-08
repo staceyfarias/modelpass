@@ -146,3 +146,39 @@ says those upgrades are safe or unsafe.
 - The `pyproject.toml` caps match those decisions, and the suite passes on them.
 - Live tests have been run by the owner on anything upgraded.
 - Installed and latest versions can be listed with one command.
+
+## Sessions for the API runtimes (proposed 2026-11-05)
+
+**Why.** `new_chat`, `resume_chat` and `session.send` work on the subscription
+runtimes, but an API connection such as `anthropic-api` refuses them, because the
+vendor API holds no conversation between calls. Each caller then has to keep and
+resend the history itself. The King's Unit harness hit this when moving its AI seats
+from a subscription to API credits: it plays through chats, so its own
+`anthropic-api` connection could not be used without a replay layer of its own.
+
+A default session on the API runtimes would give every project that layer once.
+It would also make prototyping AI chat apps quicker: the same chat code would run on
+a subscription or an API key, and changing between them would mean naming a
+different connection.
+
+**Proposed work:**
+
+1. **A default session mechanism for the API runtimes.** `new_chat` and `send` keep
+   the history and replay it on each call, with the same events and terminal usage
+   as a subscription session.
+2. **Resume.** `resume_chat` reopens a saved session by its id, so the history has
+   to be stored somewhere the caller can reach, or supplied by the caller.
+3. **Prompt caching by default.** Place the breakpoints so a replayed history reads
+   from the cache, with the lifetime set per connection or per block (for example a
+   1-hour system prefix and a 5-minute conversation tail).
+4. **Schemas.** `new_chat(schema=)` works as it does on a subscription session.
+5. **History limits.** Decide what happens as a conversation nears the model's
+   context limit, and leave the caller a way to choose.
+
+**Done when:**
+
+- A chat written for a subscription connection runs unchanged on an `anthropic-api`
+  connection, including resume and a reply schema.
+- A replayed conversation reads its earlier turns from the cache, and the usage
+  shows it.
+- Live tests have been run by the owner.
