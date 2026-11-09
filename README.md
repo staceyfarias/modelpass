@@ -1286,11 +1286,74 @@ receipt — so nothing about a call you already have moves.
 
 | Runtime | Explicit breakpoints | What caching you do get |
 | --- | --- | --- |
-| `anthropic-sdk` | **unsupported** — `ClaudeAgentOptions.system_prompt` is `str \| SystemPromptPreset \| SystemPromptFile`, with no block list anywhere (read off claude_agent_sdk 0.2.148, 2026-09-13) | the CLI caches on its own, and `ttl_control` **is** supported: a session pins `1h` |
+| `anthropic-sdk` | **unsupported** — `ClaudeAgentOptions.system_prompt` is `str \| SystemPromptPreset \| SystemPromptFile`, with no block list anywhere (read off claude_agent_sdk 0.2.148, 2026-09-13). **One is honoured anyway:** a breakpoint in the first user message moves the text before it into the system prompt (below) | the CLI caches on its own, ending its cached prefix at the system prompt, and `ttl_control` **is** supported: a session pins `1h` |
 | `openai-sdk` | **unsupported** — no `cache_control` in the Responses API, and `baseInstructions` is a string | automatic, exact-prefix, ~5–10 minutes idle. Prefix stability is the whole of the control |
 | `anthropic-api` | **supported** — `cache_control` markers reach `messages.create` intact, and this is the runtime the content-block vocabulary exists for. `ttl_control` is `unverified`: a `5m`/`1h` lifetime is carried through, but no test in this suite can observe one expiring | explicit, where you put the breakpoints |
 | `openai-api`, `openai-compatible` | **unsupported** — no such field in the request schema | automatic, vendor-side |
 | `google-api` | **unsupported** — Gemini's explicit caching is a separate cached-content resource, not a marker inside a message | implicit caching, automatic |
+
+### Prompt caching on a Claude subscription
+
+Claude Code caches every call by itself, and you cannot turn that off. What you
+cannot do is say where the cached prefix ends: the CLI ends it at the **system
+prompt**, and modelpass sends a stateless call's message as one string. So the
+usual pattern — a long document, then a question that changes every call — puts
+the document after the CLI's breakpoint, and each call writes it to the cache
+again and never reads it. One consumer's 800 such calls (2026-11-09) wrote 7.46M
+cache tokens and read 51k.
+
+**Mark the end of the shared part, and modelpass moves it into the system prompt.**
+Write the prompt the way you would for `anthropic-api`, with the breakpoint after
+the stable part of the first user message:
+
+```python
+document = TextBlock(f"<document>\n{text}\n</document>", CacheControl())
+
+for chunk in chunks:
+    events = bridge.chat(
+        connection="claude-sub",
+        system_prompt=INSTRUCTIONS,
+        message=(document, TextBlock(f"<chunk>\n{chunk}\n</chunk>")),
+    )
+```
+
+On `anthropic-sdk` the text up to the last breakpoint in the first user message
+becomes part of the system prompt, after yours, with every byte kept. Only the rest
+is sent as the message. Every call on the same document then starts with the same
+system prompt, so the CLI reads it back. `PROMPT_CACHE_MARKER` in the text does the
+same thing, so a prompt with markers moves between runtimes unedited. On
+`anthropic-api` the same call sends the breakpoint where you put it. The receipt
+says what happened:
+`1 cache breakpoint(s) honoured by moving the text before them into the system prompt`.
+
+What to get right:
+
+* **Keep the system prompt byte-identical across calls.** Instructions first, then
+  the shared document. A date, an id or a counter anywhere in it starts a new cache
+  entry.
+* **Order calls by document.** The cache lives about an hour on a subscription
+  (five minutes once the account draws on credits), so run a document's calls
+  together rather than interleaving documents.
+* **The shared part must clear the model's cache floor** — 1,024 tokens on most
+  models, 512 on Opus 5 (`cache_eligibility` on the receipt). A short document
+  caches nothing, wherever it sits.
+* **Read the reads.** `cached_input_tokens` on the second call that shares a
+  document should be about the document's size. A large `cache_write_tokens` on
+  every call with reads near zero is the pattern this exists to fix.
+
+What does not move: text after the last breakpoint, any breakpoint in a later
+message, a message with nothing after its breakpoint (there would be no question
+left), and documents (`DocumentBlock`), which this runtime does not take. Sessions
+(`new_chat()`, `new_worker()`) are unchanged: put the shared text in their
+`system_prompt=` yourself.
+
+**On an OpenAI subscription (`openai-sdk`)** there is no breakpoint to place: OpenAI
+caches any exact prefix of 1,024 tokens or more. Put the shared document at the start
+of the message, after a byte-identical system prompt, and it should be read back. The
+one Codex measurement on record saw only the instructions and tools cached
+([§3.6](docs/api-and-runtimes.md#36-prompt-caching-per-vendor)), so check
+`cached_input_tokens` before you rely on it. modelpass does not move anything there
+yet.
 
 **Where breakpoints are not honoured they are not silently dropped.** The content
 is flattened to text and the receipt that precedes the run carries the line

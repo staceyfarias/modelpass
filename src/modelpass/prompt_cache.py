@@ -64,7 +64,7 @@ from typing import Any
 from .capabilities import DEFAULT_REGISTRY, Capability, CapabilityRegistry, Support
 from .errors import InvalidConnection
 from .runtimes import Runtime
-from .types import CacheControl, ContentBlock, Message, TextBlock
+from .types import CacheControl, ContentBlock, Message, Role, TextBlock
 
 __all__ = [
     "AUTO",
@@ -394,7 +394,9 @@ def _note(
 # marks everything. In ``"none"`` nothing is marked. Only a runtime that takes
 # breakpoints acts on any of this. Everywhere else a marker is removed and the prompt
 # reads as if it was never there, so a prompt written for ``anthropic-api`` can move
-# to another vendor without being edited.
+# to another vendor without being edited -- with one exception, added 2026-11-09:
+# on a runtime in :data:`SYSTEM_PREFIX_RUNTIMES` a breakpoint in the first user
+# message is honoured by moving the text before it into the system prompt.
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,6 +559,75 @@ def _map_breakpoints(
     return tuple(out)
 
 
+#: Runtimes that place a cache breakpoint of their own at the end of the system
+#: prompt and accept none from the caller (2026-11-09). On these, a caller's
+#: breakpoint in the first user message -- a ``cache_control`` or a
+#: :data:`PROMPT_CACHE_MARKER` -- is honoured by moving everything before it into
+#: the system prompt, so the runtime's own breakpoint lands where the caller asked.
+#:
+#: Why ``anthropic-sdk``: Claude Code caches automatically, with breakpoints after
+#: its system prompt and at the end of the message, and modelpass flattens a
+#: stateless call's message into one string. A document followed by a question in
+#: one user message was therefore re-written to the cache on every call and never
+#: read back: a 2026-11-09 consumer run of 800 calls -- a whole document, then one
+#: of its chunks, several calls per document -- recorded 7.46M cache-write tokens
+#: and 51k cache reads. With the document in the system prompt, calls that share it
+#: share a cached prefix (the 2026-08-30 ``chat()`` measurements in docs §3.6
+#: already showed a system block over the floor read back against different
+#: messages).
+#:
+#: ``openai-sdk`` is not here yet, and that is an open question rather than a
+#: finding. OpenAI caches any exact prefix with no breakpoint to place, so a shared
+#: document at the start of the input should be read back as it is; but the one
+#: Codex measurement on record (2026-08-31, docs §3.6) saw only the stable front --
+#: base instructions and tools -- cached while the input grew. Adding it here is
+#: one line once a live run shows which it is.
+SYSTEM_PREFIX_RUNTIMES: frozenset[Runtime] = frozenset({Runtime.ANTHROPIC_SDK})
+
+
+def _first_turn(messages: tuple[Message, ...]) -> int | None:
+    return next((i for i, m in enumerate(messages) if m.role is not Role.SYSTEM), None)
+
+
+def _move_prefix_to_system(messages: tuple[Message, ...]) -> tuple[tuple[Message, ...], int]:
+    """Move the first user message's text up to its last breakpoint into a system
+    message placed just before it. Returns the messages and how many breakpoints that
+    honoured; ``0`` and the messages unchanged when there is nothing to move.
+
+    Only text moves (a document cannot go into a system prompt), only from the first
+    user message (the stable part of a stateless call is at its start), and only
+    when text remains after the breakpoint: a message that is all prefix has no
+    question left to ask. The moved text keeps every byte; its breakpoints are
+    removed, because the system prompt's end is now the breakpoint.
+    """
+    first = _first_turn(messages)
+    if first is None:
+        return messages, 0
+    message = messages[first]
+    if message.role is not Role.USER or isinstance(message.content, str):
+        return messages, 0
+    blocks = message.content
+    last = max(
+        (i for i, b in enumerate(blocks) if getattr(b, "cache_control", None) is not None),
+        default=None,
+    )
+    if last is None:
+        return messages, 0
+    prefix, rest = blocks[: last + 1], blocks[last + 1 :]
+    if not all(isinstance(b, TextBlock) for b in prefix):
+        return messages, 0
+    if not any(isinstance(b, TextBlock) and b.text.strip() for b in rest):
+        return messages, 0
+    moved = sum(1 for b in prefix if b.cache_control is not None)
+    out = list(messages)
+    out[first] = replace(message, content=tuple(rest))
+    out.insert(
+        first,
+        Message(role=Role.SYSTEM, content=tuple(replace(b, cache_control=None) for b in prefix)),
+    )
+    return tuple(out), moved
+
+
 def _mark_system(messages: tuple[Message, ...]) -> tuple[Message, ...]:
     """Put a breakpoint at the end of the system prompt, unless it has one."""
     system = [i for i, m in enumerate(messages) if m.role.value == "system"]
@@ -629,10 +700,35 @@ def arrange_prompt_cache(
     runtime = connection.runtime.value
     notes: list[str] = []
 
+    moves = (
+        not rules.takes_breakpoints
+        and not rules.off
+        and connection.runtime in SYSTEM_PREFIX_RUNTIMES
+    )
+    first = _first_turn(messages) if moves else None
+    original = messages
     markers = sum(_marker_count(m) for m in messages)
     if markers:
-        messages = tuple(_expand_markers(m, split=rules.custom) for m in messages)
+        messages = tuple(
+            _expand_markers(m, split=rules.custom or i == first)
+            for i, m in enumerate(messages)
+        )
     if not rules.takes_breakpoints:
+        moved = 0
+        if moves:
+            arranged, moved = _move_prefix_to_system(messages)
+            if moved and first is not None:
+                messages = arranged
+                markers -= _marker_count(original[first])
+                notes.append(
+                    f"{moved} cache breakpoint(s) honoured by moving the text before "
+                    f"them into the system prompt: {runtime} places its own cache "
+                    "breakpoint at the end of the system prompt and takes none from "
+                    "the caller"
+                )
+            elif markers:
+                # Nothing moved: the first message's markers come out like any other.
+                messages = tuple(_expand_markers(m, split=False) for m in original)
         if markers:
             notes.append(
                 f"{markers} prompt cache marker(s) removed: {runtime} takes no "

@@ -8,7 +8,9 @@
    otherwise. A call with no markers is not cached.
 3. **None.** Nothing is marked and nothing is left marked.
 4. **Every other runtime removes the markers,** so a prompt can move between
-   vendors unedited.
+   vendors unedited -- except that on ``anthropic-sdk`` (a Claude subscription) a
+   breakpoint in the first user message moves the text before it into the system
+   prompt, where Claude Code caches on its own (2026-11-09, section 4a).
 5. **A call stays inside the vendor's rules:** four breakpoints, and no longer
    lifetime after a shorter one.
 """
@@ -344,13 +346,155 @@ def test_none_is_refused_where_caching_cannot_be_stopped(build):
 # --- 4. every other runtime --------------------------------------------------------
 
 
-@pytest.mark.parametrize("connection", [gpt(), subscription(), gemini()])
+@pytest.mark.parametrize("connection", [gpt(), gemini()])
 def test_a_marker_disappears_on_every_other_runtime(connection):
     messages = (system(f"stable{M}volatile"), user(f"a{M}b"))
     arranged, _ = arrange_prompt_cache(messages, connection)
     assert arranged[0].content == "stablevolatile"
     assert arranged[1].content == "ab"
     assert arranged[0].cache_breakpoints == 0
+
+
+def test_a_marker_in_the_system_prompt_disappears_on_a_subscription():
+    arranged, _ = arrange_prompt_cache((system(f"stable{M}volatile"), user("q")), subscription())
+    assert arranged[0].content == "stablevolatile"
+    assert arranged[1].content == "q"
+
+
+# --- 4a. a subscription: the cached prefix moves into the system prompt -----------
+#
+# Claude Code places its own breakpoint at the end of the system prompt and takes
+# none from the caller, and a stateless call's message is flattened into one string.
+# So a document marked for caching in the user message is moved into the system
+# prompt, and calls that share the document share a cached prefix (2026-11-09).
+
+
+DOC = TextBlock("<document>the whole document</document>", cache_control=CacheControl())
+
+
+def test_a_breakpoint_in_the_user_message_moves_the_text_before_it():
+    arranged, notes = arrange_prompt_cache(
+        (system("instructions"), user((DOC, TextBlock("<chunk>one</chunk>")))), subscription()
+    )
+    assert [m.role for m in arranged] == [Role.SYSTEM, Role.SYSTEM, Role.USER]
+    assert arranged[1].content == (TextBlock("<document>the whole document</document>"),)
+    assert arranged[2].content == (TextBlock("<chunk>one</chunk>"),)
+    assert sum(m.cache_breakpoints for m in arranged) == 0
+    assert notes == (
+        "1 cache breakpoint(s) honoured by moving the text before them into the system "
+        "prompt: anthropic-sdk places its own cache breakpoint at the end of the system "
+        "prompt and takes none from the caller",
+    )
+
+
+def test_the_adapter_sends_the_document_as_the_system_prompt():
+    from modelpass.adapters.anthropic import split_messages
+
+    arranged, _ = arrange_prompt_cache(
+        (system("instructions"), user((DOC, TextBlock("<chunk>one</chunk>")))), subscription()
+    )
+    assert split_messages(arranged) == (
+        "instructions\n\n<document>the whole document</document>",
+        "<chunk>one</chunk>",
+    )
+
+
+def test_two_calls_on_one_document_share_the_system_prompt():
+    from modelpass.adapters.anthropic import split_messages
+
+    def call(chunk):
+        arranged, _ = arrange_prompt_cache(
+            (system("instructions"), user((DOC, TextBlock(chunk)))), subscription()
+        )
+        return split_messages(arranged)
+
+    (system_a, prompt_a), (system_b, prompt_b) = call("first"), call("second")
+    assert system_a == system_b
+    assert (prompt_a, prompt_b) == ("first", "second")
+
+
+def test_a_marker_in_the_user_message_moves_too():
+    arranged, notes = arrange_prompt_cache(
+        (user(f"<document>d</document>{M}<chunk>c</chunk>"),), subscription()
+    )
+    assert arranged[0].role is Role.SYSTEM
+    assert arranged[0].text == "<document>d</document>"
+    assert arranged[1].text == "<chunk>c</chunk>"
+    assert M not in "".join(m.text for m in arranged)
+    assert len(notes) == 1 and "honoured by moving" in notes[0]
+
+
+def test_every_byte_but_the_marker_is_kept():
+    arranged, _ = arrange_prompt_cache((system("s"), user(f"  a\nb {M} c\n")), subscription())
+    assert "".join(m.text for m in arranged[1:]) == "  a\nb  c\n"
+
+
+def test_only_the_last_breakpoint_counts_and_everything_before_it_moves():
+    first = TextBlock("one", cache_control=CacheControl())
+    second = TextBlock("two", cache_control=CacheControl())
+    arranged, notes = arrange_prompt_cache(
+        (user((first, second, TextBlock("question"))),), subscription()
+    )
+    assert arranged[0].content == (TextBlock("one"), TextBlock("two"))
+    assert arranged[1].content == (TextBlock("question"),)
+    assert notes[0].startswith("2 cache breakpoint(s) honoured")
+
+
+def test_nothing_moves_when_no_text_follows_the_breakpoint():
+    arranged, notes = arrange_prompt_cache((user((DOC,)),), subscription())
+    assert [m.role for m in arranged] == [Role.USER]
+    assert arranged[0].content == (DOC,)
+    assert notes == ()
+
+
+def test_a_trailing_marker_is_removed_and_nothing_moves():
+    arranged, notes = arrange_prompt_cache((user(f"all of it{M}"),), subscription())
+    assert [m.role for m in arranged] == [Role.USER]
+    assert arranged[0].text == "all of it"
+    assert arranged[0].cache_breakpoints == 0
+    assert notes == (
+        "1 prompt cache marker(s) removed: anthropic-sdk takes no breakpoints, so the "
+        "prompt was sent without them",
+    )
+
+
+def test_a_message_with_no_breakpoint_is_left_alone():
+    messages = (system("s"), user("just a question"))
+    assert arrange_prompt_cache(messages, subscription()) == (messages, ())
+
+
+def test_only_the_first_user_message_moves():
+    messages = (
+        user("earlier question"),
+        assistant("answer"),
+        user((DOC, TextBlock("follow-up"))),
+    )
+    arranged, notes = arrange_prompt_cache(messages, subscription())
+    assert [m.role for m in arranged] == [Role.USER, Role.ASSISTANT, Role.USER]
+    assert notes == ()
+
+
+def test_a_system_marker_alongside_a_moved_one_is_still_reported_removed():
+    arranged, notes = arrange_prompt_cache(
+        (system(f"a{M}b"), user(f"doc{M}question")), subscription()
+    )
+    assert arranged[0].text == "ab"
+    assert arranged[1].text == "doc"
+    assert arranged[2].text == "question"
+    assert len(notes) == 2
+    assert notes[1].startswith("1 prompt cache marker(s) removed")
+
+
+@pytest.mark.parametrize("build", [gpt, gemini])
+def test_no_other_runtime_moves_anything(build):
+    arranged, _ = arrange_prompt_cache((system("s"), user((DOC, TextBlock("q")))), build())
+    assert [m.role for m in arranged] == [Role.SYSTEM, Role.USER]
+
+
+def test_the_api_runtime_still_gets_the_breakpoint_where_the_caller_put_it():
+    arranged, _ = arrange_prompt_cache((system("s"), user((DOC, TextBlock("q")))), claude())
+    assert [m.role for m in arranged] == [Role.SYSTEM, Role.USER]
+    assert arranged[1].content[0].cache_control is not None
 
 
 def test_a_marker_in_a_block_disappears_without_leaving_a_breakpoint():

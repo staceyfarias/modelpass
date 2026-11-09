@@ -7,6 +7,18 @@ work landed.
 
 ### Fixed
 
+- **A shared document is now cached on a Claude subscription** (2026-11-09). On
+  `anthropic-sdk`, a breakpoint in the first user message (`cache_control` or
+  `PROMPT_CACHE_MARKER`) moves the text before it into the system prompt, where
+  Claude Code ends its own cached prefix. Before, the breakpoint was dropped and the
+  message flattened, so a document followed by a varying question was written to the
+  cache on every call and never read: one consumer's 800 calls wrote 7.46M cache
+  tokens and read 51k. Calls that share a document now share a system prompt. The
+  receipt notes the move. `cache_breakpoints` on this runtime stays `unsupported`,
+  since the SDK still has no field for a marker. See `prompt_cache.SYSTEM_PREFIX_RUNTIMES`,
+  README "Prompt caching on a Claude subscription" and §1.9a. Not yet done for
+  `openai-sdk`, pending a measurement.
+
 - **`promptCache = "5m"` or `"1h"` now reaches `anthropic-api`** (2026-11-04). The
   lifetime was accepted and reported, and never sent.
 

@@ -752,7 +752,11 @@ NOTES: dict[tuple[Runtime, Capability], str] = {
         "it. **This is not 'no caching'**: the CLI caches, and TTL_CONTROL on this "
         "row is 'supported' because the lifetime is settable (D17). What is absent "
         "is the caller's say in where the prefix ends. Moving this cell is a "
-        "one-line re-read of the SDK's options"
+        "one-line re-read of the SDK's options. **Since 2026-11-09 one breakpoint is "
+        "honoured anyway, without moving this cell**: a breakpoint in the first user "
+        "message moves the text before it into the system prompt, where the CLI "
+        "places its own breakpoint (prompt_cache.SYSTEM_PREFIX_RUNTIMES). The SDK "
+        "still has no field for a marker; the content moves, not the marker"
     ),
     (Runtime.ANTHROPIC_SDK, Capability.CACHE_AUTOMATIC): (
         "**supported, 2026-09-21**, and the evidence is a recorded drive rather "

@@ -29,8 +29,10 @@ from modelpass.runtimes import Runtime
 from modelpass.store import ConnectionStore
 from modelpass.types import (
     AuthMode,
+    CacheControl,
     TerminalEvent,
     TerminalStatus,
+    TextBlock,
     TextDeltaEvent,
     UsageEvent,
 )
@@ -166,3 +168,53 @@ def test_ambient_api_key_never_flips_the_run_to_metered(live_bridge, monkeypatch
 
     terminals = [e for e in events if isinstance(e, TerminalEvent)]
     assert terminals[-1].auth_mode is AuthMode.SUBSCRIPTION
+
+
+def _shared_document() -> str:
+    """~3,000 tokens of stable text: over every model's cache floor."""
+    lines = [
+        f"Section {i}: the benefit described here applies to members enrolled before "
+        f"year {2000 + i % 25}, with a copay of {i % 9 + 1}0 dollars per visit and a "
+        f"limit of {i % 7 + 2} visits per quarter."
+        for i in range(120)
+    ]
+    return "<document>\n" + "\n".join(lines) + "\n</document>"
+
+
+def _usage(events):
+    usages = [e.usage for e in events if isinstance(e, UsageEvent)]
+    assert usages, "expected a usage event"
+    return usages[-1]
+
+
+def test_a_shared_document_is_read_from_cache_on_the_next_call(live_bridge):
+    """(d) A document marked for caching in the user message is read back (2026-11-09).
+
+    Two calls, one document, a different question each. ``arrange_prompt_cache``
+    moves the document into the system prompt, where Claude Code places its own
+    breakpoint, so the second call must READ the document rather than write it
+    again. Before the move, a consumer's 800 such calls read ~60 tokens each.
+    Costs two Haiku calls.
+    """
+    bridge, connection = live_bridge
+    _require_usable_login(bridge, connection.name)
+    document = TextBlock(_shared_document(), cache_control=CacheControl())
+
+    def ask(question):
+        return list(
+            bridge.chat(
+                connection=connection.name,
+                system_prompt="Answer in one word.",
+                message=(document, TextBlock(f"\n\nQuestion: {question}")),
+                model="claude-haiku-5-5",
+                expect_auth_mode=AuthMode.SUBSCRIPTION,
+            )
+        )
+
+    first = _usage(ask("What is the copay in section 3?"))
+    second = _usage(ask("How many visits are allowed in section 5?"))
+    print(f"\nfirst:  write {first.cache_write_tokens} read {first.cached_input_tokens}")
+    print(f"second: write {second.cache_write_tokens} read {second.cached_input_tokens}")
+    assert second.cached_input_tokens >= 2000, (
+        "the second call should read the shared document from the cache"
+    )

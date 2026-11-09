@@ -938,6 +938,36 @@ before it marks nothing. Everywhere else the marker is removed in place, so the 
 is what it would have been without it, and `Receipt.notes` gives the count. Session
 prompts and turns take no breakpoints, so their markers are always removed.
 
+**On `anthropic-sdk` a breakpoint in the first user message moves the text before
+it into the system prompt (2026-11-09).** The runtime takes no breakpoints, but
+Claude Code ends its own cached prefix at the system prompt, so moving the content
+puts the cache boundary where the caller asked. `arrange_prompt_cache` does it, for
+the runtimes in `prompt_cache.SYSTEM_PREFIX_RUNTIMES`, before any adapter sees the
+call:
+
+* The first non-system message must be a user message whose last breakpoint — a
+  `cache_control`, or a `PROMPT_CACHE_MARKER`, which is split into one for this
+  purpose — is followed by non-whitespace text. Otherwise nothing moves, and a
+  marker is removed as on every other runtime.
+* Everything up to and including the block with the last breakpoint becomes a
+  system message placed just before that user message, every byte kept and its
+  breakpoints removed. `split_messages` joins it after the caller's system text with
+  `"\n\n"`. The rest stays the user message.
+* Only text moves. Later messages, sessions and `"none"` are untouched (`"none"` is
+  refused on this runtime anyway).
+* `Receipt.notes` says `N cache breakpoint(s) honoured by moving the text before them
+  into the system prompt: …`. The moved breakpoints are gone from the request, so
+  they are not counted in `cache_breakpoints_requested` and do not produce the
+  "requested and dropped" line. The capability cell stays `unsupported`: the SDK
+  still has no field for a marker. The content moves, not the marker.
+
+Evidence: before the move, a consumer's 800 stateless calls on 2026-11-09 — a
+document and then one of its chunks, several calls per document, on Haiku 5.5 —
+recorded 7.46M cache-write tokens and 51k cache reads. §3.6 records that a system
+block over the floor is read back against different messages.
+`tests/test_live_anthropic.py::test_a_shared_document_is_read_from_cache_on_the_next_call`
+is the live check, for the owner to run.
+
 `RunRequest.written_messages` keeps the messages as written, and a failover target
 arranges those for itself rather than inheriting another runtime's result.
 
@@ -2520,6 +2550,16 @@ something a judge prompt wants anyway. The segment arithmetic does not fully
 reconcile across those arms, so treat "a breakpoint forms at the system block
 once it clears the floor" as the shape the data supports rather than a mechanism
 anyone has proven.
+
+**A shared document belongs in the system prompt on `anthropic-sdk` (2026-11-09).**
+The same shape at scale: a consumer sent a whole document, then one of its chunks,
+in one user message, several calls per document. 800 calls wrote 7.46M cache tokens
+and read 51k, because the document sat after the CLI's system-prompt breakpoint
+and the varying chunk followed it in the same flattened string. modelpass now moves
+the text up to a caller's breakpoint in the first user message into the system
+prompt (§1.9a), which is the arm above that was read back against different
+messages. The live check is
+`test_live_anthropic.py::test_a_shared_document_is_read_from_cache_on_the_next_call`.
 
 **Read the reads, not the writes.** `cached_input_tokens` at zero across calls
 that should share a prefix means nothing is being reused, whatever the writes
