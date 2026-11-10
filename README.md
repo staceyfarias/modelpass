@@ -1557,7 +1557,7 @@ the same run:
 
 | runtime + model | continuity |
 | --- | --- |
-| `anthropic-api` + Fable 5.1, Mythos 5.1, Opus 5 | `supported` — per-message effort, vendor-documented as cache-preserving |
+| `anthropic-api` + Fable 5.2, Mythos 5.2, Fable 5.1, Mythos 5.1, Opus 5 | `supported` — per-message effort, vendor-documented as cache-preserving |
 | `anthropic-api` + its other effort-capable models | `unsupported` — the vendor documents that a top-level change invalidates |
 | `openai-api` + `gpt-6-astra` | `supported` — a `configuration_update` input item |
 | `openai-sdk` + `gpt-6-astra` | `experimental` — the protocol types it, no vendor statement about the cache |

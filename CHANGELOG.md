@@ -18,6 +18,13 @@ work landed.
 
 ### Added
 
+- **Fable 5.2 and Mythos 5.2 are known** (2026-11-10). `effort_cache_continuity` now
+  reads `supported` for both on `anthropic-api`: the vendor's effort page names them
+  in the per-message-effort sentence (read 2026-11-10). `reachable` stays `False`, as
+  for the other rows. The `anthropic` runtime's picker also offers a `fable` alias,
+  which the bundled Claude Code CLI resolves (claude-agent-sdk 0.2.180, CLI 2.1.321,
+  whose bundle carries `claude-fable-5-2`; checked 2026-11-10, no live call).
+
 - **`effort_cache_continuity` knows the current Anthropic models** (2026-11-05).
   Opus 5.5, Sonnet 5.5 and Haiku 5.5 now read `supported`, from the vendor's effort
   page, and were `unknown` before. `reachable` stays `False`: `anthropic` 0.97.0

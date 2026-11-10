@@ -33,6 +33,8 @@ from modelpass.types import TokenUsage
 @pytest.mark.parametrize(
     "model",
     [
+        "claude-fable-5-2",
+        "claude-mythos-5-2",
         "claude-fable-5-1",
         "claude-mythos-5-1",
         "claude-opus-5-5",
@@ -44,9 +46,10 @@ from modelpass.types import TokenUsage
 def test_the_documented_anthropic_models_are_supported(model):
     """The vendor's sentence, and nothing wider than it.
 
-    "On Claude Fable 5.1, Claude Mythos 5.1, Claude Opus 5.5, Claude Opus 5, Claude
-    Sonnet 5.5, and Claude Haiku 5.5, use a per-message effort change, which keeps
-    the prompt cache."
+    "On Claude Fable 5.2, Claude Mythos 5.2, Claude Fable 5.1, Claude Mythos 5.1,
+    Claude Opus 5.5, Claude Opus 5, Claude Sonnet 5.5, and Claude Haiku 5.5, use a
+    per-message effort change, which keeps the prompt cache." (effort page, read
+    2026-11-10)"
     """
     verdict = effort_cache_continuity(Runtime.ANTHROPIC_API, model)
     assert verdict.capability is EffortCacheContinuity.SUPPORTED

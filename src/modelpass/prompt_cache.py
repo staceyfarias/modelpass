@@ -801,11 +801,15 @@ _UNSUPPORTED = EffortCacheContinuity.UNSUPPORTED
 _UNKNOWN = EffortCacheContinuity.UNKNOWN
 
 #: The Anthropic models whose documentation states that a per-message effort
-#: change keeps the cache, read off the vendor's own effort page on 2026-11-05:
-#: *"On Claude Fable 5.1, Claude Mythos 5.1, Claude Opus 5.5, Claude Opus 5, Claude
-#: Sonnet 5.5, and Claude Haiku 5.5, use a per-message effort change, which keeps
-#: the prompt cache."* First read 2026-09-22, when the sentence named three.
+#: change keeps the cache, read off the vendor's own effort page on 2026-11-10:
+#: *"On Claude Fable 5.2, Claude Mythos 5.2, Claude Fable 5.1, Claude Mythos 5.1,
+#: Claude Opus 5.5, Claude Opus 5, Claude Sonnet 5.5, and Claude Haiku 5.5, use a
+#: per-message effort change, which keeps the prompt cache."* First read
+#: 2026-09-22, when the sentence named three; the 5.2 pair was added to it by
+#: 2026-11-10 (the 2026-11-05 read had 5.1 as its newest).
 _ANTHROPIC_PER_MESSAGE_MODELS: tuple[str, ...] = (
+    "claude-fable-5-2",
+    "claude-mythos-5-2",
     "claude-fable-5-1",
     "claude-mythos-5-1",
     "claude-opus-5-5",
