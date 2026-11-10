@@ -110,6 +110,24 @@ caps in `pyproject.toml` block an upgrade until someone evaluates it.
 | `openai` | `openai-api`, `openai-compatible` | `>=2,<3` | 2.32.0 | 3.46.0 |
 | `google-genai` | `google-api` | `>=1,<2` | 1.73.1 | 2.34.0 |
 
+**Re-measured (2026-11-10):** `claude-agent-sdk` was upgraded to 0.2.180, whose
+bundled CLI (2.1.321) carries `claude-fable-5-2`; the 0.2.178 bundle (CLI 2.1.318)
+did not. Nothing else was upgraded. Two things moved since the table above:
+`google-genai` is now at **3.0.0**, so its `<2` cap is two majors behind, and
+`langchain-core` (declared `>=1,<2`, installed 1.3.2) was not in the table at all and
+is at 1.7.7. A new Claude model reached the bundled CLI two releases after the
+global Claude Code had it, which is what this entry exists to catch.
+
+| Package | Declared | Installed | Latest (2026-11-10) |
+| --- | --- | --- | --- |
+| `claude-agent-sdk` | `>=0.2.159` | 0.2.180 | 0.2.180 |
+| `@openai/codex` (npm) | not declared | 0.151.0 | 0.167.0 |
+| `openai-codex` (pip) | no version | 0.154.0 | 0.167.0 |
+| `anthropic` | `>=0.40,<1` | 0.97.0 | 2.7.0 |
+| `openai` | `>=2,<3` | 2.32.0 | 3.49.0 |
+| `google-genai` | `>=1,<2` | 1.73.1 | 3.0.0 |
+| `langchain-core` | `>=1,<2` | 1.3.2 | 1.7.7 |
+
 **What is known about `anthropic`, from reading the packages and Anthropic's
 upgrade guide:**
 
@@ -121,7 +139,7 @@ upgrade guide:**
 - Per-message effort is typed only in 2.x. 0.125.0 and 1.0.0 have neither the beta
   name nor the message type, and 1.17.0 has the beta name only.
 
-**Not yet read:** the `openai` 3.x and `google-genai` 2.x changes. Nothing here
+**Not yet read:** the `openai` 3.x and `google-genai` 2.x and 3.x changes. Nothing here
 says those upgrades are safe or unsafe.
 
 **Proposed work:**
@@ -130,7 +148,11 @@ says those upgrades are safe or unsafe.
    `claude-agent-sdk` and the Codex CLI forward, and confirm the receipt still names
    the binary and its version. Check for new controls, such as a `set_effort` on
    `ClaudeSDKClient`.
-2. **Evaluate each API library across its major version.** One library at a time:
+2. **Update the Anthropic API library first, then check the others.** `anthropic`
+   2.7.0 is the one that matters most: it types per-message effort, which would make
+   the Fable 5.2 and Mythos 5.2 `supported` rows `reachable`. Then work through
+   `openai`, `google-genai`, `langchain-core` and the Codex packages in turn.
+   Evaluate each API library across its major version. One library at a time:
    read its migration guide, list what breaks, and decide whether to raise the cap.
    Each is its own change, because each can alter what callers see.
 3. **Re-read what Modelpass recorded from the old versions.** Every
