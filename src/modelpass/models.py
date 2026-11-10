@@ -73,6 +73,7 @@ _CODEX_HOME_ENV = "CODEX_HOME"
 #: Aliases the Claude Code runtime resolves to "the latest model of that family".
 #: Not a model list -- see the module docstring for why there isn't one.
 ANTHROPIC_ALIASES: tuple[tuple[str, str], ...] = (
+    ("fable", "Fable (alias)"),
     ("sonnet", "Sonnet (alias)"),
     ("opus", "Opus (alias)"),
     ("haiku", "Haiku (alias)"),
@@ -165,7 +166,7 @@ def _anthropic_catalogue() -> ModelCatalogue:
         notes=(
             "The Claude Code runtime exposes no way to enumerate models: no 'models' "
             "subcommand on the CLI (2.1.63), no manifest in ~/.claude, no enumeration "
-            "API on claude-agent-sdk (checked 2026-08-17). These three are aliases the "
+            "API on claude-agent-sdk (checked 2026-08-17). These are aliases the "
             "runtime resolves to the current model of each family.",
             "For an exact model id -- 'claude-sonnet-4-6' and the like -- type it in "
             "the free-text field. modelpass will not guess one for you.",

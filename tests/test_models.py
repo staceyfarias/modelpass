@@ -115,7 +115,7 @@ def test_anthropic_offers_aliases_and_says_they_are_aliases():
     """No enumeration API exists there; presenting a made-up list as the vendor's
     would be the guard-default mistake with a vendor's name on it."""
     catalogue = models_for(Runtime.ANTHROPIC_SDK)
-    assert [c.id for c in catalogue.choices] == ["sonnet", "opus", "haiku"]
+    assert [c.id for c in catalogue.choices] == ["fable", "sonnet", "opus", "haiku"]
     assert catalogue.exact is False
     assert "not a vendor model list" in catalogue.source
     assert any("enumerate" in note for note in catalogue.notes)
