@@ -194,6 +194,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from .._background import process_options
 from ..errors import InvalidTool, VendorRunFailed
 from ..preflight import check_launch_args
 from ..runtimes import Runtime
@@ -749,6 +750,7 @@ def _default_spawn(
     """
     return subprocess.Popen(
         argv,
+        **process_options(),
         env=env,
         cwd=cwd,
         stdin=subprocess.PIPE,

@@ -585,11 +585,17 @@ class Bridge:
 
     def conversations(
         self, root: str | Path, *, application: str, application_name: str | None = None,
+        keep_alive: bool = False,
     ) -> ConversationStore:
-        """Open private, app-scoped managed history; no model call or global chat listing."""
+        """Open private, app-scoped history without a model call.
+
+        Retain the store across requests when keep_alive=True: native chats reuse
+        idle sessions (up to four); close the store on shutdown. History mode still
+        replays text and does not become a native conversation automatically.
+        """
         from .conversations import ConversationStore
         return ConversationStore(root, bridge=self, application=application,
-                                 application_name=application_name)
+                                 application_name=application_name, keep_alive=keep_alive)
 
     @property
     def run_log(self) -> RunLog:
@@ -660,6 +666,52 @@ class Bridge:
     def account(self, name: str) -> Connection:
         """Resolve an account profile by its stable ID, not its nickname."""
         return self.connection(name)
+
+    def models(self, connection: str | Connection, *, refresh: bool = False,
+               timeout: float = 15.0):
+        """Return model suggestions for one explicit connection.
+
+        Offline by default: subscription catalogues come from local vendor
+        state; API results come only from this Bridge's previous explicit
+        refresh. refresh=True may request authenticated model metadata, never
+        generate, fall back to another account, or write a run receipt.
+        """
+        from .models import ModelCatalogue, models_for
+        if not isinstance(refresh, bool):
+            raise ValueError("refresh must be true or false")
+        if isinstance(connection, str) and connection.startswith(_GROUP_PREFIX):
+            raise ValueError("Model discovery requires a connection, not a group")
+        selected = self._resolve(connection)
+        if selected.runtime not in API_RUNTIMES:
+            return models_for(selected.runtime, codex_root=selected.config_dir)
+        if refresh and not selected.enabled:
+            raise ConnectionDisabled(selected.name)
+        cache = getattr(self, "_model_catalogues", None)
+        if cache is None:
+            cache = self._model_catalogues = {}
+        key = repr(selected)
+        if not refresh:
+            return cache.get(key, ModelCatalogue(
+                runtime=selected.runtime, source="not fetched",
+                problem="Load models to request this account's model list."))
+        if (isinstance(timeout, bool) or not isinstance(timeout, (float, int))
+                or not 0 < timeout <= 120):
+            raise ValueError(
+                "Model discovery timeout must be greater than 0 and at most 120 seconds")
+        adapter = self.adapter_for(selected.runtime)
+        discover = getattr(adapter, "list_models", None)
+        if not callable(discover):
+            return ModelCatalogue(runtime=selected.runtime,
+                                  problem="This adapter does not support model discovery.")
+        try:
+            result = discover(selected, timeout=timeout)
+        except SubpassError:
+            raise
+        except Exception as exc:
+            raise AdapterFailed(selected.runtime.value, "Model discovery failed") from exc
+        if result.problem is None:
+            cache[key] = result
+        return result
 
     def groups(self) -> tuple[Group, ...]:
         """Every group, with its membership, in name order.
@@ -2129,6 +2181,7 @@ class Bridge:
         raise_on_stop: bool = False,
         schema: Mapping[str, Any] | None = None,
         schema_name: str | None = None,
+        tools: Iterable[ToolDef | Mapping[str, Any]] | None = None,
     ) -> ChatSession:
         """Pick a persisted session back up by id.
 
@@ -2138,12 +2191,12 @@ class Bridge:
         thread whose first turn never completed leaves an id that resume
         rejects. A stored id is a hint.
 
-        **There is deliberately no ``tools=`` here.** Tools were fixed when the
-        session was created, they are the very front of a cached prefix that has
-        been warm ever since, and modelpass cannot check a re-declared value
-        against what the session actually holds -- so accepting one would mean
-        either silently ignoring it or silently changing the prefix, and D17 has
-        no room for either.
+        ``tools=`` explicitly reattaches in-process handlers when resuming a
+        tool-enabled session. The caller must supply the original definitions;
+        raw resume cannot verify a vendor's earlier prefix. Managed native
+        conversations persist and compare these definitions before resuming,
+        then rebind only the current turn's handlers. Tools remain fixed during
+        a live Session; changing definitions requires a separate managed chat.
 
         ``system_prompt`` is the exception, and the runtimes split on it because
         they store it in different places. Gated on
@@ -2188,7 +2241,7 @@ class Bridge:
             system_prompt=system_prompt,
             persist=persist,
             project_folder=project_folder,
-            tools=None,
+            tools=tools,
             mcp_servers=None,
             guards=guards,
             stop_at_tokens=stop_at_tokens,

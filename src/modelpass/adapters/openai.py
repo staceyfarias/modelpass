@@ -352,6 +352,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, ClassVar
 
+from .._background import process_options
 from .._toml import dumps_inline
 from ..capabilities import Capability, Support
 from ..errors import (
@@ -1822,6 +1823,7 @@ def _default_mcp_list(binary: str, env: dict[str, str]) -> str | None:
     try:
         result = subprocess.run(
             [binary, "mcp", "list", "--json"],
+            **process_options(),
             env=env,
             capture_output=True,
             text=True,
@@ -1839,6 +1841,7 @@ def _default_mcp_list(binary: str, env: dict[str, str]) -> str | None:
 def _default_spawn(argv: list[str], env: dict[str, str], cwd: str) -> subprocess.Popen[str]:
     return subprocess.Popen(
         argv,
+        **process_options(),
         env=env,
         cwd=cwd,
         stdout=subprocess.PIPE,
@@ -1905,6 +1908,7 @@ def _default_codex_version(binary: str, env: dict[str, str]) -> str | None:
     try:
         result = subprocess.run(
             [binary, "--version"],
+            **process_options(),
             env=env,
             capture_output=True,
             text=True,
@@ -1925,6 +1929,7 @@ def _default_login_status(binary: str, env: dict[str, str]) -> str | None:
     try:
         result = subprocess.run(
             [binary, "login", "status"],
+            **process_options(),
             env=env,
             capture_output=True,
             text=True,
@@ -2007,6 +2012,7 @@ def _default_session_spawn(
     """
     return subprocess.Popen(
         argv,
+        **process_options(),
         env=env,
         cwd=cwd,
         stdout=subprocess.PIPE,
