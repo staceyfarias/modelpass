@@ -375,12 +375,22 @@ def to_json_schema(tool: Any) -> dict:
     return schema
 
 
+#: The runtimes whose structured output is OpenAI's strict subset, and whose
+#: answers therefore carry a ``null`` for every optional field the model had
+#: nothing to say about. ``openai-sdk`` requires the caller to send the strict
+#: form; ``openai-api`` and ``openai-compatible`` rewrite to it themselves.
+_STRICT_SCHEMA_RUNTIMES = frozenset(
+    {Runtime.OPENAI_SDK, Runtime.OPENAI_API, Runtime.OPENAI_COMPATIBLE}
+)
+
+
 def _strip_nulls(value: Any) -> Any:
     """Drop ``None`` values, recursively, from a strict-schema answer.
 
     :func:`modelpass.to_openai_strict` expresses "optional" as *required and
     nullable*, because OpenAI's strict subset has no notion of an absent key. So
-    an ``openai-sdk`` run reports every field it had nothing to say about as
+    a run on any of :data:`_STRICT_SCHEMA_RUNTIMES` reports every field it had
+    nothing to say about as
     ``null``, and handing that to a dataclass or model constructor overwrites
     the class's own default with ``None`` -- a ``list`` field becomes ``None``
     and the next thing to iterate it raises, three layers from here.
@@ -652,8 +662,13 @@ class ChatSubpass(BaseChatModel):
         field comes back explicitly null. See :func:`_strip_nulls`.
         """
         runtime = getattr(connection, "runtime", None)
-        if runtime is not Runtime.OPENAI_SDK:
+        if runtime not in _STRICT_SCHEMA_RUNTIMES:
             return schema
+        # Converted here for all three, though the two API adapters would do it
+        # themselves: the rewrite is idempotent, and one place deciding both
+        # "this was tightened" and "so strip its nulls" cannot disagree with
+        # itself. Keying the strip on openai-sdk alone left the API runtimes
+        # handing a constructor nulls in place of its own defaults.
         state["strict_schema"] = True
         return to_openai_strict(schema)
 

@@ -1264,7 +1264,10 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
         # the schema, and "no structured answer" would misreport why.
         if request.schema is not None and not refusal.strip():
             event, failure = build_structured_event(
-                request.schema,
+            # Checked against the schema that was *sent*: the strict rewrite
+            # made optional properties required-and-nullable, and an answer
+            # that obeys it must not be failed against the form it replaced.
+                to_openai_strict(normalize_schema(request.schema)),
                 raw=final_text,
                 schema_name=resolve_schema_name(request.schema, request.schema_name),
             )

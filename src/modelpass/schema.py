@@ -353,6 +353,12 @@ def build_structured_event(
 # --- the one place the runtimes disagree ------------------------------------------
 
 
+#: Where a schema keeps the subschemas its ``$ref``s point at. Both spellings:
+#: ``$defs`` is the current one and what Pydantic v2 writes, ``definitions`` is
+#: draft-07's and what older generators still write.
+_DEFINITION_KEYWORDS = ("$defs", "definitions")
+
+
 def openai_strict_issues(schema: Mapping[str, Any], *, path: str = "$") -> tuple[str, ...]:
     """Why ``openai-sdk`` would reject this schema, in its own terms. Pure.
 
@@ -406,6 +412,11 @@ def _strict_issues(schema: Any, path: str, issues: list[str]) -> None:
     items = schema.get("items")
     if isinstance(items, Mapping):
         _strict_issues(items, f"{path}[]", issues)
+    for keyword in _DEFINITION_KEYWORDS:
+        definitions = schema.get(keyword)
+        if isinstance(definitions, Mapping):
+            for name, subschema in definitions.items():
+                _strict_issues(subschema, f"{path}.{keyword}.{name}", issues)
 
 
 def to_openai_strict(schema: Mapping[str, Any]) -> dict[str, Any]:
@@ -416,17 +427,30 @@ def to_openai_strict(schema: Mapping[str, Any]) -> dict[str, Any]:
     not required gains ``"null"`` in its type**, so "absent" is expressed as
     "present and null". Objects gain ``additionalProperties: false``.
 
-    **Deliberately not applied automatically.** Making an optional field
-    mandatory-but-nullable changes the shape of the answer the caller gets back,
-    and doing that silently to somebody's schema is the kind of helpfulness that
-    turns into a bug report about missing keys. A caller who wants it asks for
-    it, once, where they can see what it did::
+    **Who applies it.** Making an optional field mandatory-but-nullable changes
+    the shape of the answer the caller gets back, so where it happens is stated
+    rather than left to be discovered:
 
-        schema = to_openai_strict(EXTRACTION_SCHEMA)
+    * ``openai-sdk`` (Codex) does **not** apply it. The schema is passed through
+      verbatim and the receipt reports :func:`openai_strict_issues`; a caller
+      who wants the rewrite asks for it, once, where they can see what it did::
+
+          schema = to_openai_strict(EXTRACTION_SCHEMA)
+
+    * ``openai-api`` and ``openai-compatible`` **do** apply it, on every schema,
+      because ``strict: true`` is the only form their structured output takes.
+      They say so on the receipt, and they validate the answer against the
+      rewritten schema -- the one the model was actually held to -- so a
+      ``null`` for a formerly optional property is a valid answer.
+
+    Definitions (``$defs``, ``definitions``) are rewritten too: that is where a
+    nested model lives in a schema generated from Pydantic, and an object left
+    loose there is rejected under ``strict: true`` like any other.
 
     Composition subtrees (``anyOf``, ``$ref``, ...) are returned untouched: they
     cannot be rewritten without changing meaning, and OpenAI's strict mode has
-    its own rules for them that modelpass has not verified.
+    its own rules for them that modelpass has not verified. The input is never
+    modified, and the rewrite of an already strict schema is that schema.
     """
     return _to_strict(schema)
 
@@ -453,6 +477,10 @@ def _to_strict(schema: Any) -> Any:
     items = out.get("items")
     if isinstance(items, Mapping):
         out["items"] = _to_strict(items)
+    for keyword in _DEFINITION_KEYWORDS:
+        definitions = out.get(keyword)
+        if isinstance(definitions, Mapping):
+            out[keyword] = {name: _to_strict(sub) for name, sub in definitions.items()}
     return out
 
 
