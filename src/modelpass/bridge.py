@@ -536,6 +536,27 @@ def _with_call_reasoning(
         replace(sampling, reasoning_effort=None),
     )
 
+def _sampling_for_failover(sampling: Sampling | None) -> Sampling | None:
+    """What the caller asked about sampling, as the second leg should hear it.
+
+    2026-11-13. A failover is still the caller's call, so the ceiling and the
+    temperature they set cross with it -- the second leg is the one most likely
+    to be metered, and it used to run with neither. A field the target runtime
+    cannot take is dropped by the target's own sampling rules and named on its
+    receipt, exactly as on a first leg.
+
+    **The effort level does not cross.** A level is a vendor's vocabulary, the
+    first request's copy may be the first *connection's* standing level rather
+    than anything the caller said, and the documented rule is that a failover
+    target uses its own connection's level -- which ``_build_request`` fills in
+    from the target once this field is empty.
+    """
+    if sampling is None or sampling.reasoning_effort is None:
+        return sampling
+    carried = replace(sampling, reasoning_effort=None)
+    return None if carried == Sampling() else carried
+
+
 class Bridge:
     """Entry point. Owns a connection store, a capability registry and adapters.
 
@@ -3257,18 +3278,7 @@ class Bridge:
         :meth:`achat` can hand it to a thread without copying the decorations
         that follow it.
         """
-        receipt = self._with_recorded_identity(
-            plan.request.connection, plan.adapter.preflight(plan.request)
-        )
-        _note = self._option_note(plan.adapter, plan.request.options)
-        if _note is not None:
-            receipt = replace(receipt, notes=(*receipt.notes, _note))
-        receipt = self._with_cache_disclosure(plan.adapter, plan.request, receipt)
-        receipt = self._with_cache_breakpoints(plan.request, receipt)
-        receipt = self._with_documents(plan.request, receipt)
-        receipt = self._with_reasoning_disclosure(plan.request, receipt)
-        receipt = self._with_prompt_cache(plan.request, receipt)
-        receipt = self._with_sampling_disclosure(plan.request, receipt)
+        receipt = self._decorated_receipt(plan.adapter, plan.request)
         receipt.require_ok()
         receipt.require_auth_mode(
             AuthMode(plan.expect_auth_mode)
@@ -3276,6 +3286,29 @@ class Bridge:
             else None
         )
 
+        return receipt
+
+    def _decorated_receipt(self, adapter: Adapter, request: RunRequest) -> Receipt:
+        """One leg's preflight, with every disclosure the bridge adds to it.
+
+        Its own method so the two places a leg starts share it (2026-11-13). A
+        failover's second leg used to take the adapter's receipt bare, so the
+        leg most likely to be metered was the one whose receipt -- and whose
+        ledger line, which is read off the receipt -- said nothing about
+        sampling, cache breakpoints, documents, reasoning or ignored options.
+        """
+        receipt = self._with_recorded_identity(
+            request.connection, adapter.preflight(request)
+        )
+        _note = self._option_note(adapter, request.options)
+        if _note is not None:
+            receipt = replace(receipt, notes=(*receipt.notes, _note))
+        receipt = self._with_cache_disclosure(adapter, request, receipt)
+        receipt = self._with_cache_breakpoints(request, receipt)
+        receipt = self._with_documents(request, receipt)
+        receipt = self._with_reasoning_disclosure(request, receipt)
+        receipt = self._with_prompt_cache(request, receipt)
+        receipt = self._with_sampling_disclosure(request, receipt)
         return receipt
 
     def _stream(self, prepared: _Prepared) -> Iterator[AgentEvent]:
@@ -3667,14 +3700,15 @@ class Bridge:
                 primary.written_messages or primary.messages,
                 model=model,
                 options=primary.options,
+                sampling=_sampling_for_failover(primary.sampling),
                 tools=primary.tools,
                 mcp_servers=primary.mcp_servers,
                 schema=primary.schema,
                 schema_name=primary.schema_name,
             )
-            receipt = self._with_recorded_identity(
-                target, adapter.preflight(request)
-            )
+            # The same decoration the first leg's receipt gets, so the second
+            # receipt and the second ledger line answer the same questions.
+            receipt = self._decorated_receipt(adapter, request)
             receipt.require_ok()
             receipt.require_auth_mode()
         except SubpassError as exc:

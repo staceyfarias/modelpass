@@ -36,6 +36,7 @@ from modelpass.types import (
     FailoverEvent,
     ReceiptEvent,
     Retryable,
+    Sampling,
     TerminalEvent,
     TerminalStatus,
     TextDeltaEvent,
@@ -628,3 +629,117 @@ def test_a_429_that_named_no_wait_still_fails_over(store):
     assert len(fake.requests) == 2
     assert events[-1].connection == "openai-api"
     assert events[-1].failed_over_from == "claude-api"
+
+
+# --- what the caller asked for crosses with the call (2026-11-13) ------------------
+#
+# The second leg is the one most likely to be metered, so it is the leg where a
+# dropped ``max_output_tokens`` costs money: ``chat(sampling=Sampling(
+# max_output_tokens=256, temperature=0))`` that failed over ran uncapped, and
+# the ledger line for that leg had empty sampling columns.
+
+
+def _sub_to_api(store, **second):
+    store.add(
+        Connection(
+            name="claude-sub",
+            runtime=Runtime.ANTHROPIC_SDK,
+            auth_mode=AuthMode.SUBSCRIPTION,
+            guards=failing_over_to("claude-api"),
+        )
+    )
+    store.add(
+        Connection(
+            name="claude-api",
+            runtime=Runtime.ANTHROPIC_API,
+            auth_mode=AuthMode.API_KEY,
+            credential_ref=CredentialRef.parse("env:ANTHROPIC_API_KEY"),
+            **second,
+        )
+    )
+    fake = FakeAdapter(script_two_runs([EXHAUSTED], [TextDeltaEvent(text="ok")]))
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={Runtime.ANTHROPIC_SDK: fake, Runtime.ANTHROPIC_API: fake},
+        env=dict(ENV),
+    )
+    return bridge, fake
+
+
+def test_the_callers_sampling_reaches_the_second_leg(store):
+    bridge, fake = _sub_to_api(store)
+    list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            sampling=Sampling(max_output_tokens=256, temperature=0.0),
+        )
+    )
+    _first, second = fake.requests
+    assert second.sampling is not None
+    assert second.sampling.max_output_tokens == 256
+    assert second.sampling.temperature == 0.0
+
+
+def test_the_second_receipt_says_what_sampling_it_applied(store):
+    bridge, _ = _sub_to_api(store)
+    events = list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            sampling=Sampling(max_output_tokens=256, temperature=0.0),
+        )
+    )
+    first, second = [e.receipt for e in events if isinstance(e, ReceiptEvent)]
+    # The subscription leg could apply none of it, and said so.
+    assert first.sampling_applied == {}
+    assert second.sampling_requested == {"temperature": 0.0, "max_output_tokens": 256}
+    assert second.sampling_applied["max_output_tokens"] == 256
+    assert second.sampling_applied["temperature"] == 0.0
+
+
+def test_the_second_legs_ledger_line_carries_its_sampling(store):
+    bridge, _ = _sub_to_api(store)
+    list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            sampling=Sampling(max_output_tokens=256, temperature=0.0),
+        )
+    )
+    lines = {line["connection"]: line for line in bridge.run_log.read()}
+    assert set(lines) == {"claude-sub", "claude-api"}
+    second = lines["claude-api"]
+    assert second["sampling_requested"] == {"temperature": 0.0, "max_output_tokens": 256}
+    assert second["sampling_applied"]["max_output_tokens"] == 256
+    assert second["sampling_applied"]["temperature"] == 0.0
+
+
+def test_the_second_receipt_is_decorated_like_the_first(store):
+    """An undecorated receipt hid a required default as well as a request.
+
+    ``anthropic-api`` sends a ``max_tokens`` whether or not anyone chose one,
+    and the receipt for a first leg says so. The second leg's has to as well.
+    """
+    bridge, _ = _sub_to_api(store)
+    events = list(bridge.chat(connection="claude-sub", message="hi"))
+    second = [e.receipt for e in events if isinstance(e, ReceiptEvent)][1]
+    direct = bridge.preflight("claude-api")
+    assert second.sampling_applied
+    assert second.sampling_applied == direct.sampling_applied
+
+
+def test_a_per_call_effort_does_not_cross_the_target_uses_its_own_level(store):
+    """README: "A failover target uses its own connection's level"."""
+    bridge, fake = _sub_to_api(store, reasoning="low")
+    list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            sampling=Sampling(reasoning_effort="high", max_output_tokens=256),
+        )
+    )
+    second = fake.requests[1]
+    assert second.sampling.max_output_tokens == 256
+    assert second.sampling.reasoning_effort == "low"
