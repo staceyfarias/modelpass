@@ -35,6 +35,7 @@ from modelpass.types import (
     AuthMode,
     FailoverEvent,
     ReceiptEvent,
+    Retryable,
     TerminalEvent,
     TerminalStatus,
     TextDeltaEvent,
@@ -550,3 +551,80 @@ def test_a_failover_target_arranges_the_prompt_as_it_was_written(store):
     assert first.cache_breakpoints == 0
     assert first.messages[0].text == "stablevolatile"
     assert second.cache_breakpoints == 1
+
+
+# --- a rate limit is not a spent allowance (2026-11-13) ---------------------------
+
+
+def _api_pair(store, first_terminal):
+    """An API-key primary failing over to a second API-key connection."""
+    store.add(
+        Connection(
+            name="claude-api",
+            runtime=Runtime.ANTHROPIC_API,
+            auth_mode=AuthMode.API_KEY,
+            credential_ref=CredentialRef.parse("env:ANTHROPIC_API_KEY"),
+            guards=failing_over_to("openai-api"),
+        )
+    )
+    store.add(
+        Connection(
+            name="openai-api",
+            runtime=Runtime.OPENAI_API,
+            auth_mode=AuthMode.API_KEY,
+            credential_ref=CredentialRef.parse("env:OPENAI_API_KEY"),
+        )
+    )
+    fake = FakeAdapter(
+        script_two_runs([first_terminal], [TextDeltaEvent(text="from the second")])
+    )
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={Runtime.ANTHROPIC_API: fake, Runtime.OPENAI_API: fake},
+        env={**ENV, "OPENAI_API_KEY": "sk-not-a-real-key-either"},
+    )
+    return bridge, fake
+
+
+def _a_429(retry_after):
+    # The shape every API adapter emits: quota_exhausted, typed off the code.
+    return TerminalEvent(
+        status=TerminalStatus.QUOTA_EXHAUSTED,
+        connection="",
+        runtime=Runtime.ANTHROPIC_API,
+        auth_mode=AuthMode.API_KEY,
+        reason="the endpoint reported HTTP 429 (rate limit / quota): slow down",
+        status_code=429,
+        retry_after=retry_after,
+    )
+
+
+def test_a_rate_limit_that_named_a_wait_does_not_fail_over(store):
+    """``retry-after: 7`` is a per-minute limit, not an allowance that ran out.
+
+    Moving that call to the named connection would spend on a second (possibly
+    metered) connection for something seven seconds would have fixed.
+    """
+    bridge, fake = _api_pair(store, _a_429(7.0))
+    events = list(bridge.chat(connection="claude-api", message="hi"))
+
+    assert not any(isinstance(e, FailoverEvent) for e in events)
+    assert len(fake.requests) == 1
+    terminal = events[-1]
+    assert terminal.status is TerminalStatus.QUOTA_EXHAUSTED
+    assert terminal.connection == "claude-api"
+    assert terminal.failed_over_from is None
+    assert terminal.retryable is Retryable.YES
+    assert terminal.retry_after == 7.0
+    assert "openai-api" in terminal.reason
+
+
+def test_a_429_that_named_no_wait_still_fails_over(store):
+    bridge, fake = _api_pair(store, _a_429(None))
+    events = list(bridge.chat(connection="claude-api", message="hi"))
+
+    assert any(isinstance(e, FailoverEvent) for e in events)
+    assert len(fake.requests) == 2
+    assert events[-1].connection == "openai-api"
+    assert events[-1].failed_over_from == "claude-api"

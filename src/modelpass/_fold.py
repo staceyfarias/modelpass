@@ -54,7 +54,7 @@ from .guards import GuardTracker
 from .preflight import Receipt
 from .prompt_cache import observed_effort_continuity
 from .reasoning import reasoning_metric
-from .retry import classify_terminal, vendor_error_facts
+from .retry import classify_terminal, rate_limit_named_a_wait, vendor_error_facts
 from .types import (
     AgentEvent,
     FailoverEvent,
@@ -515,6 +515,28 @@ class CallFold:
         """
         stopped = self.fold.finish()
         if stopped.status is not TerminalStatus.QUOTA_EXHAUSTED or self.failover is None:
+            return [], False
+
+        if rate_limit_named_a_wait(
+            stopped.runtime, stopped.status, stopped.status_code, stopped.retry_after
+        ):
+            # 2026-11-13. A 429 with a retry-after is a rate limit, not a spent
+            # allowance: the same connection answers again once the wait has
+            # passed. Failover exists for the allowance that ran out, and it is
+            # the only path onto a second (often metered) connection -- so a
+            # per-minute limit must not take it. The terminal reads retryable,
+            # carries the wait, and says the failover was deliberately not used.
+            # Decided from the typed facts and not from the stamped verdict,
+            # which a ``retry = "never"`` connection has already forced to NO.
+            why = stopped.reason or "rate limited"
+            self.fold.stopped = replace(
+                stopped,
+                reason=(
+                    f"{why}; the endpoint named a wait of {stopped.retry_after:g}s, "
+                    "so this is a rate limit and not a spent allowance, and the "
+                    f"failover to {self.failover.name!r} was not used"
+                ),
+            )
             return [], False
 
         switch = self._begin_failover(
