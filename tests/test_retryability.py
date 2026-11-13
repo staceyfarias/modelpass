@@ -768,10 +768,8 @@ def test_a_bare_timeout_error_does_not_claim_nothing_was_left_half_done():
     ``TimeoutError`` -- ``asyncio.wait_for`` around a whole call, say -- carries
     none of that evidence.
     """
-    import asyncio
-
+    # ``asyncio.TimeoutError`` is this same class since Python 3.11.
     assert classify_error(TimeoutError("timed out")).retryable is Retryable.UNKNOWN
-    assert classify_error(asyncio.TimeoutError()).retryable is Retryable.UNKNOWN
 
     class Narrower(TimeoutError):
         pass
