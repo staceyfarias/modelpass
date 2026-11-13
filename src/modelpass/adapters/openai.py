@@ -4644,10 +4644,13 @@ class OpenAIAdapter(Adapter):
         **Caller-tool failures join the stream here**, and the ordering is
         causal rather than lucky: the dispatcher records a failure on the reader
         thread *before* it answers the server, and the server's completed item
-        cannot arrive until after that answer -- so draining the dispatcher on
-        each pass puts a handler's ``is_error`` result ahead of the item it
-        explains. Recording the ids on the turn is what stops the server's own
-        item becoming a second result for the same call.
+        cannot arrive until after that answer -- so draining the dispatcher
+        **after each notification is read and before it is observed** puts a
+        handler's ``is_error`` result ahead of the item it explains. Recording
+        the ids on the turn is what stops the server's own item becoming a
+        second result for the same call. (Draining only before the wait is not
+        enough: the wait is where this loop spends its time, so that is where a
+        failure is recorded.)
         """
         while True:
             if dispatcher is not None:
@@ -4663,6 +4666,21 @@ class OpenAIAdapter(Adapter):
                     "the codex app-server stopped before the turn completed"
                     + (f": {' '.join(tail.split())[:500]}" if tail else "")
                 )
+            if dispatcher is not None:
+                # Again, now that the wait is over, and this is the pass that
+                # matters under real timing (2026-11-13). A handler takes time,
+                # so the drain above usually ran before it failed and this loop
+                # was already blocked in next_notification() when the failure
+                # was recorded. The notification that woke it is then the
+                # server's completed item for that very call -- and observing
+                # it before the failure is known turned it into a tool_result,
+                # with the failure following as a second one for the same id.
+                # The dispatcher records before it answers and the server
+                # completes the item only after the answer, so a failure for
+                # this notification's call is always here by now.
+                for event in dispatcher.drain_failures():
+                    turn.reported_tool_failures.add(event.id)
+                    yield event
             stale = _notification_turn_id(notification.params)
             if stale is not None and stale in stale_turns:
                 yield VendorEvent(

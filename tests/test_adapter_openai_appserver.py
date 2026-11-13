@@ -1415,6 +1415,38 @@ def test_a_reported_failure_is_not_doubled_by_the_servers_completed_item():
     assert "item/completed:dynamicToolCall" in vendor_names
 
 
+def test_a_failure_recorded_while_the_drain_is_waiting_is_still_not_doubled():
+    """The ordering a real turn has, which the test above does not produce.
+
+    A handler takes time, so by the time it fails the drain has read everything
+    the server said so far and is **blocked waiting for the next line**. That
+    next line is the server's completed item. The failure used to be collected
+    only *before* the wait, so the item was read first, with nothing yet known
+    about the call, and became a ``tool_result`` -- and the failure became a
+    second one on the next pass. The fake's handler here is slow on purpose:
+    an instant one fails before the drain ever blocks, which is the only reason
+    the test above passed.
+    """
+
+    def slow_then_offline(args):
+        time.sleep(0.3)  # long enough for the drain to be waiting on the queue
+        raise RuntimeError("the loudness index is offline")
+
+    server = ScriptedAppServer(tool_script())
+    adapter, _ = adapter_for(server)
+    events = list(adapter.run(request_for(tools=(loudness_tool(slow_then_offline),))))
+
+    results = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert [(r.id, r.is_error) for r in results] == [(CAPTURED_CALL_ID, True)]
+    assert "RuntimeError" in results[0].content
+    names = [getattr(e, "name", "") for e in events]
+    assert "item/completed:dynamicToolCall" in names
+    assert events.index(results[0]) < names.index("item/completed:dynamicToolCall"), (
+        "the failure explains the item, so it comes first"
+    )
+    assert events[-1].status is TerminalStatus.OK
+
+
 def test_a_handler_reporting_is_error_itself_is_a_failure_too():
     """Saying no is not crashing, and both take the same route back."""
     server = ScriptedAppServer(tool_script())
