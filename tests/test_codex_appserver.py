@@ -1370,6 +1370,32 @@ def test_the_turns_own_verdict_outranks_an_earlier_error_notification():
     assert turn.reason == "the real reason"
 
 
+def test_a_turn_that_completed_is_completed_whatever_error_came_before_it():
+    """The same rule, the other way round: the turn's own status is the verdict.
+
+    An ``error`` notification is a guess at the outcome made before the outcome
+    exists. It used to stick -- a turn the server went on to report as
+    ``completed`` was still returned as an error, with the answer it produced
+    sitting in the stream.
+    """
+    turn = AppServerTurn()
+    turn.observe(note("error", willRetry=False, error={"message": "upstream hiccup"}))
+    assert turn.status is TerminalStatus.ERROR
+
+    turn.observe(completed("completed"))
+
+    assert turn.status is TerminalStatus.OK
+    assert turn.reason is None
+
+
+def test_an_error_notification_still_fails_a_turn_that_then_reports_failure():
+    turn = AppServerTurn()
+    turn.observe(note("error", willRetry=False, error={"message": "unauthorized"}))
+    turn.observe(completed("failed", {"message": "unauthorized"}))
+    assert turn.status is TerminalStatus.ERROR
+    assert turn.reason == "unauthorized"
+
+
 def test_an_unreadable_error_keeps_its_raw_text():
     assert turn_error_detail("plain string") == "plain string"
     assert turn_error_detail(None) == ""

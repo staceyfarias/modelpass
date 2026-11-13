@@ -1983,6 +1983,16 @@ class AppServerTurn:
             )
             return
         if mapped is TerminalStatus.OK:
+            # The turn's own status is the verdict, in both directions
+            # (2026-11-13). An ``error`` notification that arrived earlier had
+            # already set a failure, and this branch used to return without
+            # touching it -- so a turn the server reported as ``completed`` was
+            # still handed back as an error. :meth:`_note_error` states the
+            # rule ("the turn's own status outranks a notification that
+            # preceded it"); this is the half of it that was not written.
+            # The notification itself is not lost: it left as a vendor_event.
+            self.status = TerminalStatus.OK
+            self.reason = None
             return
         detail = turn_error_detail(error)
         if mapped is TerminalStatus.CANCELLED:
@@ -2009,6 +2019,16 @@ class AppServerTurn:
         outcome -- and it does not overwrite a verdict ``turn/completed`` has
         already given, because the turn's own status outranks a notification
         that preceded it.
+
+        What it sets is **provisional** for the same reason: it stands if the
+        stream ends without a ``turn/completed``, and a ``turn/completed`` that
+        does arrive replaces it, whichever way that goes
+        (:meth:`_note_turn_completed`). **Assumed, not driven**: no capture
+        holds an ``error`` notification, so that a real server follows a
+        ``willRetry: false`` error on a turn with ``status: "failed"`` for that
+        turn is read from the schema (``TurnStatus``, ``TurnError``) and not
+        observed. If a server ever reported ``completed`` for a turn it had
+        also declared failed, this reading would take its word for it.
         """
         if params.get("willRetry") is True:
             return
