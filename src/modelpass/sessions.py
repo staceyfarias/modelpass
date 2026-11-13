@@ -429,7 +429,7 @@ class Session:
         does not pretend to know.
         """
         self._require_sendable(message)
-        return self._turn(message, Timeout.coerce(timeout), self._plan_effort(reasoning))
+        return self._turn(message, self._turn_timeout(timeout), self._plan_effort(reasoning))
 
     def asend(
         self,
@@ -464,7 +464,20 @@ class Session:
         policy about where a conversation lives rather than a gap here.
         """
         self._require_sendable(message)
-        return self._aturn(message, Timeout.coerce(timeout), self._plan_effort(reasoning))
+        return self._aturn(message, self._turn_timeout(timeout), self._plan_effort(reasoning))
+
+    def _turn_timeout(self, timeout: Timeout | float | None) -> Timeout | None:
+        """The bound for this turn: the caller's, else the connection's, else none.
+
+        The same rule :meth:`Bridge.chat` applies, by the same function, because
+        ``timeoutSeconds`` is documented as the default bound *per call* and a
+        turn is a call (2026-11-13). ``send()`` used to coerce only its own
+        argument, so a session on a connection configured at 120 seconds waited
+        on a hung runtime for ever. A turn that names a bound still replaces the
+        connection's rather than being clamped by it, and an empty
+        :class:`~modelpass.types.Timeout` still means unbounded.
+        """
+        return self._bridge._call_timeout(self._request.connection, timeout)
 
     async def _aturn(
         self,

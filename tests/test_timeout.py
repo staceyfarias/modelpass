@@ -332,3 +332,97 @@ def test_a_session_turn_is_bounded_and_the_session_survives(tmp_path, connection
     events = list(session.send("hi", timeout=Timeout(total=30)))
     assert events[-1].status is TerminalStatus.OK
     assert not session.closed
+
+
+# --- a turn is a call: the connection's bound, and the first-token bound ----------
+
+
+class _StallingSessionAdapter(StallingAdapter):
+    """A session whose every turn stops answering until it is cancelled.
+
+    The session counterpart of :class:`~modelpass.testing.StallingAdapter`: the
+    handle's ``send`` is the stalled stream, and the adapter's ``cancel()`` is
+    what the watchdog reaches (a plain generator carries no cancel of its own).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # A broken bound fails the test in seconds rather than hanging it.
+        self.patience = 3.0
+        self.efforts: list[str | None] = []
+
+    def open_session(self, request):
+        adapter = self
+
+        class _Handle:
+            id = None
+
+            def send(self, message, *, effort=None):
+                adapter.efforts.append(effort)
+                return adapter._stall(request)
+
+            def history(self):
+                return ()
+
+            def close(self):
+                pass
+
+        return _Handle()
+
+
+def _bounded(seconds: float) -> Connection:
+    return Connection(
+        name="claude-sub",
+        runtime=Runtime.ANTHROPIC_SDK,
+        auth_mode=AuthMode.SUBSCRIPTION,
+        credential_ref=CredentialRef.native_login(),
+        timeout_seconds=seconds,
+    )
+
+
+def test_a_session_turn_takes_the_connections_bound_when_it_names_none(tmp_path):
+    """``timeoutSeconds`` is "per call", and a turn is a call (2026-11-13).
+
+    ``send()`` used to coerce only its own argument, so a session on a
+    connection configured at 120 seconds waited on a hung runtime for ever.
+    """
+    adapter = _StallingSessionAdapter()
+    bridge, _, _ = _bridge(tmp_path, _bounded(0.2), adapter)
+    session = bridge.new_chat(connection="claude-sub", persist=False)
+    try:
+        events = list(session.send("hi"))
+        assert events[-1].status is TerminalStatus.TIMED_OUT
+        assert "0.2" in events[-1].reason
+        assert not session.closed
+    finally:
+        session.close()
+
+
+def test_a_session_turn_that_names_a_bound_replaces_the_connections(tmp_path):
+    """Replaced, never clamped: the turn's own bound is the one that fires."""
+    adapter = _StallingSessionAdapter()
+    bridge, _, _ = _bridge(tmp_path, _bounded(0.05), adapter)
+    session = bridge.new_chat(connection="claude-sub", persist=False)
+    try:
+        events = list(session.send("hi", timeout=Timeout(first_token=0.3)))
+        assert events[-1].status is TerminalStatus.TIMED_OUT
+        assert "first_token" in events[-1].reason
+    finally:
+        session.close()
+
+
+def test_an_async_session_turn_takes_the_connections_bound_too(tmp_path):
+    import asyncio
+
+    adapter = _StallingSessionAdapter()
+    bridge, _, _ = _bridge(tmp_path, _bounded(0.2), adapter)
+    session = bridge.new_chat(connection="claude-sub", persist=False)
+
+    async def drive():
+        return [event async for event in session.asend("hi")]
+
+    try:
+        events = asyncio.run(drive())
+        assert events[-1].status is TerminalStatus.TIMED_OUT
+    finally:
+        session.close()
