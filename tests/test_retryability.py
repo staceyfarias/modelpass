@@ -739,3 +739,57 @@ def test_a_never_connection_still_outranks_a_carried_verdict(tmp_path):
     assert classify_error(caught.value, connection_retry=NEVER).retryable is (
         Retryable.NO
     )
+
+
+# --- two builtin exceptions the name table got wrong (2026-11-13) -----------------
+
+
+def test_a_cancellation_is_the_callers_own_act_and_reads_no():
+    """The terminal row for ``cancelled`` says NO; the exception has to agree.
+
+    It read UNKNOWN -- "not in the retry table" -- which a loop treating
+    UNKNOWN as "ask a human or try once" would act on, for a run somebody
+    stopped on purpose.
+    """
+    import asyncio
+    import concurrent.futures
+
+    for exc in (asyncio.CancelledError(), concurrent.futures.CancelledError()):
+        verdict = classify_error(exc)
+        assert verdict.retryable is Retryable.NO, type(exc)
+        assert "cancel" in verdict.note
+
+
+def test_a_bare_timeout_error_does_not_claim_nothing_was_left_half_done():
+    """A builtin ``TimeoutError`` does not say what timed out or how far it got.
+
+    It read YES unconditionally. The only timeout this table calls transient
+    outright is a first-token expiry on a stateless run, and a bare
+    ``TimeoutError`` -- ``asyncio.wait_for`` around a whole call, say -- carries
+    none of that evidence.
+    """
+    import asyncio
+
+    assert classify_error(TimeoutError("timed out")).retryable is Retryable.UNKNOWN
+    assert classify_error(asyncio.TimeoutError()).retryable is Retryable.UNKNOWN
+
+    class Narrower(TimeoutError):
+        pass
+
+    assert classify_error(Narrower()).retryable is Retryable.UNKNOWN
+
+
+def test_a_timeout_that_carries_a_status_code_is_still_read_off_the_code():
+    class GatewayTimeout(TimeoutError):
+        status_code = 504
+
+    assert classify_error(GatewayTimeout()).retryable is Retryable.YES
+
+
+def test_the_sdks_own_request_timeout_is_still_transient():
+    """Typed by the vendor SDK as its request timeout: that one names itself."""
+
+    class APITimeoutError(Exception):
+        pass
+
+    assert classify_error(APITimeoutError()).retryable is Retryable.YES

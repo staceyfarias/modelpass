@@ -293,7 +293,22 @@ _ERROR_NAME_ROWS: dict[str, tuple[Retryable, str]] = {
     "APITimeoutError": (Retryable.YES, "the SDK's own request timeout fired"),
     "ConnectionResetError": (Retryable.YES, "the connection was reset"),
     "ConnectionError": (Retryable.YES, "the connection failed"),
-    "TimeoutError": (Retryable.YES, "a transport timeout"),
+    # 2026-11-13. UNKNOWN, where this row said YES. The builtin says a wait
+    # ran out and nothing else: not which wait, not whether a request was
+    # mid-answer when it did. ``asyncio.wait_for`` around a whole call raises
+    # exactly this, for a run that may have spent most of its allowance -- the
+    # case the RunTimedOut row above already answers UNKNOWN for the same
+    # reason. The timeouts this table does call transient name themselves: the
+    # SDK's APITimeoutError, a 408 or a 504, a first-token expiry.
+    "TimeoutError": (
+        Retryable.UNKNOWN,
+        "a timeout with no typed fact saying what timed out or how far it got",
+    ),
+    # 2026-11-13. A cancellation is the caller's own act, as on the CANCELLED
+    # terminal row: retrying a run somebody deliberately stopped is the library
+    # second-guessing them. Matches asyncio's and concurrent.futures' classes,
+    # which share the name. It was absent, and so read UNKNOWN.
+    "CancelledError": (Retryable.NO, "the caller cancelled this run"),
     "ServiceUnavailable": (Retryable.YES, "the service reported itself unavailable"),
     "InternalServerError": (Retryable.YES, "a server-side fault"),
     "RateLimitError": (Retryable.YES, "the endpoint reported a rate limit"),
