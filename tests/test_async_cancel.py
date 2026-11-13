@@ -130,13 +130,15 @@ def test_aclose_joins_the_worker_thread(tmp_path, connection):
     assert wait_for(lambda: not worker_threads())
 
 
-def test_an_abandoned_run_leaves_no_line_in_the_ledger(tmp_path, connection):
+def test_an_abandoned_run_leaves_a_cancelled_line_in_the_ledger(tmp_path, connection):
     """Exactly what the sync face does, and the reason is the same.
 
-    A run nobody finished has no terminal, and the ledger is a record of
-    terminals: writing a line here would put a run in the log that never ended
-    and whose spend nobody ever totalled. The cancel still happens; the
-    bookkeeping does not, on either face.
+    Reversed on 2026-11-13. This test used to hold the opposite -- no line,
+    because "the ledger is a record of terminals" and an abandoned run has
+    none. That left a run which had started, and may have streamed thousands
+    of tokens of usage, absent from the one file that says what was spent. The
+    line is now written as ``cancelled`` with the usage seen up to the moment
+    of letting go; see ``CallFold.abandon``.
     """
     adapter = StallingAdapter(before=[TextDeltaEvent(text="a")])
     bridge, _, _ = bridged(tmp_path, connection, adapter)
@@ -150,7 +152,9 @@ def test_an_abandoned_run_leaves_no_line_in_the_ledger(tmp_path, connection):
         await events.aclose()
 
     run(go())
-    assert bridge.run_log.read() == ()
+    (line,) = bridge.run_log.read()
+    assert line["status"] == "cancelled"
+    assert line["connection"] == "claude-sub"
     assert adapter.cancelled == 1
 
 

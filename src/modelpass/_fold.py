@@ -461,6 +461,13 @@ class CallFold:
         self._record_run = record_run
         self._begin_failover = begin_failover
         self._failed_over_from: str | None = None
+        #: ``True`` once the current leg's adapter has been asked to run. The
+        #: pump sets it. A leg that was never started spent nothing and has no
+        #: line to write if the caller lets go.
+        self.leg_running = False
+        #: ``True`` once :meth:`finish` or :meth:`abandon` has written the final
+        #: leg's line, so no path writes it twice.
+        self._closed = False
         self.fold = self._new_fold()
 
     def _new_fold(self) -> RunFold:
@@ -586,6 +593,7 @@ class CallFold:
         # call crosses at most one connection boundary, so a second exhausted
         # allowance ends the call rather than starting a third leg.
         self.failover = None
+        self.leg_running = False
         self.fold = self._new_fold()
         return [event], True
 
@@ -651,7 +659,41 @@ class CallFold:
             stopped = replace(stopped, failed_over_from=self._failed_over_from)
             self.fold.stopped = stopped
         self.record()
+        self._closed = True
         return [stopped]
+
+    def abandon(self) -> None:
+        """The caller let go before the terminal: write the line it never saw.
+
+        2026-11-13. Closing the iterator is the documented way to stop a run
+        early (D10), and the ledger line was only ever written on the way to
+        emitting the terminal event -- so a run stopped that way left no line
+        at all, however much usage it had already streamed. A run that was
+        paid for is a run the ledger records.
+
+        The line is ``cancelled`` with the tracker's total at the moment of
+        letting go, which is this library's last knowledge of what the run
+        cost; the vendor may have billed a little more that no event carried.
+        Where the fold had already decided a terminal the caller did not stay
+        to read -- a guard stop, a timeout -- that terminal is the truth and is
+        what is written. Nothing is written for a leg whose adapter was never
+        started, and nothing twice.
+
+        No event comes of this: there is nobody left to hand one to.
+        """
+        if self._closed or not self.leg_running:
+            return
+        self._closed = True
+        stopped = self.fold.stopped
+        if stopped is None:
+            stopped = self.fold.terminal(
+                TerminalStatus.CANCELLED,
+                "cancelled by caller: the stream was closed before the run ended",
+            )
+        if self._failed_over_from is not None:
+            stopped = replace(stopped, failed_over_from=self._failed_over_from)
+        self.fold.stopped = stopped
+        self.record()
 
     def raise_for_stop(self) -> None:
         """``raise_on_stop``'s half of the contract, read off the final terminal."""

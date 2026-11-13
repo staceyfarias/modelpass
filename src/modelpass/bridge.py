@@ -3342,6 +3342,13 @@ class Bridge:
             # The durable half of D3's stamp, then the one terminal event.
             yield from call.finish()
             call.raise_for_stop()
+        except GeneratorExit:
+            # The caller closed the iterator. That is a cancel (D10), and the
+            # run it cancelled still goes in the ledger -- see CallFold.abandon.
+            # Only this exit: a refusal or an adapter bug raised out of the pump
+            # is not a cancellation and must not be written down as one.
+            call.abandon()
+            raise
         finally:
             # Always, on every exit -- a terminal, a raise, or the caller
             # letting go of the iterator. A timer left armed after the run would
@@ -3379,6 +3386,7 @@ class Bridge:
             # a run failure like any other and must not escape the
             # classification below.
             stream = leg.adapter.run(leg.request)
+            call.leg_running = True
             if fold.deadline is not None:
                 # The watchdog cancels this run and nothing else (see Deadline).
                 fold.deadline.bind_run(run_canceller(stream, leg.adapter))
@@ -3472,6 +3480,11 @@ class Bridge:
             for event in call.finish():
                 yield event
             call.raise_for_stop()
+        except (GeneratorExit, asyncio.CancelledError):
+            # ``aclose()`` or a cancelled task: the same letting-go as closing
+            # the sync iterator, and the same ledger line.
+            call.abandon()
+            raise
         finally:
             # Always, on every exit -- a terminal, a raise, or an ``aclose()``.
             if deadline is not None:
@@ -3521,6 +3534,7 @@ class Bridge:
         stream: AsyncIterator[AgentEvent] | None = None
         try:
             stream = leg.adapter.arun(leg.request)
+            call.leg_running = True
             if fold.deadline is not None:
                 fold.deadline.bind_run(run_canceller(stream, leg.adapter))
             async for event in stream:
