@@ -539,9 +539,25 @@ class CallFold:
             )
             return [], False
 
+        if self._bound_fired():
+            # Before the target is asked anything: its preflight is a
+            # subprocess on the agent runtimes, and a call that is already out
+            # of time should not start one.
+            self._timed_out_between_legs(stopped)
+            return [], False
+
         switch = self._begin_failover(
             self.failover, self.leg.request, stopped, self.fold.tracker.total
         )
+        if self._bound_fired():
+            # And again after it, because the preflight is where the time goes.
+            # ``total`` is the whole call's wall clock, failover legs included,
+            # and the timer fires once: a second leg started now would have
+            # nothing bounding it (2026-11-13). Read ahead of a refusal for the
+            # reason ``EventFold.feed`` reads the bound ahead of an event -- the
+            # bound the caller set is the cause, whatever else is also true.
+            self._timed_out_between_legs(stopped)
+            return [], False
         if isinstance(switch, str):
             # The target could not be made ready. The run still stopped cleanly
             # on quota -- that part is true and is reported as such; the failure
@@ -572,6 +588,44 @@ class CallFold:
         self.failover = None
         self.fold = self._new_fold()
         return [event], True
+
+    def failover_due(self) -> bool:
+        """Whether :meth:`advance` is about to ask the failover target anything.
+
+        For the async pump, which has to know before it calls :meth:`advance`
+        whether that call will block on a preflight. Call it only once the leg
+        is over: it reads the leg's terminal, and decides ``ok`` where nothing
+        else has.
+        """
+        stopped = self.fold.finish()
+        return (
+            self.failover is not None
+            and stopped.status is TerminalStatus.QUOTA_EXHAUSTED
+            and not rate_limit_named_a_wait(
+                stopped.runtime, stopped.status, stopped.status_code, stopped.retry_after
+            )
+            and not self._bound_fired()
+        )
+
+    def _bound_fired(self) -> bool:
+        return self.deadline is not None and self.deadline.fired is not None
+
+    def _timed_out_between_legs(self, stopped: TerminalEvent) -> None:
+        """End the call on the bound that ran out before the second leg began.
+
+        One terminal, on the first connection, carrying what the first leg
+        spent: no second connection ran, so there is no failover to announce
+        and one line for the ledger. The reason keeps the quota stop that was
+        true a moment earlier, so neither fact hides the other.
+        """
+        assert self.deadline is not None and self.failover is not None
+        why = stopped.reason or "quota exhausted"
+        self.fold.stopped = self.fold.terminal(
+            TerminalStatus.TIMED_OUT,
+            f"{self.deadline.reason()} before the failover to "
+            f"{self.failover.name!r} could start (the first connection had "
+            f"stopped: {why})",
+        )
 
     def record(self) -> None:
         """Write this leg's line to the ledger."""

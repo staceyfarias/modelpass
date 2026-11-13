@@ -79,10 +79,36 @@ class Deadline:
             self._schedule()
 
     def bind(self, adapter: Adapter, *, run_scoped: bool = False) -> None:
-        """Aim at a second leg's adapter without restarting the clock."""
+        """Aim at a second leg's adapter without restarting the clock.
+
+        **A bound that already fired is owed to the leg being bound**
+        (2026-11-13). The timer fires once. If it fired between the legs there
+        was no run to cancel, and nothing would ever cancel the second one: it
+        ran unbounded on a call that had already used up its time. Marking the
+        cancel as owed makes :meth:`bind_run` deliver it to the new run the
+        moment that run exists. Run-scoped only, for the reason :meth:`_fire`
+        gives: an adapter is shared, and is never cancelled to end one run.
+        """
         with self._lock:
             self._adapter = adapter
             self._run_scoped = run_scoped
+            self._run_cancel = None
+            if self._fired is not None and run_scoped:
+                self._owed = True
+
+    def release_run(self) -> None:
+        """The run this was aimed at is over; stop aiming at it.
+
+        2026-11-13. Called by the pump when a leg ends. Without it the deadline
+        kept the finished leg's cancel, and a bound firing afterwards -- while a
+        failover target's preflight ran, say -- called it. On a stream with a
+        cancel of its own that is a cancel of nothing; on a plain generator the
+        run's cancel *is* ``adapter.cancel()``, which reaches whatever other
+        call is using that adapter. Once released, a run-scoped bound that
+        fires is held as owed instead, and only a later :meth:`bind_run` can
+        collect it.
+        """
+        with self._lock:
             self._run_cancel = None
 
     def bind_run(self, cancel: Callable[[], None]) -> None:
