@@ -70,6 +70,7 @@ flattening D14 exists to remove reintroduced through the back door.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 import textwrap
@@ -517,6 +518,7 @@ class Session:
             reason_for=self._terminal_reason,
         )
         stream: AsyncIterator[AgentEvent] | None = None
+        abandoned = False
         try:
             for event in fold.begin():
                 yield event
@@ -557,17 +559,30 @@ class Session:
             error = fold.failed(exc)
             if error is not None:
                 raise error from exc
+        except (GeneratorExit, asyncio.CancelledError):
+            # ``aclose()``, or the task driving this turn was cancelled.
+            abandoned = True
+            raise
         finally:
-            if not fold.exhausted and stream is not None:
-                # Cancelled once, and only where the sync face cancels: the
-                # watchdog has already done it when the bound fired, and a turn
-                # abandoned with no bound at all closes the transport without
-                # interrupting a runtime the session intends to keep talking to.
-                await close_async_run(
-                    stream,
-                    self._adapter,
-                    cancel=deadline is not None and deadline.fired is None,
-                )
+            try:
+                if not fold.exhausted and stream is not None:
+                    # Cancelled once, and only where the sync face cancels: the
+                    # watchdog has already done it when the bound fired, and a
+                    # turn abandoned with no bound at all closes the transport
+                    # without interrupting a runtime the session intends to
+                    # keep talking to.
+                    await close_async_run(
+                        stream,
+                        self._adapter,
+                        cancel=deadline is not None and deadline.fired is None,
+                    )
+            except (GeneratorExit, asyncio.CancelledError):
+                # Cancelled during the teardown itself: just as abandoned.
+                abandoned = True
+                raise
+            finally:
+                if abandoned and stream is not None:
+                    self._finish_abandoned(fold)
 
         stopped = fold.finish()
         self._finish_turn(stopped, fold)
@@ -717,7 +732,9 @@ class Session:
                 "serialize the turns yourself. A Bridge is safe to share"
             )
 
-    def _finish_turn(self, stopped: TerminalEvent, fold: TurnFold) -> None:
+    def _finish_turn(
+        self, stopped: TerminalEvent, fold: TurnFold, *, abandoned: bool = False
+    ) -> None:
         """What a finished turn leaves behind, on either face."""
         if fold.session_stopped is not None:
             # The ceiling was for the whole session, so the conversation ends
@@ -728,9 +745,37 @@ class Session:
         # means the first send that *finishes*. A caller who walked away from the
         # iterator gets no id, which is exactly right -- on ``openai-sdk`` that
         # thread does not exist.
-        if self._id is None:
+        if self._id is None and not abandoned:
             self._id = self._handle.id
         self._record(stopped, fold.allowance)
+
+    def _finish_abandoned(self, fold: TurnFold) -> None:
+        """Write down a turn whose iterator was closed before its terminal.
+
+        **An abandoned turn is still a turn** (2026-11-13). The runtime was
+        asked, it may have answered at length, and the run log is where a
+        caller adds up what a session cost -- but the line is written by the
+        code after the pump's loop, which a closed generator never reaches. The
+        stateless door already writes a ``cancelled`` line for a call abandoned
+        the same way; a session turn left none.
+
+        The terminal is nobody's to read -- the caller has gone -- so it is
+        built only to be recorded: the one the fold had already decided where
+        there is one (a guard stop the caller did not stay for is still a guard
+        stop, and still ends the session), the timeout where the bound is what
+        fired, and otherwise ``cancelled`` carrying this turn's usage so far.
+        Called only for a turn whose stream was started, so a turn the runtime
+        was never asked for writes nothing. The id is not read: a turn that did
+        not finish names no session (:attr:`id`).
+        """
+        if fold.stopped is None:
+            if fold.deadline is not None and fold.deadline.fired is not None:
+                fold.stopped = fold.timed_out()
+            else:
+                fold.stopped = fold.terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller"
+                )
+        self._finish_turn(fold.stopped, fold, abandoned=True)
 
     def _turn(
         self,
@@ -781,6 +826,7 @@ class Session:
             reason_for=self._terminal_reason,
         )
         stream: Iterator[AgentEvent] | None = None
+        abandoned = False
         try:
             yield from fold.begin()
             for event in self._announce_effort(effort):
@@ -822,14 +868,23 @@ class Session:
             error = fold.failed(exc)
             if error is not None:
                 raise error from exc
+        except GeneratorExit:
+            # The caller closed the iterator, or dropped it.
+            abandoned = True
+            raise
         finally:
-            if not fold.exhausted and stream is not None:
-                _close(stream)
-                if deadline is not None and deadline.fired is None:
-                    # Cancelled once. The watchdog has already done it where the
-                    # bound fired, and it never closes the iterator itself. This
-                    # turn's cancel, not the shared adapter's.
-                    run_canceller(stream, self._adapter)()
+            try:
+                if not fold.exhausted and stream is not None:
+                    _close(stream)
+                    if deadline is not None and deadline.fired is None:
+                        # Cancelled once. The watchdog has already done it
+                        # where the bound fired, and it never closes the
+                        # iterator itself. This turn's cancel, not the shared
+                        # adapter's.
+                        run_canceller(stream, self._adapter)()
+            finally:
+                if abandoned and stream is not None:
+                    self._finish_abandoned(fold)
 
         stopped = fold.finish()
         self._finish_turn(stopped, fold)
