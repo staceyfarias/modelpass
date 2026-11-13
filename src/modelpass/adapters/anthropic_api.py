@@ -123,7 +123,12 @@ from ..types import (
     UsageScope,
     VendorEvent,
 )
-from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
+from ._mcp_result import (
+    ainvoke_handler,
+    anthropic_tool_result_content,
+    flatten_mcp_result,
+    mcp_result_payload,
+)
 from .base import (
     Adapter,
     AsyncInterrupt,
@@ -1022,7 +1027,7 @@ class AnthropicAPIAdapter(Adapter):
                     {
                         "type": "tool_result",
                         "tool_use_id": call_id,
-                        "content": payload.get("content", []),
+                        "content": anthropic_tool_result_content(payload),
                         "is_error": is_error,
                     }
                 )
@@ -1163,7 +1168,7 @@ class AnthropicAPIAdapter(Adapter):
                     {
                         "type": "tool_result",
                         "tool_use_id": call_id,
-                        "content": payload.get("content", []),
+                        "content": anthropic_tool_result_content(payload),
                         "is_error": is_error,
                     }
                 )
