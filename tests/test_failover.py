@@ -35,9 +35,12 @@ from modelpass.types import (
     AuthMode,
     FailoverEvent,
     ReceiptEvent,
+    Retryable,
+    Sampling,
     TerminalEvent,
     TerminalStatus,
     TextDeltaEvent,
+    Timeout,
     TokenUsage,
 )
 
@@ -550,3 +553,419 @@ def test_a_failover_target_arranges_the_prompt_as_it_was_written(store):
     assert first.cache_breakpoints == 0
     assert first.messages[0].text == "stablevolatile"
     assert second.cache_breakpoints == 1
+
+
+# --- a rate limit is not a spent allowance (2026-11-13) ---------------------------
+
+
+def _api_pair(store, first_terminal):
+    """An API-key primary failing over to a second API-key connection."""
+    store.add(
+        Connection(
+            name="claude-api",
+            runtime=Runtime.ANTHROPIC_API,
+            auth_mode=AuthMode.API_KEY,
+            credential_ref=CredentialRef.parse("env:ANTHROPIC_API_KEY"),
+            guards=failing_over_to("openai-api"),
+        )
+    )
+    store.add(
+        Connection(
+            name="openai-api",
+            runtime=Runtime.OPENAI_API,
+            auth_mode=AuthMode.API_KEY,
+            credential_ref=CredentialRef.parse("env:OPENAI_API_KEY"),
+        )
+    )
+    fake = FakeAdapter(
+        script_two_runs([first_terminal], [TextDeltaEvent(text="from the second")])
+    )
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={Runtime.ANTHROPIC_API: fake, Runtime.OPENAI_API: fake},
+        env={**ENV, "OPENAI_API_KEY": "sk-not-a-real-key-either"},
+    )
+    return bridge, fake
+
+
+def _a_429(retry_after):
+    # The shape every API adapter emits: quota_exhausted, typed off the code.
+    return TerminalEvent(
+        status=TerminalStatus.QUOTA_EXHAUSTED,
+        connection="",
+        runtime=Runtime.ANTHROPIC_API,
+        auth_mode=AuthMode.API_KEY,
+        reason="the endpoint reported HTTP 429 (rate limit / quota): slow down",
+        status_code=429,
+        retry_after=retry_after,
+    )
+
+
+def test_a_rate_limit_that_named_a_wait_does_not_fail_over(store):
+    """``retry-after: 7`` is a per-minute limit, not an allowance that ran out.
+
+    Moving that call to the named connection would spend on a second (possibly
+    metered) connection for something seven seconds would have fixed.
+    """
+    bridge, fake = _api_pair(store, _a_429(7.0))
+    events = list(bridge.chat(connection="claude-api", message="hi"))
+
+    assert not any(isinstance(e, FailoverEvent) for e in events)
+    assert len(fake.requests) == 1
+    terminal = events[-1]
+    assert terminal.status is TerminalStatus.QUOTA_EXHAUSTED
+    assert terminal.connection == "claude-api"
+    assert terminal.failed_over_from is None
+    assert terminal.retryable is Retryable.YES
+    assert terminal.retry_after == 7.0
+    assert "openai-api" in terminal.reason
+
+
+def test_a_429_that_named_no_wait_still_fails_over(store):
+    bridge, fake = _api_pair(store, _a_429(None))
+    events = list(bridge.chat(connection="claude-api", message="hi"))
+
+    assert any(isinstance(e, FailoverEvent) for e in events)
+    assert len(fake.requests) == 2
+    assert events[-1].connection == "openai-api"
+    assert events[-1].failed_over_from == "claude-api"
+
+
+# --- what the caller asked for crosses with the call (2026-11-13) ------------------
+#
+# The second leg is the one most likely to be metered, so it is the leg where a
+# dropped ``max_output_tokens`` costs money: ``chat(sampling=Sampling(
+# max_output_tokens=256, temperature=0))`` that failed over ran uncapped, and
+# the ledger line for that leg had empty sampling columns.
+
+
+def _sub_to_api(store, **second):
+    store.add(
+        Connection(
+            name="claude-sub",
+            runtime=Runtime.ANTHROPIC_SDK,
+            auth_mode=AuthMode.SUBSCRIPTION,
+            guards=failing_over_to("claude-api"),
+        )
+    )
+    store.add(
+        Connection(
+            name="claude-api",
+            runtime=Runtime.ANTHROPIC_API,
+            auth_mode=AuthMode.API_KEY,
+            credential_ref=CredentialRef.parse("env:ANTHROPIC_API_KEY"),
+            **second,
+        )
+    )
+    fake = FakeAdapter(script_two_runs([EXHAUSTED], [TextDeltaEvent(text="ok")]))
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={Runtime.ANTHROPIC_SDK: fake, Runtime.ANTHROPIC_API: fake},
+        env=dict(ENV),
+    )
+    return bridge, fake
+
+
+def test_the_callers_sampling_reaches_the_second_leg(store):
+    bridge, fake = _sub_to_api(store)
+    list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            sampling=Sampling(max_output_tokens=256, temperature=0.0),
+        )
+    )
+    _first, second = fake.requests
+    assert second.sampling is not None
+    assert second.sampling.max_output_tokens == 256
+    assert second.sampling.temperature == 0.0
+
+
+def test_the_second_receipt_says_what_sampling_it_applied(store):
+    bridge, _ = _sub_to_api(store)
+    events = list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            sampling=Sampling(max_output_tokens=256, temperature=0.0),
+        )
+    )
+    first, second = [e.receipt for e in events if isinstance(e, ReceiptEvent)]
+    # The subscription leg could apply none of it, and said so.
+    assert first.sampling_applied == {}
+    assert second.sampling_requested == {"temperature": 0.0, "max_output_tokens": 256}
+    assert second.sampling_applied["max_output_tokens"] == 256
+    assert second.sampling_applied["temperature"] == 0.0
+
+
+def test_the_second_legs_ledger_line_carries_its_sampling(store):
+    bridge, _ = _sub_to_api(store)
+    list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            sampling=Sampling(max_output_tokens=256, temperature=0.0),
+        )
+    )
+    lines = {line["connection"]: line for line in bridge.run_log.read()}
+    assert set(lines) == {"claude-sub", "claude-api"}
+    second = lines["claude-api"]
+    assert second["sampling_requested"] == {"temperature": 0.0, "max_output_tokens": 256}
+    assert second["sampling_applied"]["max_output_tokens"] == 256
+    assert second["sampling_applied"]["temperature"] == 0.0
+
+
+def test_the_second_receipt_is_decorated_like_the_first(store):
+    """An undecorated receipt hid a required default as well as a request.
+
+    ``anthropic-api`` sends a ``max_tokens`` whether or not anyone chose one,
+    and the receipt for a first leg says so. The second leg's has to as well.
+    """
+    bridge, _ = _sub_to_api(store)
+    events = list(bridge.chat(connection="claude-sub", message="hi"))
+    second = [e.receipt for e in events if isinstance(e, ReceiptEvent)][1]
+    direct = bridge.preflight("claude-api")
+    assert second.sampling_applied
+    assert second.sampling_applied == direct.sampling_applied
+
+
+def test_a_per_call_effort_does_not_cross_the_target_uses_its_own_level(store):
+    """README: "A failover target uses its own connection's level"."""
+    bridge, fake = _sub_to_api(store, reasoning="low")
+    list(
+        bridge.chat(
+            connection="claude-sub",
+            message="hi",
+            sampling=Sampling(reasoning_effort="high", max_output_tokens=256),
+        )
+    )
+    second = fake.requests[1]
+    assert second.sampling.max_output_tokens == 256
+    assert second.sampling.reasoning_effort == "low"
+
+
+# --- the bound is one clock over both legs, and it can run out between them --------
+#
+# 2026-11-13. ``Timeout(total=0.3)``, a first leg that ends on quota, and a
+# target whose preflight takes 0.6 s: the bound fired with no run to cancel, the
+# second leg started anyway with nothing watching it, and the watchdog's cancel
+# went to the first leg's finished run -- which, on an adapter whose streams
+# carry no cancel of their own, is the adapter every concurrent call shares.
+
+
+class _SlowPreflight(FakeAdapter):
+    def preflight(self, request):
+        import time
+
+        time.sleep(0.6)
+        return super().preflight(request)
+
+
+def _slow_target(store, primary):
+    second = Connection(
+        name="codex-sub", runtime=Runtime.OPENAI_SDK, auth_mode=AuthMode.SUBSCRIPTION
+    )
+    store.add(primary.with_guards(failing_over_to("codex-sub")))
+    store.add(second)
+    first_adapter = FakeAdapter([usage(input_tokens=10, output_tokens=5), EXHAUSTED])
+    second_adapter = _SlowPreflight(
+        [TextDeltaEvent(text="never")], runtime=Runtime.OPENAI_SDK
+    )
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={
+            Runtime.ANTHROPIC_SDK: first_adapter,
+            Runtime.OPENAI_SDK: second_adapter,
+        },
+        env={},
+    )
+    return bridge, first_adapter, second_adapter
+
+
+def test_a_second_leg_does_not_start_after_the_bound_has_fired(store, primary):
+    bridge, _, second_adapter = _slow_target(store, primary)
+    events = run(bridge, timeout=Timeout(total=0.3))
+
+    assert second_adapter.requests == []
+    assert not any(isinstance(e, FailoverEvent) for e in events)
+    assert len([e for e in events if isinstance(e, ReceiptEvent)]) == 1
+    terminals = [e for e in events if isinstance(e, TerminalEvent)]
+    assert len(terminals) == 1
+    terminal = terminals[0]
+    assert terminal.status is TerminalStatus.TIMED_OUT
+    assert terminal.connection == "claude-sub"
+    assert terminal.reason.startswith("timed out: the total bound of 0.3s expired")
+    assert "codex-sub" in terminal.reason
+    # What the first leg spent is still on the one terminal there is.
+    assert terminal.usage.total_tokens == 15
+    # One call, one ledger line, and it is the first connection's.
+    (line,) = bridge.run_log.read()
+    assert line["connection"] == "claude-sub"
+    assert line["status"] == "timed_out"
+
+
+def test_a_bound_that_fires_between_legs_cancels_no_adapter(store, primary):
+    """The first leg's run is over; a cancel aimed at it lands on its adapter,
+    which every other call on that runtime is using."""
+    bridge, first_adapter, second_adapter = _slow_target(store, primary)
+    run(bridge, timeout=Timeout(total=0.3))
+    assert first_adapter.cancelled == 0
+    assert second_adapter.cancelled == 0
+
+
+def test_raise_on_stop_reports_the_bound_that_ran_out_between_legs(store, primary):
+    from modelpass.errors import RunTimedOut
+
+    bridge, _, second_adapter = _slow_target(store, primary)
+    with pytest.raises(RunTimedOut) as caught:
+        run(bridge, timeout=Timeout(total=0.3), raise_on_stop=True)
+    assert caught.value.which == "total"
+    assert second_adapter.requests == []
+
+
+def test_a_bound_already_spent_skips_the_targets_preflight(store, primary):
+    """Fired before the first leg even reported: nothing is asked of the target."""
+    import time
+
+    second = Connection(
+        name="codex-sub", runtime=Runtime.OPENAI_SDK, auth_mode=AuthMode.SUBSCRIPTION
+    )
+    store.add(primary.with_guards(failing_over_to("codex-sub")))
+    store.add(second)
+    second_adapter = FakeAdapter([TextDeltaEvent(text="never")], runtime=Runtime.OPENAI_SDK)
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={Runtime.ANTHROPIC_SDK: FakeAdapter([]), Runtime.OPENAI_SDK: second_adapter},
+        env={},
+    )
+    prepared = bridge._prepare(
+        connection="claude-sub", message="hi", timeout=Timeout(total=0.05)
+    )
+    from modelpass._deadline import Deadline
+
+    deadline = Deadline(prepared.timeout)
+    call = bridge._call_fold(prepared, deadline)
+    try:
+        call.begin()
+        # The leg ends on quota without the fold having seen the bound fire.
+        call.fold.stopped = call.fold.terminal(TerminalStatus.QUOTA_EXHAUSTED, "spent")
+        time.sleep(0.2)
+        assert deadline.fired == "total"
+        events, running = call.advance()
+    finally:
+        deadline.stop()
+    assert (events, running) == ([], False)
+    assert call.fold.finish().status is TerminalStatus.TIMED_OUT
+    assert second_adapter.preflights == []
+
+
+def test_the_first_connections_configured_model_is_not_carried_as_the_callers(
+    store, primary, metered
+):
+    """Same runtime, and the first connection has a model in its config.
+
+    Nobody asked for that model on this call, so the target runs its own -- and
+    its receipt does not say "requested for this call" about a name that came
+    from somebody else's connection.
+    """
+    from dataclasses import replace
+
+    store.add(replace(primary, model="sub-configured-model"))
+    store.add(metered)
+    fake = FakeAdapter(script_two_runs([EXHAUSTED], [TextDeltaEvent(text="ok")]))
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={Runtime.ANTHROPIC_SDK: fake},
+        env=dict(ENV),
+    )
+    events = run(bridge)
+    first, second = fake.requests
+    assert first.model == "sub-configured-model"
+    assert second.model != "sub-configured-model"
+    receipt = [e.receipt for e in events if isinstance(e, ReceiptEvent)][1]
+    assert receipt.model_source != "requested for this call"
+
+
+def test_a_model_the_caller_named_still_crosses_on_the_same_runtime(wired):
+    bridge, fake = wired(script_two_runs([EXHAUSTED], [TextDeltaEvent(text="ok")]))
+    events = run(bridge, model="caller-chosen-model")
+    assert fake.requests[1].model == "caller-chosen-model"
+    receipt = [e.receipt for e in events if isinstance(e, ReceiptEvent)][1]
+    assert receipt.model_source == "requested for this call"
+
+
+class _BrokenPreflight(FakeAdapter):
+    def preflight(self, request):
+        raise OSError("the CLI could not be started")
+
+
+def test_a_target_preflight_that_breaks_is_a_refusal_not_a_lost_run(store, primary):
+    """Anything escaping the target's preflight used to escape the call raw,
+    with the first leg -- which really ran and really spent -- never recorded."""
+    second = Connection(
+        name="codex-sub", runtime=Runtime.OPENAI_SDK, auth_mode=AuthMode.SUBSCRIPTION
+    )
+    store.add(primary.with_guards(failing_over_to("codex-sub")))
+    store.add(second)
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={
+            Runtime.ANTHROPIC_SDK: FakeAdapter([usage(input_tokens=10), EXHAUSTED]),
+            Runtime.OPENAI_SDK: _BrokenPreflight([], runtime=Runtime.OPENAI_SDK),
+        },
+        env={},
+    )
+    events = run(bridge)
+
+    assert not any(isinstance(e, FailoverEvent) for e in events)
+    terminal = events[-1]
+    assert terminal.status is TerminalStatus.QUOTA_EXHAUSTED
+    assert terminal.connection == "claude-sub"
+    assert "could not run" in terminal.reason
+    assert "the CLI could not be started" in terminal.reason
+    (line,) = bridge.run_log.read()
+    assert line["connection"] == "claude-sub"
+
+
+def test_the_async_face_runs_an_agent_targets_preflight_off_the_loop(store, primary):
+    import asyncio
+    import threading
+
+    seen = []
+
+    class Recording(FakeAdapter):
+        def preflight(self, request):
+            seen.append(threading.get_ident())
+            return super().preflight(request)
+
+    second = Connection(
+        name="codex-sub", runtime=Runtime.OPENAI_SDK, auth_mode=AuthMode.SUBSCRIPTION
+    )
+    store.add(primary.with_guards(failing_over_to("codex-sub")))
+    store.add(second)
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={
+            Runtime.ANTHROPIC_SDK: FakeAdapter([EXHAUSTED]),
+            Runtime.OPENAI_SDK: Recording(
+                [TextDeltaEvent(text="ok")], runtime=Runtime.OPENAI_SDK
+            ),
+        },
+        env={},
+    )
+
+    async def go():
+        loop_thread = threading.get_ident()
+        events = [e async for e in bridge.achat(connection="claude-sub", message="hi")]
+        return loop_thread, events
+
+    loop_thread, events = asyncio.run(go())
+    assert events[-1].connection == "codex-sub"
+    assert seen and loop_thread not in seen

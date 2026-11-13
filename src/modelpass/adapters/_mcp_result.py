@@ -38,7 +38,12 @@ from typing import Any
 
 from ..tools import ToolDef
 
-__all__ = ["ainvoke_handler", "flatten_mcp_result", "mcp_result_payload"]
+__all__ = [
+    "ainvoke_handler",
+    "anthropic_tool_result_content",
+    "flatten_mcp_result",
+    "mcp_result_payload",
+]
 
 #: Cap on the JSON fallback. A ``tool_result``'s ``content`` is documented as
 #: flattened text for a human or a model to read, not as a transport for an
@@ -80,6 +85,66 @@ def flatten_mcp_result(payload: Any) -> str:
         return json.dumps(payload, default=str)[:_MAX_FALLBACK_CHARS]
     except (TypeError, ValueError):
         return str(payload)[:_MAX_FALLBACK_CHARS]
+
+
+def anthropic_tool_result_content(payload: Any) -> list[dict[str, Any]]:
+    """An MCP result's ``content``, as the Messages API's ``tool_result.content``.
+
+    The two vocabularies overlap in name and not in shape, which is the trap.
+    An MCP image block is ``{"type": "image", "data": <base64>, "mimeType":
+    ...}``; the Messages API's is ``{"type": "image", "source": {"type":
+    "base64", "media_type": ..., "data": ...}}`` (``ImageBlockParam`` and
+    ``Base64ImageSourceParam``, anthropic 0.97.0, read 2026-11-13). Passing the
+    handler's list through unchanged sent the first where the second is
+    required, and the request failed on the turn after the tool had run.
+
+    * text keeps ``type`` and ``text`` and nothing else -- MCP's ``annotations``
+      are not a field the Messages API reads;
+    * an MCP image is rewritten into the Messages shape;
+    * a block that already carries a ``source`` is in the Messages shape and is
+      passed through, so a handler written against this API keeps working;
+    * anything else -- audio, a resource link, an image missing its data or its
+      type -- becomes a ``[<type>]`` text marker, the same marker
+      :func:`flatten_mcp_result` puts in the event. Not dropped, and not sent
+      in a shape that would fail the whole request.
+
+    Returns a new list; the handler's own result is not modified. Never raises.
+    """
+    content = payload.get("content") if isinstance(payload, Mapping) else None
+    if not isinstance(content, (list, tuple)):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, str):
+            blocks.append({"type": "text", "text": block})
+            continue
+        if not isinstance(block, Mapping):
+            blocks.append({"type": "text", "text": f"[{type(block).__name__}]"})
+            continue
+        kind = block.get("type")
+        text = block.get("text")
+        if kind == "text" and isinstance(text, str):
+            blocks.append({"type": "text", "text": text})
+        elif isinstance(block.get("source"), Mapping):
+            blocks.append(dict(block))
+        elif (
+            kind == "image"
+            and isinstance(block.get("data"), str)
+            and isinstance(block.get("mimeType"), str)
+        ):
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": block["mimeType"],
+                        "data": block["data"],
+                    },
+                }
+            )
+        else:
+            blocks.append({"type": "text", "text": f"[{kind}]"})
+    return blocks
 
 
 def mcp_result_payload(value: Any) -> dict[str, Any]:

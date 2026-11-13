@@ -192,14 +192,21 @@ class GatedSdk:
 
 
 class OfflineAnthropicAdapter(AnthropicAdapter):
-    """The real adapter with the two machine-touching seams stubbed.
+    """The real adapter with the three machine-touching seams stubbed.
 
     ``run()``, ``cancel()`` and everything between them are the production code;
-    only the preflight (which launches the CLI) and the SDK import are replaced.
+    only the preflight (which launches the CLI), the SDK import and the
+    ``claude --version`` probe are replaced.
+
+    The probe was left real until 2026-11-13. The bridge's cache disclosure asks
+    the adapter for the TTL it runs under, which asks the CLI its version, so
+    the first call on each of these adapters launched the installed ``claude``
+    binary -- 1.5 to 3 seconds on an idle machine, and once past ``PATIENCE``
+    in a loaded full-suite run, which read as the first client never starting.
     """
 
     def __init__(self, sdk: GatedSdk) -> None:
-        super().__init__()
+        super().__init__(claude_version=lambda binary, env: "2.1.233 (Claude Code)")
         self._fake_sdk = sdk
 
     @classmethod

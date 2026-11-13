@@ -140,13 +140,16 @@ from ..types import (
 from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
 from .base import (
     Adapter,
+    AsyncInterrupt,
     InFlight,
     RunCancel,
+    RunInterrupted,
     RunRequest,
     RunStream,
     SessionHandle,
     SessionRequest,
     document_rejection,
+    interrupt_client,
     native_run,
     refuse_documents,
 )
@@ -517,10 +520,13 @@ def _reason_value(reason: Any) -> str | None:
 #: named on the terminal. Read off ``google-genai`` 1.73.1's ``FinishReason``
 #: enum on 2026-09-13; every one of them is a *content* judgement, which is the
 #: same kind of event as Anthropic's ``refusal`` and OpenAI's ``content_filter``.
+#: ``LANGUAGE`` joined on 2026-11-13: generation stopped because the content is
+#: in a language the model does not support, which is the vendor declining too.
 _BLOCKED_REASONS = frozenset(
     {
         "SAFETY",
         "RECITATION",
+        "LANGUAGE",
         "PROHIBITED_CONTENT",
         "BLOCKLIST",
         "SPII",
@@ -533,7 +539,13 @@ _BLOCKED_REASONS = frozenset(
 #: Finish reasons that mean the answer is unfinished for a mechanical reason.
 #: Separate from the set above because the sentence a caller needs is different:
 #: nothing was refused, something went wrong.
-_BROKEN_REASONS = frozenset({"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "OTHER"})
+#: ``NO_IMAGE`` and ``IMAGE_OTHER`` joined on 2026-11-13: an image was expected
+#: and was not produced. With ``LANGUAGE`` above, that makes every member of the
+#: installed ``FinishReason`` enum (1.73.1) a decision rather than a fall-through
+#: to "unknown, so ``ok``" -- which is where those three had been.
+_BROKEN_REASONS = frozenset(
+    {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "OTHER", "NO_IMAGE", "IMAGE_OTHER"}
+)
 
 
 def terminal_status(
@@ -612,6 +624,42 @@ def terminal_status(
             f"the generation ended unfinished ({reason})",
         )
     return TerminalStatus.OK, reason
+
+
+def _unfinished(finish_reason: Any, blocked: str | None) -> bool:
+    """Whether this turn ended any way but well -- in which case no tool runs.
+
+    The verdict :func:`terminal_status` would give the turn if it were the last:
+    ``MAX_TOKENS``, a blocked or broken finish reason
+    (``MALFORMED_FUNCTION_CALL`` among them), or a blocked prompt. A function
+    call beside one of those is a call the model did not finish making.
+    """
+    status, _ = terminal_status(
+        finish_reason, unanswered_call=False, blocked=blocked, answered=True
+    )
+    return status is not TerminalStatus.OK
+
+
+def event_call_id(call: Any, name: str, issued: dict[str, int]) -> str:
+    """The id a call's ``tool_call`` and ``tool_result`` events share.
+
+    The vendor's own ``FunctionCall.id`` when there is one. It is optional here
+    and usually absent, and an event with an empty id cannot be paired with its
+    result by a consumer reading the stream, so the fallback is the tool's
+    name -- made distinct. Two calls to one tool in a turn (parallel calls) used
+    to share that name as their id; now the first is ``look_up`` as before and
+    the next are ``look_up#2``, ``look_up#3``, counted across the whole run in
+    ``issued`` so a later round does not reuse one either.
+
+    Only the events carry it. What goes back to the vendor is the call itself
+    (:func:`function_response_part`), so a made-up id never reaches the wire.
+    """
+    vendor_id = getattr(call, "id", None)
+    if vendor_id:
+        return str(vendor_id)
+    count = issued.get(name, 0) + 1
+    issued[name] = count
+    return name if count == 1 else f"{name}#{count}"
 
 
 def _bare_terminal(
@@ -795,6 +843,11 @@ class GoogleAPIAdapter(Adapter):
         """
         self._client_factory = client_factory or _default_client
         self._async_client_factory = async_client_factory or _default_async_client
+        #: Whether the sync client is one this adapter builds per run, and may
+        #: therefore close to interrupt that run. A client from an injected
+        #: factory may be shared by other runs, so cancelling one run must not
+        #: close it; such a run is cancelled at the next event instead.
+        self._owns_clients = client_factory is None
         self._env = env
         self._secrets = secrets
         #: The runs in flight, each with its own cancel state. Nothing about one
@@ -1045,11 +1098,17 @@ class GoogleAPIAdapter(Adapter):
         # one run ending stopped whichever other run reached a round boundary.
         cancel = RunCancel()
         self._runs.add(cancel)
+        if self._owns_clients:
+            # The floor under the flag (D10): a run blocked in a read cannot
+            # look at one, so the cancel reaches the socket. Only for a client
+            # this adapter built for this run -- see ``interrupt_client``.
+            cancel.on_cancel(lambda: interrupt_client(client))
         return RunStream(self._loop(client, request, cancel), cancel.cancel)
 
     def _loop(self, client: Any, request: RunRequest, cancel: RunCancel) -> Iterator[AgentEvent]:
         contents = content_items(request)
         by_name = {tool.name: tool for tool in request.tools}
+        issued_ids: dict[str, int] = {}
         final_text = ""
 
         while True:
@@ -1071,6 +1130,8 @@ class GoogleAPIAdapter(Adapter):
                 stream = client.models.generate_content_stream(**params)
                 try:
                     for chunk in stream:
+                        if cancel.is_set():
+                            raise RunInterrupted
                         usage = getattr(chunk, "usage_metadata", None) or usage
                         blocked = blocked or _blocked_reason(chunk)
                         for candidate in candidates(chunk):
@@ -1100,6 +1161,14 @@ class GoogleAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
+                # A cancel that interrupted the wait surfaces here, as whatever
+                # the transport raised when it was cut. The caller stopped the
+                # run; that, not the wreckage, is how it ended.
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1112,6 +1181,16 @@ class GoogleAPIAdapter(Adapter):
 
             yield UsageEvent(usage=token_usage(usage), scope=UsageScope.DELTA)
 
+            # A stream cut by a cancel can also just *end* (a body delimited by
+            # the connection closing), and a cancel can land while the last
+            # event is in hand. Either way nothing below may run: not a tool,
+            # not another round, not an ``ok``.
+            if cancel.is_set():
+                yield _bare_terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                )
+                return
+
             if text:
                 final_text = text
 
@@ -1119,12 +1198,15 @@ class GoogleAPIAdapter(Adapter):
             # replying "not declared" round after round would be a loop with a
             # bill on it. The model should never ask -- it was sent no tools --
             # so if it does, the run ends and terminal_status() says why.
-            if not (request.tools and calls):
+            if not (request.tools and calls) or _unfinished(finish_reason, blocked):
+            # ... and a turn that was cut short has nothing to answer either:
+            # a call beside a truncated, filtered or failed ending is a call the
+            # model did not finish making, and a handler has side effects.
                 yield from self._finish(
                     request,
                     final_text,
                     finish_reason=finish_reason,
-                    unanswered_call=bool(calls),
+                    unanswered_call=bool(calls) and not request.tools,
                     blocked=blocked,
                     answered=answered,
                 )
@@ -1137,16 +1219,21 @@ class GoogleAPIAdapter(Adapter):
             for call in calls:
                 name = getattr(call, "name", "") or ""
                 arguments = call_arguments(call)
-                # FunctionCall.id is optional here and usually absent, so the
-                # name is the fallback: an event with an empty id cannot be
-                # paired with its result by a consumer reading the stream.
-                call_id = getattr(call, "id", None) or name
+                call_id = event_call_id(call, name, issued_ids)
                 yield ToolCallEvent(
                     name=name,
                     arguments=arguments,
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                # No handler runs after a cancel -- including one that arrived
+                # while the caller was looking at the call just announced, or
+                # while the previous handler was running.
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 tool = by_name.get(name)
                 payload = (
                     invoke_handler(tool, arguments) if tool is not None else _missing_tool(name)
@@ -1202,7 +1289,12 @@ class GoogleAPIAdapter(Adapter):
         """
         contents = content_items(request)
         by_name = {tool.name: tool for tool in request.tools}
+        issued_ids: dict[str, int] = {}
         final_text = ""
+
+        # Every vendor wait below goes through this, so a cancel -- the
+        # timeout watchdog's, from its own thread -- interrupts it.
+        scope = AsyncInterrupt(cancel)
 
         while True:
             if cancel.is_set():
@@ -1220,9 +1312,11 @@ class GoogleAPIAdapter(Adapter):
             text = ""
             answered = False
             try:
-                stream = await client.models.generate_content_stream(**params)
+                stream = await scope.run(
+                    client.models.generate_content_stream(**params)
+                )
                 try:
-                    async for chunk in stream:
+                    async for chunk in scope.iterate(stream):
                         usage = getattr(chunk, "usage_metadata", None) or usage
                         blocked = blocked or _blocked_reason(chunk)
                         for candidate in candidates(chunk):
@@ -1257,6 +1351,11 @@ class GoogleAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1269,15 +1368,21 @@ class GoogleAPIAdapter(Adapter):
 
             yield UsageEvent(usage=token_usage(usage), scope=UsageScope.DELTA)
 
+            if cancel.is_set():
+                yield _bare_terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                )
+                return
+
             if text:
                 final_text = text
 
-            if not (request.tools and calls):
+            if not (request.tools and calls) or _unfinished(finish_reason, blocked):
                 for out in self._finish(
                     request,
                     final_text,
                     finish_reason=finish_reason,
-                    unanswered_call=bool(calls),
+                    unanswered_call=bool(calls) and not request.tools,
                     blocked=blocked,
                     answered=answered,
                 ):
@@ -1289,13 +1394,18 @@ class GoogleAPIAdapter(Adapter):
             for call in calls:
                 name = getattr(call, "name", "") or ""
                 arguments = call_arguments(call)
-                call_id = getattr(call, "id", None) or name
+                call_id = event_call_id(call, name, issued_ids)
                 yield ToolCallEvent(
                     name=name,
                     arguments=arguments,
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 tool = by_name.get(name)
                 # The caller's own coroutine, awaited on the caller's own loop.
                 payload = (
@@ -1429,24 +1539,66 @@ def _vendor_failure(exc: Exception) -> tuple[TerminalStatus, str]:
     return TerminalStatus.ERROR, f"{type(exc).__name__}: {exc}"
 
 
+#: Where the Gemini API lives when the connection names no ``baseUrl``. Stated
+#: here, and always handed to the constructor, because a constructor given no
+#: base URL reads ``GOOGLE_GEMINI_BASE_URL`` -- and then the connection's key
+#: goes wherever the process environment says (D2). Read off
+#: ``BaseApiClient.__init__``, google-genai 1.73.1, 2026-11-13.
+_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/"
+
+
+def _client_kwargs(*, api_key: str, base_url: str | None) -> dict[str, Any]:
+    """The constructor arguments that leave the SDK nothing to discover (D2).
+
+    What ``google.genai.Client`` decides from the environment when it is not
+    told (google-genai 1.73.1, read 2026-11-13), and what is said instead:
+
+    * ``api_key`` from ``GOOGLE_API_KEY`` / ``GEMINI_API_KEY`` -- always passed.
+    * the base URL from ``GOOGLE_GEMINI_BASE_URL`` (``_base_url.get_base_url``)
+      -- always passed: the connection's own, else the vendor's endpoint by
+      name. It travels in ``http_options``, because this SDK has no
+      ``base_url`` argument of its own; a dict rather than a
+      ``types.HttpOptions``, which the SDK accepts as ``HttpOptionsDict``.
+    * ``vertexai`` from ``GOOGLE_GENAI_USE_VERTEXAI`` -- ``False``, out loud.
+      ``None`` is what triggers the lookup, and a run that lands on Vertex is
+      a different service, a different bill and a different endpoint. With it
+      ``False`` the ambient ``GOOGLE_CLOUD_PROJECT`` / ``GOOGLE_CLOUD_LOCATION``
+      are read onto the client and used for nothing.
+    * ``debug_config`` from ``GOOGLE_GENAI_CLIENT_MODE`` and its two
+      companions, which swap the HTTP client for a record/replay harness --
+      passed with every field ``None``.
+    """
+    kwargs: dict[str, Any] = {
+        "api_key": api_key,
+        "vertexai": False,
+        "http_options": {
+            "base_url": base_url or _DEFAULT_BASE_URL,
+            # modelpass never retries, and the layer under it must not either.
+            # One attempt is this SDK's default today (``retry_args(None)``,
+            # google-genai 1.73.1); saying it keeps a later default from
+            # re-sending a request the vendor may already have billed.
+            "retry_options": {"attempts": 1},
+        },
+    }
+    debug_config = getattr(importlib.import_module(f"{_MODULE}.client"), "DebugConfig", None)
+    if debug_config is not None:
+        kwargs["debug_config"] = debug_config(
+            client_mode=None, replays_directory=None, replay_id=None
+        )
+    return kwargs
+
+
 def _default_client(*, api_key: str, base_url: str | None) -> Any:
     """``google.genai.Client``, constructed with an explicit key and nothing ambient.
 
-    ``base_url`` travels in ``http_options`` -- this SDK has no ``base_url``
-    argument of its own -- and is passed only when the connection carries one, so
-    a connection without one gets the SDK's own default endpoint rather than a
-    ``None`` the constructor has to interpret. A dict rather than a
-    ``types.HttpOptions``: the SDK accepts ``HttpOptionsDict`` and this way the
-    only vendor symbol this module touches is the client itself.
+    Every argument the SDK would otherwise fill from the process environment is
+    stated here -- see :func:`_client_kwargs`.
     """
     try:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.GOOGLE_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["http_options"] = {"base_url": base_url}
-    return sdk.Client(**kwargs)
+    return sdk.Client(**_client_kwargs(api_key=api_key, base_url=base_url))
 
 
 def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
@@ -1461,7 +1613,4 @@ def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.GOOGLE_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["http_options"] = {"base_url": base_url}
-    return sdk.Client(**kwargs).aio
+    return sdk.Client(**_client_kwargs(api_key=api_key, base_url=base_url)).aio

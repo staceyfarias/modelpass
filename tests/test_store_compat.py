@@ -250,3 +250,128 @@ def test_a_malformed_connection_that_is_not_an_unknown_value_still_refuses_the_f
     )
     with pytest.raises(InvalidConnection, match="enabled"):
         store.load()
+
+
+# --- 4. a carried key is carried whatever TOML type it holds (2026-11-13) ----------
+
+_WITH_UNUSUAL_VALUES = """\
+version = 1
+
+[connections.claude-sub]
+runtime = "anthropic-sdk"
+authMode = "subscription"
+credentialRef = "native-login"
+addedAt = 2026-11-13T00:00:00Z
+addedLocal = 2026-11-13T08:30:00.250
+reviewOn = 2026-12-01
+reviewAt = 07:45:00
+limits = [{ model = "a", rpm = 5 }, { model = "b", rpm = 9, tags = ["x", "y"] }]
+budget = inf
+
+[[connections.claude-sub.hooks]]
+event = "before"
+command = "echo \\"hi\\""
+
+[[connections.claude-sub.hooks]]
+event = "after"
+when = 2026-11-13T00:00:00+02:00
+
+[connections.claude-sub.hooks.env]
+A = "1"
+"""
+
+
+def test_a_carried_key_of_any_toml_type_survives_a_rewrite(store, api_connection):
+    """Dates, arrays of tables and inline tables in arrays made every write fail.
+
+    The store promises a key it does not recognise is "preserved exactly as
+    written", and the writer raised ``TypeError`` on the first value that was
+    not a string, number, boolean or flat array -- so one ``addedAt`` written
+    by another tool left this build unable to add, change or remove anything.
+    """
+    _write(store, _WITH_UNUSUAL_VALUES)
+    before = _raw(store)["connections"]["claude-sub"]
+    store.add(api_connection)  # rewrites the whole file
+    after = _raw(store)["connections"]["claude-sub"]
+    assert after == before
+    assert after["addedAt"].utcoffset() is not None
+    assert after["addedLocal"].tzinfo is None
+    assert after["hooks"][1]["env"] == {"A": "1"}
+    # A second rewrite reads what the first one wrote.
+    store.remove("claude-api")
+    assert _raw(store)["connections"]["claude-sub"] == before
+
+
+def test_the_writer_refuses_a_value_toml_cannot_hold_by_name():
+    from modelpass import _toml
+
+    with pytest.raises(TypeError, match="set"):
+        _toml.dumps({"connections": {"x": {"odd": {1, 2}}}})
+
+
+def test_the_inline_writer_takes_the_same_types():
+    import datetime
+
+    from modelpass import _toml
+
+    text = _toml.dumps_inline(
+        {"at": datetime.date(2026, 11, 13), "rows": [{"a": 1}, {"b": [True]}]}
+    )
+    assert tomllib.loads(f"v = {text}")["v"] == {
+        "at": datetime.date(2026, 11, 13),
+        "rows": [{"a": 1}, {"b": [True]}],
+    }
+
+
+# --- 5. a malformed connection can be removed by name (2026-11-13) -----------------
+
+_WITH_A_TYPO = _ONE + (
+    '\n[connections.broken]\nruntime = "anthropic-sdk"\n'
+    'authMode = "subscription"\nenabled = "no"\nkeepMe = 1\n'
+)
+
+
+def test_a_malformed_connection_can_still_be_removed_by_name(store):
+    """The file is still refused -- and the remedy it names has to work.
+
+    ``remove`` loaded every connection before it looked for the one it was
+    asked about, so the one command that could take the mistake out of the file
+    failed on the mistake.
+    """
+    _write(store, _WITH_A_TYPO)
+    with pytest.raises(InvalidConnection, match="enabled"):
+        store.load()
+    store.remove("broken")
+    assert set(_raw(store)["connections"]) == {"claude-sub"}
+    assert store.names() == ("claude-sub",)
+
+
+def test_removing_another_connection_still_refuses_a_malformed_file(store):
+    """Only the named mistake is dropped; nothing else is rewritten around one."""
+    _write(store, _WITH_A_TYPO)
+    with pytest.raises(InvalidConnection, match="enabled"):
+        store.remove("claude-sub")
+    assert set(_raw(store)["connections"]) == {"claude-sub", "broken"}
+
+
+def test_two_malformed_connections_are_removed_one_at_a_time(store):
+    _write(
+        store,
+        _WITH_A_TYPO + '\n[connections.also-broken]\nruntime = "anthropic-sdk"\n'
+        'authMode = "subscription"\nretry = 3\n',
+    )
+    store.remove("broken")
+    assert set(_raw(store)["connections"]) == {"claude-sub", "also-broken"}
+    assert _raw(store)["connections"]["also-broken"]["retry"] == 3
+    store.remove("also-broken")
+    assert store.names() == ("claude-sub",)
+
+
+def test_a_refused_connection_can_be_removed_beside_a_malformed_one(store):
+    _write(
+        store,
+        _WITH_UNKNOWN_RUNTIME + '\n[connections.broken]\nruntime = "anthropic-sdk"\n'
+        'authMode = "subscription"\nenabled = "no"\n',
+    )
+    store.remove("future")
+    assert set(_raw(store)["connections"]) == {"claude-sub", "odd-mode", "broken"}

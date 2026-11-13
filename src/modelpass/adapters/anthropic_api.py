@@ -123,16 +123,24 @@ from ..types import (
     UsageScope,
     VendorEvent,
 )
-from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
+from ._mcp_result import (
+    ainvoke_handler,
+    anthropic_tool_result_content,
+    flatten_mcp_result,
+    mcp_result_payload,
+)
 from .base import (
     Adapter,
+    AsyncInterrupt,
     InFlight,
     RunCancel,
+    RunInterrupted,
     RunRequest,
     RunStream,
     SessionHandle,
     SessionRequest,
     document_rejection,
+    interrupt_client,
     native_run,
 )
 
@@ -426,13 +434,26 @@ def terminal_status(message: Any) -> tuple[TerminalStatus, str | None]:
       fix -- raise it -- is in the message rather than in a doc.
     * ``refusal`` is ``error``, carrying ``stop_details.category`` where the
       vendor supplied one.
+    * **No ``stop_reason`` at all is ``error``.** The reason arrives in
+      ``message_delta``, near the end of the stream, and the Messages API states
+      one on every message that ended. A message without one is a stream that
+      was cut -- a server or proxy closing the body after a few deltas -- and
+      the SDK hands back what it had accumulated (anthropic 0.97.0, driven over
+      a mock transport 2026-11-13). Reporting that ``ok`` is reporting half a
+      sentence as a finished call.
 
     Anything else -- ``pause_turn`` today, whatever the vocabulary grows next --
     is ``ok`` with the raw reason recorded, because an adapter inventing a
     verdict for a value it does not know is rule 3 broken in the other direction.
     """
     reason = getattr(message, "stop_reason", None)
-    if reason in (None, "end_turn", "stop_sequence"):
+    if reason is None:
+        return (
+            TerminalStatus.ERROR,
+            "the response stream ended before the vendor sent a stop_reason, so "
+            "the answer is unfinished",
+        )
+    if reason in ("end_turn", "stop_sequence"):
         return TerminalStatus.OK, reason
     if reason == "max_tokens":
         return (
@@ -592,6 +613,11 @@ class AnthropicAPIAdapter(Adapter):
         """
         self._client_factory = client_factory or _default_client
         self._async_client_factory = async_client_factory or _default_async_client
+        #: Whether the sync client is one this adapter builds per run, and may
+        #: therefore close to interrupt that run. A client from an injected
+        #: factory may be shared by other runs, so cancelling one run must not
+        #: close it; such a run is cancelled at the next event instead.
+        self._owns_clients = client_factory is None
         self._env = env
         self._secrets = secrets
         #: The runs in flight, each with its own cancel state. Nothing about one
@@ -888,6 +914,11 @@ class AnthropicAPIAdapter(Adapter):
         # one run ending stopped whichever other run reached a round boundary.
         cancel = RunCancel()
         self._runs.add(cancel)
+        if self._owns_clients:
+            # The floor under the flag (D10): a run blocked in a read cannot
+            # look at one, so the cancel reaches the socket. Only for a client
+            # this adapter built for this run -- see ``interrupt_client``.
+            cancel.on_cancel(lambda: interrupt_client(client))
         return RunStream(self._loop(client, request, cancel), cancel.cancel)
 
     def _loop(self, client: Any, request: RunRequest, cancel: RunCancel) -> Iterator[AgentEvent]:
@@ -905,11 +936,19 @@ class AnthropicAPIAdapter(Adapter):
             try:
                 with client.messages.stream(**params) as stream:
                     for event in stream:
+                        if cancel.is_set():
+                            raise RunInterrupted
                         yield from stream_events(event)
                     message = stream.get_final_message()
             except SubpassError:
                 raise
             except Exception as exc:
+                # A cancel that interrupted the wait surfaces here, as whatever
+                # the transport raised when it was cut. The caller stopped the
+                # run; that, not the wreckage, is how it ended.
+                if cancel.is_set():
+                    yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -924,6 +963,14 @@ class AnthropicAPIAdapter(Adapter):
                 usage=token_usage(getattr(message, "usage", None)),
                 scope=UsageScope.DELTA,
             )
+
+            # A stream cut by a cancel can also just *end* (a body delimited by
+            # the connection closing), and a cancel can land while the last
+            # event is in hand. Either way nothing below may run: not a tool,
+            # not another round, not an ``ok``.
+            if cancel.is_set():
+                yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
+                return
 
             blocks = list(getattr(message, "content", None) or ())
             text = "".join(
@@ -959,6 +1006,12 @@ class AnthropicAPIAdapter(Adapter):
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                # No handler runs after a cancel -- including one that arrived
+                # while the caller was looking at the call just announced, or
+                # while the previous handler was running.
+                if cancel.is_set():
+                    yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
+                    return
                 tool = by_name.get(name)
                 payload = (
                     invoke_handler(tool, arguments) if tool is not None else _missing_tool(name)
@@ -974,7 +1027,7 @@ class AnthropicAPIAdapter(Adapter):
                     {
                         "type": "tool_result",
                         "tool_use_id": call_id,
-                        "content": payload.get("content", []),
+                        "content": anthropic_tool_result_content(payload),
                         "is_error": is_error,
                     }
                 )
@@ -1022,6 +1075,10 @@ class AnthropicAPIAdapter(Adapter):
         by_name = {tool.name: tool for tool in request.tools}
         final_text = ""
 
+        # Every vendor wait below goes through this, so a cancel -- the
+        # timeout watchdog's, from its own thread -- interrupts it.
+        scope = AsyncInterrupt(cancel)
+
         while True:
             if cancel.is_set():
                 yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
@@ -1030,14 +1087,17 @@ class AnthropicAPIAdapter(Adapter):
             params = self.request_params(request, messages)
             message = None
             try:
-                async with client.messages.stream(**params) as stream:
-                    async for event in stream:
+                async with scope.entering(client.messages.stream(**params)) as stream:
+                    async for event in scope.iterate(stream):
                         for out in stream_events(event):
                             yield out
-                    message = await stream.get_final_message()
+                    message = await scope.run(stream.get_final_message())
             except SubpassError:
                 raise
             except Exception as exc:
+                if cancel.is_set():
+                    yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1052,6 +1112,10 @@ class AnthropicAPIAdapter(Adapter):
                 usage=token_usage(getattr(message, "usage", None)),
                 scope=UsageScope.DELTA,
             )
+
+            if cancel.is_set():
+                yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
+                return
 
             blocks = list(getattr(message, "content", None) or ())
             text = "".join(
@@ -1082,6 +1146,9 @@ class AnthropicAPIAdapter(Adapter):
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                if cancel.is_set():
+                    yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
+                    return
                 tool = by_name.get(name)
                 # The one line this whole face exists for: the caller's own
                 # coroutine, awaited on the caller's own loop.
@@ -1101,7 +1168,7 @@ class AnthropicAPIAdapter(Adapter):
                     {
                         "type": "tool_result",
                         "tool_use_id": call_id,
-                        "content": payload.get("content", []),
+                        "content": anthropic_tool_result_content(payload),
                         "is_error": is_error,
                     }
                 )
@@ -1189,10 +1256,15 @@ _NO_MODEL = (
 def _vendor_failure(exc: Exception) -> tuple[TerminalStatus, str]:
     """Classify a vendor exception into a terminal status and a reason.
 
-    A 429 is :attr:`TerminalStatus.QUOTA_EXHAUSTED` and not an error, because it
-    is the outcome a quota failover exists to act on -- typed off the status code
-    the SDK carries rather than matched on the message, which is the substring
-    matching that burned a real allowance once already (R6).
+    A 429 is :attr:`TerminalStatus.QUOTA_EXHAUSTED` and not an error -- typed off
+    the status code the SDK carries rather than matched on the message, which is
+    the substring matching that burned a real allowance once already (R6).
+
+    What a 429 then *leads to* is not decided here. The bridge reads the
+    ``retry-after`` this terminal carries: a 429 that names a wait is a rate
+    limit, reported as retryable after that wait, and does **not** fail over;
+    a 429 that names none may be a spent allowance, and is the one a configured
+    quota failover acts on.
     """
     status_code = getattr(exc, "status_code", None)
     if status_code == 429:
@@ -1205,21 +1277,63 @@ def _vendor_failure(exc: Exception) -> tuple[TerminalStatus, str]:
     return TerminalStatus.ERROR, f"{type(exc).__name__}: {exc}"
 
 
+#: Where the Messages API lives when the connection names no ``baseUrl``. Stated
+#: here, and always handed to the constructor, because a constructor given no
+#: ``base_url`` reads ``ANTHROPIC_BASE_URL`` -- and then the connection's key
+#: goes wherever the process environment says (D2). Read off
+#: ``anthropic.Anthropic.__init__``, anthropic 0.97.0, 2026-11-13.
+_DEFAULT_BASE_URL = "https://api.anthropic.com"
+
+
+def _client_kwargs(sdk: Any, *, api_key: str, base_url: str | None) -> dict[str, Any]:
+    """The constructor arguments that leave the SDK nothing to discover (D2).
+
+    The SDK fills three arguments from the environment when they are ``None``
+    (``Anthropic.__init__``, anthropic 0.97.0, read 2026-11-13):
+
+    * ``api_key`` from ``ANTHROPIC_API_KEY`` -- always passed.
+    * ``base_url`` from ``ANTHROPIC_BASE_URL`` -- always passed: the
+      connection's own, else the vendor's endpoint by name.
+    * ``auth_token`` from ``ANTHROPIC_AUTH_TOKEN``, sent as a second credential
+      in ``Authorization: Bearer``. The constructor has no value that means
+      "none" (``None`` is what triggers the lookup), so the *header* is omitted
+      instead. ``default_headers`` is what survives ``with_options()``/``copy()``,
+      which rebuild the client and read the environment again.
+    """
+    return {
+        "api_key": api_key,
+        "base_url": base_url or _DEFAULT_BASE_URL,
+        # modelpass never retries, and the layer under it must not either:
+        # the SDK's default of two retries on 429/5xx/timeouts would hold a
+        # quota failover behind two backoffs, ignore ``retry = "never"``, and
+        # re-send a request the vendor may already have billed.
+        "max_retries": 0,
+        "default_headers": {"Authorization": sdk.Omit()},
+    }
+
+
+def _sealed(client: Any) -> Any:
+    """Drop the ambient bearer token the constructor may have picked up.
+
+    The omitted header already keeps it off the wire; this keeps it off the
+    object, so nothing that inspects the client finds a credential the
+    connection never named.
+    """
+    client.auth_token = None
+    return client
+
+
 def _default_client(*, api_key: str, base_url: str | None) -> Any:
     """``anthropic.Anthropic``, constructed with an explicit key and nothing ambient.
 
-    ``base_url`` is passed only when the connection carries one, so a connection
-    without one gets the SDK's own default endpoint rather than a ``None`` the
-    constructor has to interpret.
+    Every argument the SDK would otherwise fill from the process environment is
+    stated here -- see :func:`_client_kwargs`.
     """
     try:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.ANTHROPIC_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    return sdk.Anthropic(**kwargs)
+    return _sealed(sdk.Anthropic(**_client_kwargs(sdk, api_key=api_key, base_url=base_url)))
 
 
 def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
@@ -1233,7 +1347,4 @@ def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.ANTHROPIC_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    return sdk.AsyncAnthropic(**kwargs)
+    return _sealed(sdk.AsyncAnthropic(**_client_kwargs(sdk, api_key=api_key, base_url=base_url)))

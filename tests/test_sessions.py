@@ -892,3 +892,167 @@ def test_a_session_schema_is_refused_where_the_session_adapter_does_not_apply_it
     with pytest.raises(CapabilityNotSupported, match="anthropic-sdk session adapter only"):
         bridge.new_chat(connection="codex-sub", schema=CHOICE)
     assert made["codex-sub"].session_requests == []
+
+
+# --- an abandoned turn still leaves a ledger line (2026-11-13) ----------------------
+
+
+def _abandon_bridge(sessions, *, script, **overrides):
+    bridge, made = sessions(anthropic_connection(**overrides), script=script)
+    return bridge, made["claude-sub"]
+
+
+def test_a_turn_abandoned_mid_stream_is_logged_as_cancelled_with_its_usage(sessions):
+    """Closing the iterator early skipped the code that writes the turn down.
+
+    The turn ran and spent tokens, and the run log -- the one place a caller can
+    add up what a session cost -- had no line for it.
+    """
+    bridge, _ = _abandon_bridge(
+        sessions,
+        script=[TextDeltaEvent(text="par"), usage(input_tokens=5), TextDeltaEvent(text="t")],
+    )
+    session = bridge.new_chat(connection="claude-sub")
+    stream = session.send("one")
+    for event in stream:
+        if isinstance(event, UsageEvent):
+            break
+    stream.close()
+
+    (record,) = bridge.run_log.read()
+    assert record["status"] == "cancelled"
+    assert record["input_tokens"] == 5
+    assert record["connection"] == "claude-sub"
+    # Abandoned, so no id: the timing rule for ``Session.id`` is unchanged.
+    assert session.id is None
+    # The session is still open, and the next turn is one more line.
+    list(session.send("two"))
+    assert [r["status"] for r in bridge.run_log.read()] == ["ok", "cancelled"]
+    session.close()
+
+
+def test_a_decided_terminal_is_logged_as_itself_when_the_caller_walks_away(sessions):
+    """A guard stop the caller never read is still a guard stop, and still ends the session."""
+    bridge, _ = _abandon_bridge(
+        sessions,
+        script=[usage(input_tokens=50), TextDeltaEvent(text="never read")],
+        guards=Guards(stop_at_tokens=10),
+    )
+    session = bridge.new_chat(connection="claude-sub")
+    stream = session.send("one")
+    for event in stream:
+        if isinstance(event, UsageEvent):
+            break  # the guard_stop event and the terminal are still to come
+    stream.close()
+
+    (record,) = bridge.run_log.read()
+    assert record["status"] == "guard_stop"
+    assert record["input_tokens"] == 50
+    with pytest.raises(GuardStop):
+        session.send("two")
+    session.close()
+
+
+def test_a_turn_let_go_of_after_its_bound_fired_is_logged_as_timed_out(sessions):
+    """The same rule as the stateless call: ``EventFold.abandoned``."""
+    import time
+
+    bridge, _ = _abandon_bridge(
+        sessions, script=[usage(input_tokens=5), TextDeltaEvent(text="rest")]
+    )
+    session = bridge.new_chat(connection="claude-sub")
+    stream = session.send("one", timeout=0.05)
+    for event in stream:
+        if isinstance(event, UsageEvent):
+            break
+    time.sleep(0.4)  # the bound fires while the caller is holding the event
+    stream.close()
+
+    (record,) = bridge.run_log.read()
+    assert record["status"] == "timed_out"
+    assert record["input_tokens"] == 5
+    session.close()
+
+
+def test_a_turn_whose_stream_never_started_writes_nothing(sessions):
+    bridge, made = _abandon_bridge(sessions, script=[TextDeltaEvent(text="hi")])
+    session = bridge.new_chat(connection="claude-sub")
+
+    never_driven = session.send("zero")
+    never_driven.close()
+
+    stream = session.send("one")
+    assert isinstance(next(stream), ReceiptEvent)
+    stream.close()  # closed at the receipt: the runtime was never asked
+
+    assert not bridge.run_log.read()
+    assert made.handles[-1].messages == []
+    session.close()
+
+
+def test_a_finished_turn_is_written_once_however_it_is_closed(sessions):
+    bridge, _ = _abandon_bridge(sessions, script=[TextDeltaEvent(text="hi")])
+    session = bridge.new_chat(connection="claude-sub")
+
+    stream = session.send("one")
+    for event in stream:
+        if isinstance(event, TerminalEvent):
+            break
+    stream.close()  # closed at the terminal, which was already written
+    list(session.send("two"))
+
+    assert [r["status"] for r in bridge.run_log.read()] == ["ok", "ok"]
+    session.close()
+
+
+def test_an_async_turn_closed_early_is_logged_as_cancelled(sessions):
+    import asyncio
+
+    bridge, _ = _abandon_bridge(
+        sessions, script=[usage(input_tokens=7), TextDeltaEvent(text="rest")]
+    )
+    session = bridge.new_chat(connection="claude-sub")
+
+    async def drive():
+        stream = session.asend("one")
+        async for event in stream:
+            if isinstance(event, UsageEvent):
+                break
+        await stream.aclose()
+
+    asyncio.run(drive())
+    (record,) = bridge.run_log.read()
+    assert record["status"] == "cancelled"
+    assert record["input_tokens"] == 7
+    session.close()
+
+
+def test_an_async_turn_whose_task_is_cancelled_is_logged_as_cancelled(sessions):
+    import asyncio
+
+    bridge, _ = _abandon_bridge(
+        sessions, script=[usage(input_tokens=7), TextDeltaEvent(text="rest")]
+    )
+    session = bridge.new_chat(connection="claude-sub")
+
+    async def drive():
+        reached = asyncio.Event()
+
+        async def consume():
+            async for event in session.asend("one"):
+                if isinstance(event, UsageEvent):
+                    reached.set()
+                    await asyncio.sleep(30)  # the caller is busy; then cancelled
+
+        task = asyncio.create_task(consume())
+        await reached.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The generator the cancelled task was iterating is finalized by the loop.
+        await asyncio.sleep(0)
+        await asyncio.get_running_loop().shutdown_asyncgens()
+
+    asyncio.run(drive())
+    assert [r["status"] for r in bridge.run_log.read()] == ["cancelled"]
+    session.close()

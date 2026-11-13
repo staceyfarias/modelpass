@@ -843,6 +843,7 @@ class ConnectionStore:
         *,
         settings: StoreSettings | None = None,
         drop: Iterable[str] = (),
+        carry: Iterable[str] = (),
     ) -> None:
         """Replace the whole file with these connections, atomically.
 
@@ -850,6 +851,11 @@ class ConnectionStore:
         parse them -- the one way a refused connection leaves the file, used by
         :meth:`remove`. Without it, "delete the connection my build does not
         understand" would have no answer but hand-editing.
+
+        ``carry`` names connections to write back exactly as found although
+        they are not among ``connections`` -- the malformed neighbours
+        :meth:`remove` steps around. Nothing else may use it to keep a
+        connection this build could not validate out of sight.
 
         ``settings`` defaults to whatever the file already says, so adding a
         connection never silently reverts a store-wide setting somebody set.
@@ -880,10 +886,13 @@ class ConnectionStore:
         # A connection this build refused is still the user's connection. It is
         # written back exactly as found, in name order with the rest.
         dropped = set(drop)
+        carried = set(carry)
         for name, existing in raw_connections.items():
-            if name in table or name in dropped or not isinstance(existing, Mapping):
+            if name in table or name in dropped:
                 continue
-            if _unknown_value_reason(existing):
+            if name in carried:
+                table[name] = existing
+            elif isinstance(existing, Mapping) and _unknown_value_reason(existing):
                 table[name] = dict(existing)
         table = {name: table[name] for name in sorted(table)}
         document: dict[str, Any] = {}
@@ -944,7 +953,24 @@ class ConnectionStore:
         self.save(connections.values())
 
     def remove(self, name: str) -> None:
-        connections = self.load()
+        """Forget one connection, including one this build could not read.
+
+        **A malformed connection can be removed by name** (2026-11-13). The
+        file it sits in is still refused -- ``enabled = "no"`` is a mistake
+        worth failing on -- but this is the command that takes the mistake out,
+        and it used to load every connection before looking for the one it was
+        asked about, so it failed on the mistake too. Now the named connection
+        is dropped without being parsed, and any other connection that does not
+        parse is written back exactly as found. Removing a *valid* connection
+        from a file with a malformed one still refuses, the way every other
+        write does.
+        """
+        try:
+            connections = self.load()
+        except InvalidConnection:
+            if not self._remove_malformed(name):
+                raise
+            return
         if name in connections:
             del connections[name]
             self.save(connections.values())
@@ -953,6 +979,35 @@ class ConnectionStore:
             self.save(connections.values(), drop=(name,))
             return
         raise NoSuchConnection(name, tuple(sorted(connections)))
+
+    def _remove_malformed(self, name: str) -> bool:
+        """Drop ``name`` if it is a connection that does not parse. See :meth:`remove`."""
+        raw_connections = self._read().get("connections", {})
+        if not isinstance(raw_connections, Mapping) or name not in raw_connections:
+            return False
+        named = raw_connections[name]
+        if not (isinstance(named, Mapping) and _unknown_value_reason(named)):
+            try:
+                connection_from_dict(name, named)
+            except InvalidConnection:
+                pass
+            else:
+                # The named connection is fine; the mistake is somewhere else,
+                # and the caller is owed the refusal that names it.
+                return False
+        usable: list[Connection] = []
+        unparsed: list[str] = []
+        for other, data in raw_connections.items():
+            if other == name:
+                continue
+            if isinstance(data, Mapping) and _unknown_value_reason(data):
+                continue  # ``save`` already carries these
+            try:
+                usable.append(connection_from_dict(other, data))
+            except InvalidConnection:
+                unparsed.append(other)
+        self.save(usable, drop=(name,), carry=unparsed)
+        return True
 
     def _write(self, text: str) -> None:
         try:

@@ -742,8 +742,9 @@ version = 1
 
 # --- store-wide settings (optional; omit the table entirely for defaults) ----
 [settings]
-# Every completed run appends one line to runs.jsonl beside this file. On by
-# default; this is the opt-out.
+# Every run that reaches a terminal appends one line to runs.jsonl beside this
+# file, and so does a run you stop by closing its iterator. On by default; this
+# is the opt-out.
 runLog = true
 
 # --- a subscription connection ----------------------------------------------
@@ -758,6 +759,7 @@ description   = "Claude Code login"  # optional note to yourself
 enabled       = true                 # optional, default true (see below)
 groups        = ["fast"]             # optional; omit and it is in "default"
 timeoutSeconds = 120                 # optional; default wall-clock bound per call
+                                     # and per session turn
 retry         = "default"            # optional; "default" | "never" (see below)
 maxInputTokens = 200000              # optional; the model's usable input window, in
                                      # tokens, as YOU state it. Omit it and the window
@@ -860,11 +862,20 @@ On Windows there are two layers and modelpass claims only what it applied:
 
 - The documented floor is the ACL your user profile directory already carries, which
   `%USERPROFILE%\.modelpass` inherits.
-- On top of that, once at creation, modelpass runs
-  `icacls <path> /inheritance:r /grant:r "<you>":F` and **records whether it worked**.
-  `modelpass check` reports either "restricted to your account" or "could not restrict:
-  `<reason>`; the profile directory's own ACL is the floor". A protection that was not
-  applied is never described as though it were.
+- On top of that, **on every write**, modelpass runs
+  `icacls <path> /inheritance:r /grant:r "<you>":F` and records whether it worked. The
+  grantee is your account's SID, read from the process itself. Every write replaces the
+  file with a new one, so the ACL is applied to the new file before it is moved into
+  place. (Until 2026-11-13 it was applied once, at creation, and the next write
+  replaced the restricted file with an unrestricted one.)
+- `modelpass check` **reads the file's own ACL** and reports what it finds, not what
+  was recorded: "restricted to your account" only when every entry that allows access
+  names your account and none is inherited. Otherwise it says "could not restrict:
+  `<reason>`", "readable beyond your account: `<what the ACL holds>`", or "could not
+  read the secrets file's ACL", each followed by "the profile directory's own ACL is
+  the floor". `SecretStore.permissions().windows_acl` carries the same four answers:
+  `restricted`, `failed`, `open`, `unknown`. A protection that was not applied is
+  never described as though it were.
 
 **Keeping the two files in step.** They are not written atomically together, so the
 order is part of the design: the secret is written first and the connection second when
@@ -897,7 +908,10 @@ absence loud rather than papering over it with an invented number. See
 connection. Failover is the *only* path in modelpass that can move a run onto metered
 billing, and naming the second connection is the consent. It never chains, never
 self-targets, announces itself as a `failover` event carrying the second connection's
-own receipt, and the terminal event names both connections.
+own receipt, and the terminal event names both connections. **A rate limit is not a
+spent allowance:** on an API runtime, a 429 that names a `retry-after` does not fail
+over. It ends on the first connection, `retryable = yes`, carrying the wait. See
+[Guards](docs/guards.md).
 
 **`allowEnv`** — a closed, per-runtime set of *non-credential* variables that may
 survive the scrub (currently: `ANTHROPIC_BASE_URL`, on `anthropic-sdk`, and nothing
@@ -947,7 +961,9 @@ they will not all be the same build of modelpass. What every build promises:
 
 Anything else invalid — a warn threshold above its stop, `enabled = "no"` — still refuses
 the file. Those are mistakes in a file a human edited, and quietly dropping the
-connection would hide one.
+connection would hide one. `modelpass remove <name>` is the way out that does not
+need an editor: it drops the named connection without parsing it, so it works on the
+malformed one (2026-11-13). Every other command still refuses until the file reads.
 
 **`MODELPASS_HOME`** moves the config location (`$MODELPASS_HOME/connections.toml`
 instead of `~/.modelpass/connections.toml`). It moves *where the file is read from* and
@@ -1110,7 +1126,10 @@ used**. Adapters can report a status; they cannot claim how a run was billed.
 That stamp is also written to `~/.modelpass/runs.jsonl`, one JSON line per connection the
 call ran on, so the question survives the run that answered it. (A call that exhausts
 its allowance and fails over spent two allowances, and writes two lines — one per leg,
-each with the auth mode that paid for it.) See
+each with the auth mode that paid for it.) A run you stop by closing its iterator
+never reaches its terminal event, and is written anyway, as `cancelled` with the
+tokens seen so far (2026-11-13). The same holds for a session turn. A call that ends
+by raising writes no line. See
 [How do I know it was the subscription?](docs/subscription-proof-2026-08-17.md) — which
 includes a live falsification experiment, its control, and the check that does not
 require trusting modelpass at all.
@@ -1303,7 +1322,9 @@ users:
   `openai-sdk` with a 400 — before any generation, so it costs nothing to discover,
   but it will not run. `modelpass.schema.to_openai_strict(schema)` converts one;
   `openai_strict_issues(schema)` tells you whether you need to, and the OpenAI
-  preflight receipt says so too. Both constraints were captured from live
+  preflight receipt says so too. Both reach nested definitions (`$defs`). `openai-api`
+  and `openai-compatible` apply the conversion themselves and validate the answer
+  against the converted schema. Both constraints were captured from live
   rejections on 2026-08-17 ([the verification record](docs/api-and-runtimes.md#22a-where-the-cells-came-from-the-verification-record)).
 
 ## Prompt caching
@@ -1544,7 +1565,8 @@ portable.
 runtime that takes a level. It beats the connection's level for that call, and the stored
 connection does not change. The two subscription runtimes take no other sampling field,
 so anything else in that `Sampling` is dropped with a note. A failover target uses its own
-connection's level.
+connection's level. The rest of the call's `Sampling` does cross to the target
+(2026-11-13).
 
 **Sessions work differently.** `send(reasoning=...)` changes the level for one turn on
 `openai-sdk`. `anthropic-sdk` fixes the level when the session opens, because
@@ -1650,18 +1672,28 @@ terminal is where you find out what it cost. `ask()` and
 `chat(raise_on_stop=True)` raise `RunTimedOut` instead; the LangChain leaf
 raises `SubpassTimeoutError`.
 
+The cancel reaches a run that is blocked (2026-11-13). On the four API runtimes
+it closes the connection of a request that is not answering, so the bound holds
+against a silent server, and no tool handler starts after it. On `openai-sdk` it
+kills the whole Codex process tree, not only the `codex.cmd` shim. The Windows
+half of each was run here; the POSIX half was not.
+
 A connection can carry a default with `timeoutSeconds`. A call that passes its
-own `timeout=` **replaces** it rather than being clamped by it.
+own `timeout=` **replaces** it rather than being clamped by it. The default
+applies to a session turn too, since 2026-11-13: `send()` with no `timeout=` is
+bounded by the connection's `timeoutSeconds`.
 
 Cancelling by closing the iterator is unchanged and still the documented way to
 stop a run early (D10). It cancels exactly once, with or without a bound
-configured.
+configured. The run is written to the run log as `cancelled`.
 
 ### modelpass never retries for you
 
 Say that part first, because it is the part people assume otherwise. There is no
-retry loop in this library, no backoff, and no configuration for either. What
-modelpass provides is the **verdict**:
+retry loop in this library, no backoff, and no configuration for either. The
+vendor SDK clients underneath are built with their own retries switched off too
+(2026-11-13), so one call is one request. What modelpass provides is the
+**verdict**:
 
 ```python
 for event in bridge.chat(connection="claude-sub", message="..."):
@@ -1676,8 +1708,14 @@ answer and a boolean has to guess which way to lie:
 | verdict | what it means |
 |---|---|
 | `YES` | transient: a 5xx, a 429 that named a `retry-after`, a connection reset, a `first_token` timeout on a stateless run |
-| `NO` | deterministic: a caller mistake, auth, a guard stop, a spent allowance with no failover, a content filter, a rejected schema, a truncation |
-| `UNKNOWN` | the vendor reported nothing typed to classify it by |
+| `NO` | deterministic: a caller mistake, auth, a guard stop, a spent allowance with no failover (a 429 that named no wait reads as one), a content filter, a rejected schema, a truncation, a cancellation |
+| `UNKNOWN` | the vendor reported nothing typed to classify it by; a run cut off by its `total` bound; a bare `TimeoutError` |
+
+Three rows changed on 2026-11-13. A 429 from an API runtime that names a
+`retry-after` is `YES`, and where it read `NO` it also triggered a configured
+failover, which it no longer does. A bare `TimeoutError`, the one
+`asyncio.wait_for` raises, is `UNKNOWN` where it read `YES`: it does not say how
+far the run got. A `CancelledError` is `NO` where it read `UNKNOWN`.
 
 Every error modelpass raises carries the same verdict on `.retryable`, and
 `.retry_after` where the vendor named a wait. That includes the errors `ask()`,
@@ -1941,7 +1979,8 @@ Three properties of the shape, each deliberate:
   runtimes refuse it rather than return prose).
 * **Guards on a session are the session's envelope**, not the turn's. `stop_at_tokens`
   bounds everything this session will ever spend — a per-turn tracker on a fifty-turn
-  worker never fires while the allowance drains.
+  worker never fires while the allowance drains. (Until 2026-11-13 the session's total
+  was its largest turn, so the ceiling did not add up across turns. It does now.)
 * **A session takes one caller at a time.** A second arriving mid-turn gets `SessionBusy`
   rather than an interleaved conversation, raised instead of queued because a lock that
   queues can deadlock when one of the two callers is the thread draining the other's
@@ -2124,7 +2163,16 @@ modelpass bench            # http://127.0.0.1:8765
 ```
 
 A local page — loopback only, no authentication because it is not a service — that shows
-the things this README claims, rather than describing them:
+the things this README claims, rather than describing them.
+
+It is guarded against other pages in your browser (2026-11-13). Every request must
+name the bench's own host, `127.0.0.1:<port>` or `localhost:<port>`. Every POST must
+carry a token the bench makes when it starts and puts in each page it renders, as the
+`csrf_token` form field or the `X-Modelpass-Csrf` header. A script that posts to the
+bench reads the token from a page first (the `modelpass-csrf` meta tag). No GET
+starts a preflight: Check is a button that posts, and `?check=` on a URL is ignored.
+
+What it shows:
 
 * **Connections** — everything configured, with each one's receipt one click away, and
   an **ambient-environment audit**: which credential variables are set on this machine

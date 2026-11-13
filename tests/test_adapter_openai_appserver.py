@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 import queue
+import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar
@@ -1049,6 +1051,148 @@ def test_cancel_attempts_the_interrupt_and_still_synthesizes_the_terminal():
     assert server.terminated == 1
 
 
+def test_a_run_cancelled_before_it_starts_launches_nothing_and_ends_cancelled():
+    """A bound or a cancel can land before the first ``next()``.
+
+    The run used to close its client and then start it anyway: a child nobody
+    would terminate, and a run reported as a transport failure
+    (``AppServerTransportClosed``) rather than as the cancel it was.
+    """
+    server = ScriptedAppServer(script_for())
+    adapter, spawn = adapter_for(server)
+
+    stream = adapter.run(request_for())
+    stream.cancel()
+    events = list(stream)
+
+    assert spawn.calls == 0
+    assert [e.type for e in events] == ["terminal"]
+    assert events[0].status is TerminalStatus.CANCELLED
+
+
+class _SilentOn(ScriptedAppServer):
+    """A server that receives one method and never answers it."""
+
+    def __init__(self, script, silent: str) -> None:
+        super().__init__(script)
+        self.silent = silent
+        self.heard = threading.Event()
+
+    def on_write(self, text: str) -> None:
+        if json.loads(text).get("method") == self.silent:
+            self.received.append(json.loads(text))
+            self.heard.set()
+            return
+        super().on_write(text)
+
+
+@pytest.mark.parametrize("silent", ["initialize", "thread/start", "turn/start"])
+def test_a_cancel_while_the_server_is_not_answering_ends_the_run_cancelled(silent):
+    """Blocked in a request, not in the drain: the cancel still ends the run.
+
+    Closing the client fails the request the run is waiting on, and that failure
+    is the cancel arriving -- one ``cancelled`` terminal, not a vendor error.
+    Driven with a real second thread because the order matters: the run has to
+    be inside the request when the cancel lands.
+    """
+    server = _SilentOn(script_for(), silent)
+    adapter, _ = adapter_for(server)
+    stream = adapter.run(request_for())
+    outcome: list = []
+
+    def consume() -> None:
+        try:
+            outcome.append(list(stream))
+        except BaseException as exc:  # recording it is the assertion
+            outcome.append(exc)
+
+    worker = threading.Thread(target=consume, daemon=True)
+    worker.start()
+    try:
+        assert server.heard.wait(timeout=5)
+        stream.cancel()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "the cancel did not unblock the run"
+    finally:
+        server.eof()
+
+    assert isinstance(outcome[0], list), f"the run raised {outcome[0]!r}"
+    terminals = [e for e in outcome[0] if e.type == "terminal"]
+    assert [t.status for t in terminals] == [TerminalStatus.CANCELLED]
+    assert server.terminated == 1
+
+
+def test_an_interrupt_that_cannot_even_be_written_gives_up_on_time():
+    """The bound is the function's own, because the write has none.
+
+    ``request(timeout=...)`` limits the wait for an answer. A server that has
+    stopped reading leaves the *write* blocked, and the caller here is the
+    cancel -- whose next step, the close, is what would free it.
+    """
+    release = threading.Event()
+
+    class Stuck:
+        def request(self, method, params=None, *, timeout=None):
+            release.wait(30)
+            return {}
+
+    started = time.monotonic()
+    try:
+        accepted = interrupt_app_server_turn(Stuck(), "thread1", "turn1", timeout=0.2)
+    finally:
+        release.set()
+
+    assert accepted is False
+    assert time.monotonic() - started < 5
+
+
+@pytest.fixture
+def run_dirs(monkeypatch):
+    """Every ``modelpass-codex-`` directory a run makes for itself, as it is made."""
+    import modelpass.adapters.openai as module
+
+    made: list[Path] = []
+    real = module.tempfile.mkdtemp
+
+    def recording(*args, **kwargs):
+        made.append(Path(real(*args, **kwargs)))
+        return str(made[-1])
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", recording)
+    yield made
+    for path in made:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_the_directory_an_app_server_run_makes_for_itself_is_removed(run_dirs):
+    """On every way out: finished, cancelled, and failed before the turn."""
+    list(adapter_for(ScriptedAppServer(script_for()))[0].run(request_for()))
+
+    server = ScriptedAppServer(script_for())
+    stream = adapter_for(server)[0].run(request_for())
+    for _ in range(3):
+        next(stream)
+    stream.cancel()
+    list(stream)
+
+    script = script_for()
+    script["thread/start"] = ({"thread": {}}, [])
+    with pytest.raises(VendorRunFailed):
+        list(adapter_for(ScriptedAppServer(script))[0].run(request_for()))
+
+    assert len(run_dirs) == 3
+    assert not any(path.exists() for path in run_dirs)
+
+
+def test_an_app_server_run_leaves_the_callers_own_directory_alone(tmp_path, run_dirs):
+    adapter, _ = adapter_for(ScriptedAppServer(script_for()))
+
+    list(adapter.run(request_for(options={"cwd": str(tmp_path)})))
+
+    assert run_dirs == []
+    assert tmp_path.is_dir()
+
+
 def test_interrupt_needs_both_ids_and_never_raises():
     """Defensive by construction: the method has not been driven live.
 
@@ -1317,6 +1461,38 @@ def test_a_reported_failure_is_not_doubled_by_the_servers_completed_item():
     assert len(results) == 1
     vendor_names = [getattr(e, "name", "") for e in events if e.type == "vendor_event"]
     assert "item/completed:dynamicToolCall" in vendor_names
+
+
+def test_a_failure_recorded_while_the_drain_is_waiting_is_still_not_doubled():
+    """The ordering a real turn has, which the test above does not produce.
+
+    A handler takes time, so by the time it fails the drain has read everything
+    the server said so far and is **blocked waiting for the next line**. That
+    next line is the server's completed item. The failure used to be collected
+    only *before* the wait, so the item was read first, with nothing yet known
+    about the call, and became a ``tool_result`` -- and the failure became a
+    second one on the next pass. The fake's handler here is slow on purpose:
+    an instant one fails before the drain ever blocks, which is the only reason
+    the test above passed.
+    """
+
+    def slow_then_offline(args):
+        time.sleep(0.3)  # long enough for the drain to be waiting on the queue
+        raise RuntimeError("the loudness index is offline")
+
+    server = ScriptedAppServer(tool_script())
+    adapter, _ = adapter_for(server)
+    events = list(adapter.run(request_for(tools=(loudness_tool(slow_then_offline),))))
+
+    results = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert [(r.id, r.is_error) for r in results] == [(CAPTURED_CALL_ID, True)]
+    assert "RuntimeError" in results[0].content
+    names = [getattr(e, "name", "") for e in events]
+    assert "item/completed:dynamicToolCall" in names
+    assert events.index(results[0]) < names.index("item/completed:dynamicToolCall"), (
+        "the failure explains the item, so it comes first"
+    )
+    assert events[-1].status is TerminalStatus.OK
 
 
 def test_a_handler_reporting_is_error_itself_is_a_failure_too():
@@ -1936,6 +2112,16 @@ def test_a_run_that_cannot_be_isolated_fails_closed_before_any_thread(config_rea
         list(adapter.run(request_for()))
     assert "thread/start" not in server.methods
     assert "turn/start" not in server.methods
+
+
+def test_a_codex_home_override_is_the_home_the_app_server_runs_in():
+    """Preflight and child must agree on the home, or the receipt describes another login."""
+    server = ScriptedAppServer(script_for())
+    adapter, spawn = adapter_for(server)
+
+    list(adapter.run(request_for(options={"codex_home": "C:/somewhere/else"})))
+
+    assert spawn.env["CODEX_HOME"] == "C:/somewhere/else"
 
 
 def test_the_option_surface_is_the_one_isolation_was_checked_against():

@@ -556,6 +556,31 @@ def test_a_hand_edited_utilization_is_repaired_like_the_token_counts_are(tmp_pat
     assert record["allowance_status"] is None
 
 
+def test_an_infinite_count_is_repaired_and_does_not_stop_the_read(tmp_path):
+    """``json`` reads a bare ``Infinity``, and ``int()`` of it is an OverflowError.
+
+    One such line made ``read()`` raise for the whole log, which is the opposite
+    of what the repair beside it is for.
+    """
+    log = RunLog(tmp_path)
+    log.path.parent.mkdir(parents=True, exist_ok=True)
+    line = (
+        '{"timestamp": "2026-08-30T00:00:00+00:00", "connection": "claude-sub", '
+        '"runtime": "anthropic-sdk", "auth_mode": "subscription", "status": "ok", '
+        '"input_tokens": Infinity, "output_tokens": -Infinity, "total_tokens": NaN, '
+        '"allowance_utilization": Infinity}'
+    )
+    good = json.dumps({"connection": "after", "input_tokens": 7})
+    log.path.write_text(line + "\n" + good + "\n", encoding="utf-8")
+    second, first = log.read()  # newest first
+    assert first["connection"] == "claude-sub"
+    assert first["input_tokens"] == 0
+    assert first["output_tokens"] == 0
+    assert first["total_tokens"] == 0
+    assert first["allowance_utilization"] is None
+    assert second["input_tokens"] == 7
+
+
 def test_an_unreadable_epoch_costs_the_field_and_not_the_record():
     record = RunRecord.from_terminal(
         TerminalEvent(
@@ -746,3 +771,201 @@ def test_a_line_written_before_the_binary_field_existed_still_reads(tmp_path):
     record = log.read()[0]
     assert record["binary"] is None
     assert record["total_tokens"] == 12  # the rest of the line is untouched
+
+
+# --- a run the caller let go of is still a run that was paid for (2026-11-13) ------
+#
+# The ledger line was written by the code that emits the terminal event, so a
+# caller who closed the iterator before the terminal -- the documented way to
+# stop a run early -- left no line at all. 7,000 tokens of usage, streamed and
+# seen, and nothing on disk said the run had happened.
+
+
+def _abandonable(tmp_path, script):
+    from modelpass.connections import Connection
+    from modelpass.runtimes import Runtime
+    from modelpass.testing import fake_bridge
+    from modelpass.types import AuthMode
+
+    bridge, _store, adapter = fake_bridge(
+        connections=[
+            Connection(
+                name="claude-sub",
+                runtime=Runtime.ANTHROPIC_SDK,
+                auth_mode=AuthMode.SUBSCRIPTION,
+            )
+        ],
+        script=script,
+        home=tmp_path / "modelpass",
+    )
+    return bridge, adapter
+
+
+def _long_script():
+    from modelpass.testing import usage
+    from modelpass.types import TextDeltaEvent
+
+    return [
+        TextDeltaEvent(text="a"),
+        usage(input_tokens=6000, output_tokens=1000),
+        TextDeltaEvent(text="b"),
+        TextDeltaEvent(text="c"),
+    ]
+
+
+def test_a_run_abandoned_mid_stream_is_written_as_cancelled(tmp_path):
+    from modelpass.types import UsageEvent
+
+    bridge, _ = _abandonable(tmp_path, _long_script())
+    stream = bridge.chat(connection="claude-sub", message="hi")
+    for event in stream:
+        if isinstance(event, UsageEvent):
+            break
+    stream.close()
+
+    (line,) = bridge.run_log.read()
+    assert line["connection"] == "claude-sub"
+    assert line["status"] == "cancelled"
+    assert line["auth_mode"] == "subscription"
+    assert line["total_tokens"] == 7000
+    assert line["input_tokens"] == 6000
+
+
+def test_an_abandoned_async_run_is_written_as_cancelled(tmp_path):
+    import asyncio
+
+    from modelpass.types import UsageEvent
+
+    bridge, _ = _abandonable(tmp_path, _long_script())
+
+    async def go():
+        stream = bridge.achat(connection="claude-sub", message="hi")
+        async for event in stream:
+            if isinstance(event, UsageEvent):
+                break
+        await stream.aclose()
+
+    asyncio.run(go())
+    (line,) = bridge.run_log.read()
+    assert line["status"] == "cancelled"
+    assert line["total_tokens"] == 7000
+
+
+def test_a_cancelled_task_leaves_a_line_too(tmp_path):
+    import asyncio
+
+    from modelpass.types import UsageEvent
+
+    bridge, _ = _abandonable(tmp_path, _long_script())
+
+    async def go():
+        seen = asyncio.Event()
+
+        async def consume():
+            async for event in bridge.achat(connection="claude-sub", message="hi"):
+                if isinstance(event, UsageEvent):
+                    seen.set()
+                    await asyncio.sleep(30)
+
+        task = asyncio.ensure_future(consume())
+        await seen.wait()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    import contextlib
+
+    # ``asyncio.run`` finalises the generator the cancelled task left behind.
+    asyncio.run(go())
+    (line,) = bridge.run_log.read()
+    assert line["status"] == "cancelled"
+    assert line["total_tokens"] == 7000
+
+
+def test_a_run_that_finished_is_written_once(tmp_path):
+    """Reading to the end, and then closing as well, is still one line."""
+    bridge, _ = _abandonable(tmp_path, _long_script())
+    stream = bridge.chat(connection="claude-sub", message="hi")
+    events = list(stream)
+    stream.close()
+    assert events[-1].status.value == "ok"
+    (line,) = bridge.run_log.read()
+    assert line["status"] == "ok"
+
+
+def test_closing_after_the_terminal_was_decided_keeps_that_terminal(tmp_path):
+    """A guard stop the caller walked away from mid-delivery is a guard stop."""
+    from modelpass.connections import Connection, Guards
+    from modelpass.runtimes import Runtime
+    from modelpass.testing import fake_bridge, usage
+    from modelpass.types import AuthMode, UsageEvent
+
+    bridge, _store, _adapter = fake_bridge(
+        connections=[
+            Connection(
+                name="claude-sub",
+                runtime=Runtime.ANTHROPIC_SDK,
+                auth_mode=AuthMode.SUBSCRIPTION,
+                guards=Guards(warn_at_tokens=10, stop_at_tokens=100),
+            )
+        ],
+        script=[usage(input_tokens=7000)],
+        home=tmp_path / "modelpass",
+    )
+    stream = bridge.chat(connection="claude-sub", message="hi")
+    for event in stream:
+        if isinstance(event, UsageEvent):
+            break
+    stream.close()
+    (line,) = bridge.run_log.read()
+    assert line["status"] == "guard_stop"
+    assert line["total_tokens"] == 7000
+
+
+def test_a_bound_that_fired_before_the_caller_let_go_is_written_as_the_timeout(tmp_path):
+    """The caller held an event past the bound and then closed: that is a timeout.
+
+    The fold had not been asked for another event, so it had decided nothing,
+    and the line read ``cancelled`` here while a session turn left the same way
+    read ``timed_out``. One rule now, ``EventFold.abandoned`` (2026-11-13).
+    """
+    import time
+
+    from modelpass.types import UsageEvent
+
+    bridge, _ = _abandonable(tmp_path, _long_script())
+    stream = bridge.chat(connection="claude-sub", message="hi", timeout=0.05)
+    for event in stream:
+        if isinstance(event, UsageEvent):
+            break
+    time.sleep(0.4)  # the bound fires while the caller is holding the event
+    stream.close()
+
+    (line,) = bridge.run_log.read()
+    assert line["status"] == "timed_out"
+    assert line["total_tokens"] == 7000
+
+
+def test_a_call_let_go_of_before_its_run_started_writes_nothing(tmp_path):
+    """The receipt was read and the iterator closed: no run, so no line."""
+    bridge, adapter = _abandonable(tmp_path, _long_script())
+    stream = bridge.chat(connection="claude-sub", message="hi")
+    next(stream)  # the receipt
+    stream.close()
+    assert adapter.requests == []
+    assert bridge.run_log.read() == ()
+
+
+def test_raise_on_stop_does_not_write_the_run_twice(tmp_path):
+    from modelpass.errors import GuardStop
+    from modelpass.testing import usage
+
+    bridge, _ = _abandonable(tmp_path, [usage(input_tokens=10)])
+    with pytest.raises(GuardStop):
+        list(
+            bridge.chat(
+                connection="claude-sub", message="hi", stop_at_tokens=5, raise_on_stop=True
+            )
+        )
+    (line,) = bridge.run_log.read()
+    assert line["status"] == "guard_stop"

@@ -245,7 +245,11 @@
 
     fetch('/playground/run', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // The bench refuses a POST without its per-process token.
+        '{{ csrf_header }}': document.querySelector('meta[name="modelpass-csrf"]').content
+      },
       body: JSON.stringify({
         connection: opt.value,
         message: document.getElementById('message').value,

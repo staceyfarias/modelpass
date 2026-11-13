@@ -42,6 +42,7 @@ experiment behind it, is ``docs/subscription-proof-2026-08-17.md``.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from collections.abc import Iterator, Mapping
@@ -521,7 +522,9 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, bool) or not isinstance(value, int):
             try:
                 out[field_name] = int(value)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError is ``Infinity``, which ``json`` reads as a
+                # float and ``int()`` cannot hold; ``NaN`` is the ValueError.
                 out[field_name] = 0
     # Additive (R5, 2026-09-13), coerced toward *empty* rather than toward
     # ``None``: an absent key and a run that asked for nothing are the same
@@ -589,6 +592,11 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
             out["allowance_utilization"] = None
     else:
         out["allowance_utilization"] = float(utilization)
+    repaired = out["allowance_utilization"]
+    if repaired is not None and not math.isfinite(repaired):
+        # ``Infinity`` and ``NaN`` parse as floats and are not a share of
+        # anything: absent, like every other value this field cannot read.
+        out["allowance_utilization"] = None
     return out
 
 

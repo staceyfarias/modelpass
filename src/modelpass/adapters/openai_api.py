@@ -157,13 +157,16 @@ from ..types import (
 from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
 from .base import (
     Adapter,
+    AsyncInterrupt,
     InFlight,
     RunCancel,
+    RunInterrupted,
     RunRequest,
     RunStream,
     SessionHandle,
     SessionRequest,
     document_rejection,
+    interrupt_client,
     native_run,
     refuse_documents,
 )
@@ -634,6 +637,37 @@ def response_text(response: Any) -> str:
     return "".join(parts)
 
 
+def _unfinished(response: Any) -> bool:
+    """Whether this turn ended any way but well -- in which case no tool runs.
+
+    The verdict :func:`terminal_status` would give the turn if it were the last:
+    ``incomplete`` (the token ceiling, the content filter), ``failed``,
+    ``cancelled``, a refusal, or no response at all.
+    """
+    return terminal_status(response, unanswered_call=False)[0] is not TerminalStatus.OK
+
+
+def response_refusal(response: Any) -> str:
+    """The model's refusal, if the finished response carries one, else ``""``.
+
+    A refusal on this API is in-band: a ``message`` item whose content is a
+    ``refusal`` part (``ResponseOutputRefusal`` -- ``type`` and ``refusal``;
+    openai 2.32.0, read 2026-11-13), on a response whose ``status`` is still
+    ``completed``. Nothing else on the response says the model declined.
+    """
+    parts: list[str] = []
+    for item in getattr(response, "output", None) or ():
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", None) or ():
+            if getattr(part, "type", None) == "refusal":
+                text = getattr(part, "refusal", "")
+                parts.append(text if isinstance(text, str) else "")
+    if not parts:
+        return ""
+    return "".join(parts).strip() or "(no reason given)"
+
+
 def function_calls(response: Any) -> list[Any]:
     """The ``function_call`` items a finished response asked for."""
     return [
@@ -651,6 +685,11 @@ def terminal_status(response: Any, *, unanswered_call: bool) -> tuple[TerminalSt
     on a terminal does not have to learn two sets of rules:
 
     * ``completed`` is ``ok``.
+    * **A refusal is ``error``, carrying the model's own words**, and it too is
+      checked before ``status``: a refused request is ``completed`` as far as
+      the vendor is concerned, with a ``refusal`` part where the answer would
+      be (:func:`response_refusal`). The same verdict 1.6 gives
+      ``stop_reason == "refusal"``.
     * **A tool call on a run that declared no tools is ``error``**, and this is
       checked before ``status`` because such a response is ``completed`` as far
       as the vendor is concerned. The answer is unfinished, and calling it ``ok``
@@ -685,6 +724,9 @@ def terminal_status(response: Any, *, unanswered_call: bool) -> tuple[TerminalSt
             "the model asked for a tool this run did not declare, so the answer "
             "is unfinished",
         )
+    refusal = response_refusal(response)
+    if refusal:
+        return TerminalStatus.ERROR, f"the model refused this request: {refusal}"
     status = getattr(response, "status", None)
     if status in (None, "completed"):
         return TerminalStatus.OK, status
@@ -818,14 +860,62 @@ def _missing_tool(name: str) -> dict[str, Any]:
     }
 
 
+def arguments_are_whole(raw: Any) -> bool:
+    """Whether a call's raw arguments are something a handler may be run with.
+
+    ``True`` for a mapping, for a string that parses as a JSON **object**, and
+    for no arguments at all -- ``None`` or ``""`` is how a model calls a tool
+    that takes none. ``False`` for anything else: a fragment cut off mid-string,
+    prose, a JSON list or scalar. Those used to become ``{}`` and reach the
+    handler, which is a caller's function run with arguments nobody sent.
+    """
+    if raw is None or isinstance(raw, Mapping):
+        return True
+    if not isinstance(raw, str):
+        return False
+    if not raw.strip():
+        return True
+    try:
+        return isinstance(json.loads(raw), dict)
+    except (TypeError, ValueError):
+        return False
+
+
+def unrunnable(name: str, tool: ToolDef | None, raw: Any) -> dict[str, Any] | None:
+    """The failed result for a call that must not reach a handler, else ``None``.
+
+    Two reasons, both answered to the model rather than ending the run: the
+    tool was never declared, or its arguments are not whole
+    (:func:`arguments_are_whole`). The model can ask again; the handler is not
+    called on a guess.
+    """
+    if tool is None:
+        return _missing_tool(name)
+    if not arguments_are_whole(raw):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"tool {name!r} was not run: its arguments were not a "
+                        "complete JSON object"
+                    ),
+                }
+            ],
+            "is_error": True,
+        }
+    return None
+
+
 def _call_arguments(call: Any) -> dict[str, Any]:
     """A function call's arguments, which arrive as a JSON *string* here.
 
     The other difference from Anthropic worth a function: ``tool_use.input`` is
     already a parsed object there, while ``ResponseFunctionToolCall.arguments``
-    is typed ``str``. Unparseable JSON becomes ``{}`` rather than an exception --
-    the handler then sees an empty mapping and can say so, which is a failed tool
-    result the model can act on instead of a dead run.
+    is typed ``str``. Unparseable JSON becomes ``{}`` rather than an exception,
+    and that ``{}`` is for the ``tool_call`` event only: the loop asks
+    :func:`unrunnable` before any handler runs, and a call whose arguments did
+    not parse is answered with a failed result instead.
     """
     raw = getattr(call, "arguments", None)
     if isinstance(raw, Mapping):
@@ -896,6 +986,11 @@ class OpenAIAPIAdapter(Adapter):
         """
         self._client_factory = client_factory or _default_client
         self._async_client_factory = async_client_factory or _default_async_client
+        #: Whether the sync client is one this adapter builds per run, and may
+        #: therefore close to interrupt that run. A client from an injected
+        #: factory may be shared by other runs, so cancelling one run must not
+        #: close it; such a run is cancelled at the next event instead.
+        self._owns_clients = client_factory is None
         self._env = env
         self._secrets = secrets
         #: The runs in flight, each with its own cancel state. Nothing about one
@@ -1140,6 +1235,11 @@ class OpenAIAPIAdapter(Adapter):
         # one run ending stopped whichever other run reached a round boundary.
         cancel = RunCancel()
         self._runs.add(cancel)
+        if self._owns_clients:
+            # The floor under the flag (D10): a run blocked in a read cannot
+            # look at one, so the cancel reaches the socket. Only for a client
+            # this adapter built for this run -- see ``interrupt_client``.
+            cancel.on_cancel(lambda: interrupt_client(client))
         return RunStream(self._loop(client, request, cancel), cancel.cancel)
 
     def _loop(self, client: Any, request: RunRequest, cancel: RunCancel) -> Iterator[AgentEvent]:
@@ -1159,11 +1259,21 @@ class OpenAIAPIAdapter(Adapter):
             try:
                 with client.responses.stream(**params) as stream:
                     for event in stream:
+                        if cancel.is_set():
+                            raise RunInterrupted
                         response = final_response(event) or response
                         yield from stream_events(event, self.runtime)
             except SubpassError:
                 raise
             except Exception as exc:
+                # A cancel that interrupted the wait surfaces here, as whatever
+                # the transport raised when it was cut. The caller stopped the
+                # run; that, not the wreckage, is how it ended.
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1180,6 +1290,16 @@ class OpenAIAPIAdapter(Adapter):
                 scope=UsageScope.DELTA,
             )
 
+            # A stream cut by a cancel can also just *end* (a body delimited by
+            # the connection closing), and a cancel can land while the last
+            # event is in hand. Either way nothing below may run: not a tool,
+            # not another round, not an ``ok``.
+            if cancel.is_set():
+                yield _bare_terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                )
+                return
+
             text = response_text(response)
             if text:
                 final_text = text
@@ -1189,8 +1309,13 @@ class OpenAIAPIAdapter(Adapter):
             # replying "not declared" round after round would be a loop with a
             # bill on it. The model should never ask -- it was sent no tools --
             # so if it does, the run ends and terminal_status() says why.
-            if not (request.tools and calls):
-                yield from self._finish(request, response, final_text, bool(calls))
+            if not (request.tools and calls) or _unfinished(response):
+            # ... and a turn that was cut short has nothing to answer either:
+            # a call beside a truncated, filtered or failed ending is a call the
+            # model did not finish making, and a handler has side effects.
+                yield from self._finish(
+                    request, response, final_text, bool(calls) and not request.tools
+                )
                 return
 
             # The whole assistant turn goes back verbatim -- reasoning items
@@ -1208,10 +1333,18 @@ class OpenAIAPIAdapter(Adapter):
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                # No handler runs after a cancel -- including one that arrived
+                # while the caller was looking at the call just announced, or
+                # while the previous handler was running.
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 tool = by_name.get(name)
-                payload = (
-                    invoke_handler(tool, arguments) if tool is not None else _missing_tool(name)
-                )
+                payload = unrunnable(name, tool, getattr(call, "arguments", None))
+                if payload is None:
+                    payload = invoke_handler(tool, arguments)
                 is_error = bool(payload.get("is_error"))
                 content = flatten_mcp_result(payload)
                 yield ToolResultEvent(
@@ -1270,6 +1403,10 @@ class OpenAIAPIAdapter(Adapter):
         by_name = {tool.name: tool for tool in request.tools}
         final_text = ""
 
+        # Every vendor wait below goes through this, so a cancel -- the
+        # timeout watchdog's, from its own thread -- interrupts it.
+        scope = AsyncInterrupt(cancel)
+
         while True:
             if cancel.is_set():
                 yield _bare_terminal(
@@ -1280,14 +1417,19 @@ class OpenAIAPIAdapter(Adapter):
             params = self.request_params(request, items)
             response = None
             try:
-                async with client.responses.stream(**params) as stream:
-                    async for event in stream:
+                async with scope.entering(client.responses.stream(**params)) as stream:
+                    async for event in scope.iterate(stream):
                         response = final_response(event) or response
                         for out in stream_events(event, self.runtime):
                             yield out
             except SubpassError:
                 raise
             except Exception as exc:
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1307,13 +1449,21 @@ class OpenAIAPIAdapter(Adapter):
                 scope=UsageScope.DELTA,
             )
 
+            if cancel.is_set():
+                yield _bare_terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                )
+                return
+
             text = response_text(response)
             if text:
                 final_text = text
 
             calls = function_calls(response)
-            if not (request.tools and calls):
-                for out in self._finish(request, response, final_text, bool(calls)):
+            if not (request.tools and calls) or _unfinished(response):
+                for out in self._finish(
+                    request, response, final_text, bool(calls) and not request.tools
+                ):
                     yield out
                 return
 
@@ -1330,13 +1480,16 @@ class OpenAIAPIAdapter(Adapter):
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 tool = by_name.get(name)
-                # The caller's own coroutine, awaited on the caller's own loop.
-                payload = (
-                    await ainvoke_handler(tool, arguments)
-                    if tool is not None
-                    else _missing_tool(name)
-                )
+                payload = unrunnable(name, tool, getattr(call, "arguments", None))
+                if payload is None:
+                    # The caller's own coroutine, awaited on the caller's own loop.
+                    payload = await ainvoke_handler(tool, arguments)
                 is_error = bool(payload.get("is_error"))
                 content = flatten_mcp_result(payload)
                 yield ToolResultEvent(
@@ -1358,9 +1511,14 @@ class OpenAIAPIAdapter(Adapter):
     ) -> Iterator[AgentEvent]:
         """The structured answer, if one was asked for, and then the terminal."""
         status, reason = terminal_status(response, unanswered_call=unanswered_call)
-        if request.schema is not None:
+        # A refusal is the whole outcome: there is no answer to hold against
+        # the schema, and "no structured answer" would misreport why.
+        if request.schema is not None and not response_refusal(response):
             event, failure = build_structured_event(
-                request.schema,
+            # Checked against the schema that was *sent*: the strict rewrite
+            # made optional properties required-and-nullable, and an answer
+            # that obeys it must not be failed against the form it replaced.
+                to_openai_strict(normalize_schema(request.schema)),
                 raw=final_text,
                 schema_name=resolve_schema_name(request.schema, request.schema_name),
             )
@@ -1434,21 +1592,69 @@ def _vendor_failure(exc: Exception) -> tuple[TerminalStatus, str]:
     return TerminalStatus.ERROR, f"{type(exc).__name__}: {exc}"
 
 
+#: Where the Responses API lives when the connection names no ``baseUrl``.
+#: Stated here, and always handed to the constructor, because a constructor
+#: given no ``base_url`` reads ``OPENAI_BASE_URL`` -- and then the connection's
+#: key goes wherever the process environment says (D2). Read off
+#: ``openai.OpenAI.__init__``, openai 2.32.0, 2026-11-13.
+_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+
+def _client_kwargs(sdk: Any, *, api_key: str, base_url: str | None) -> dict[str, Any]:
+    """The constructor arguments that leave the SDK nothing to discover (D2).
+
+    The SDK fills these from the environment when they are ``None``
+    (``OpenAI.__init__``, openai 2.32.0, read 2026-11-13):
+
+    * ``api_key`` from ``OPENAI_API_KEY`` -- always passed.
+    * ``base_url`` from ``OPENAI_BASE_URL`` -- always passed: the
+      connection's own, else the vendor's endpoint by name.
+    * ``organization`` / ``project`` from ``OPENAI_ORG_ID`` /
+      ``OPENAI_PROJECT_ID``, sent as the ``OpenAI-Organization`` and
+      ``OpenAI-Project`` headers. The constructor has no value that means
+      "none" (``None`` is what triggers the lookup, and ``""`` sends an empty
+      header), so the *headers* are omitted instead. ``default_headers`` is
+      what survives ``with_options()``/``copy()``, which rebuild the client and
+      read the environment again.
+    """
+    return {
+        "api_key": api_key,
+        "base_url": base_url or _DEFAULT_BASE_URL,
+        # modelpass never retries, and the layer under it must not either:
+        # the SDK's default of two retries on 429/5xx/timeouts would hold a
+        # quota failover behind two backoffs, ignore ``retry = "never"``, and
+        # re-send a request the vendor may already have billed.
+        "max_retries": 0,
+        "default_headers": {
+            "OpenAI-Organization": sdk.Omit(),
+            "OpenAI-Project": sdk.Omit(),
+        },
+    }
+
+
+def _sealed(client: Any) -> Any:
+    """Drop what the constructor may have picked up from the environment anyway.
+
+    The omitted headers already keep the organization and project off the
+    wire; this keeps them, and ``OPENAI_WEBHOOK_SECRET``, off the object.
+    """
+    client.organization = None
+    client.project = None
+    client.webhook_secret = None
+    return client
+
+
 def _default_client(*, api_key: str, base_url: str | None) -> Any:
     """``openai.OpenAI``, constructed with an explicit key and nothing ambient.
 
-    ``base_url`` is passed only when the connection carries one, so a connection
-    without one gets the SDK's own default endpoint rather than a ``None`` the
-    constructor has to interpret.
+    Every argument the SDK would otherwise fill from the process environment is
+    stated here -- see :func:`_client_kwargs`.
     """
     try:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.OPENAI_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    return sdk.OpenAI(**kwargs)
+    return _sealed(sdk.OpenAI(**_client_kwargs(sdk, api_key=api_key, base_url=base_url)))
 
 
 def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
@@ -1457,7 +1663,4 @@ def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.OPENAI_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    return sdk.AsyncOpenAI(**kwargs)
+    return _sealed(sdk.AsyncOpenAI(**_client_kwargs(sdk, api_key=api_key, base_url=base_url)))

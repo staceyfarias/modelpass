@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 import time
 import tomllib
 from pathlib import Path
@@ -44,6 +45,7 @@ from modelpass.errors import (
     PreflightFailed,
     SessionClosed,
     SessionNotFound,
+    VendorRunFailed,
 )
 from modelpass.preflight import plan_launch
 from modelpass.runtimes import Runtime
@@ -403,6 +405,57 @@ def test_run_launches_an_isolated_account_with_its_codex_home(tmp_path):
     assert spawn.argv[-1] == "-"
     assert spawn.proc.stdin.value == "Reply with exactly OK"
     assert spawn.proc.stdin.closed is True
+
+
+def test_a_codex_home_override_is_the_home_the_child_runs_in(tmp_path):
+    """The login the receipt describes has to be the login the run uses.
+
+    ``options={"codex_home": X}`` pointed the preflight at X and left the child
+    in whatever home the plan named -- so X could hold a ChatGPT login while the
+    child ran on an API-key login in ``~/.codex``: a receipt saying
+    *subscription* over a run billed to a key.
+    """
+    home = tmp_path / "other-codex"
+    spawn = FakeSpawn(FakeProc(SUCCESS_STREAM))
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=spawn)
+
+    list(
+        adapter.run(
+            request_for(codex_connection(), options={**EXEC, "codex_home": str(home)})
+        )
+    )
+
+    assert spawn.env["CODEX_HOME"] == str(home)
+
+
+def test_an_adapter_wide_codex_home_reaches_the_child_and_the_probes(tmp_path):
+    home = tmp_path / "other-codex"
+    home.mkdir()
+    seen: dict[str, str | None] = {}
+
+    def login_status(binary, env):
+        seen["login"] = env.get("CODEX_HOME")
+        return "Logged in using ChatGPT\n"
+
+    def version(binary, env):
+        seen["version"] = env.get("CODEX_HOME")
+        return "codex-cli 0.117.0"
+
+    spawn = FakeSpawn(FakeProc(SUCCESS_STREAM))
+    adapter = OpenAIAdapter(
+        codex_bin="codex",
+        spawn=spawn,
+        login_status=login_status,
+        codex_version=version,
+        codex_home=home,
+    )
+    request = request_for(codex_connection())
+
+    assert adapter.preflight(request).ok is True
+    list(adapter.run(request))
+
+    assert seen == {"login": str(home), "version": str(home)}
+    assert spawn.env["CODEX_HOME"] == str(home)
 
 
 def test_prompt_rides_stdin_because_cmd_truncates_argv_at_newline():
@@ -963,6 +1016,80 @@ def test_cancel_kills_the_process_and_synthesizes_cancelled():
     terminal = events[-1]
     assert terminal.status is TerminalStatus.CANCELLED
     assert terminal.reason is not None and "no vendor-side record" in terminal.reason
+
+
+def test_a_run_cancelled_before_it_starts_launches_no_process():
+    """Nothing is launched for a run that was already cancelled.
+
+    It used to be launched and killed at once, which ended ``cancelled`` too --
+    but a ``codex exec`` that exists for an instant is still one that existed.
+    """
+    spawn = FakeSpawn(FakeProc([THREAD_STARTED, TURN_STARTED], returncode=1))
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=spawn)
+
+    stream = adapter.run(request_for(codex_connection()))
+    stream.cancel()
+    events = list(stream)
+
+    assert spawn.argv is None
+    assert [e.type for e in events] == ["terminal"]
+    assert events[0].status is TerminalStatus.CANCELLED
+
+
+@pytest.fixture
+def run_dirs(monkeypatch):
+    """Every ``modelpass-codex-`` directory a run makes for itself, as it is made."""
+    import modelpass.adapters.openai as module
+
+    made: list[Path] = []
+    real = module.tempfile.mkdtemp
+
+    def recording(*args, **kwargs):
+        made.append(Path(real(*args, **kwargs)))
+        return str(made[-1])
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", recording)
+    yield made
+    for path in made:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_the_directory_a_run_makes_for_itself_is_removed_when_it_ends(run_dirs):
+    """One per stateless call used to stay behind in the temp folder for good."""
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=FakeSpawn(FakeProc(SUCCESS_STREAM)))
+
+    list(adapter.run(request_for(codex_connection())))
+
+    assert len(run_dirs) == 1
+    assert not run_dirs[0].exists()
+
+
+def test_the_run_directory_is_removed_on_a_cancel_and_on_a_failed_launch(run_dirs):
+    proc = FakeProc([THREAD_STARTED, TURN_STARTED], returncode=1)
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=FakeSpawn(proc))
+    stream = adapter.run(request_for(codex_connection()))
+    next(stream)
+    stream.cancel()
+    list(stream)
+
+    def refuse(argv, env, cwd):
+        raise OSError(193, "%1 is not a valid Win32 application")
+
+    with pytest.raises(VendorRunFailed):
+        adapter = OpenAIAdapter(codex_bin="codex", spawn=refuse)
+        list(adapter.run(request_for(codex_connection())))
+
+    assert len(run_dirs) == 2
+    assert not any(path.exists() for path in run_dirs)
+
+
+def test_a_directory_the_caller_named_is_never_removed(tmp_path, run_dirs):
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=FakeSpawn(FakeProc(SUCCESS_STREAM)))
+
+    list(adapter.run(request_for(codex_connection(), options={**EXEC, "cwd": str(tmp_path)})))
+
+    assert run_dirs == []
+    assert tmp_path.is_dir()
 
 
 # --- preflight ------------------------------------------------------------------
@@ -1560,6 +1687,12 @@ NO_ROLLOUT_STDERR = (
 )
 
 
+OTHER_RESUME_FAILURE_STDERR = (
+    "Error: thread/resume: thread/resume failed: failed to read rollout: "
+    "permission denied (os error 13) (code -32603)\n"
+)
+
+
 def session_request(
     connection: Connection | None = None,
     *,
@@ -1823,6 +1956,63 @@ def test_a_first_turn_that_fails_is_a_terminal_not_a_missing_session():
 
     events = list(session.send("hello"))
     assert events[-1].status is TerminalStatus.ERROR
+
+
+def test_a_resume_that_failed_for_another_reason_is_a_failed_turn_not_a_missing_one():
+    """The CLI prefixes every resume failure the same way; only one means *gone*."""
+    spawn = FakeSessionSpawn(([], 1, OTHER_RESUME_FAILURE_STDERR))
+    session = session_adapter(spawn).resume_session(session_request(resume_id="abc-123"))
+
+    terminal = list(session.send("carry on"))[-1]
+
+    assert terminal.status is TerminalStatus.ERROR
+    assert "permission denied" in terminal.reason
+    assert not is_missing_thread(OTHER_RESUME_FAILURE_STDERR)
+
+
+def test_an_exec_session_turn_cancelled_before_it_starts_launches_nothing():
+    """The turn's cancel used to find no process and do nothing at all.
+
+    A bound that fired ahead of the first ``next()`` was spent on that, and the
+    turn then ran with nothing left to stop it.
+    """
+    spawn = FakeSessionSpawn(SUCCESS_STREAM)
+    session = session_adapter(spawn).open_session(session_request())
+
+    stream = session.send("hello")
+    stream.cancel()
+    events = list(stream)
+
+    assert spawn.calls == []
+    assert [e.type for e in events] == ["terminal"]
+    assert events[0].status is TerminalStatus.CANCELLED
+
+
+def test_a_cancelled_exec_session_turn_ends_cancelled_not_as_a_failed_exit():
+    """A killed process exits non-zero; that is the cancel, not a vendor error."""
+    spawn = FakeSessionSpawn(([THREAD_STARTED, TURN_STARTED], 1, ""))
+    session = session_adapter(spawn).open_session(session_request())
+
+    stream = session.send("hello")
+    next(stream)
+    stream.cancel()
+    terminal = list(stream)[-1]
+
+    assert spawn.procs[0].killed
+    assert terminal.status is TerminalStatus.CANCELLED
+    assert session.id is None
+
+
+def test_an_exec_session_turn_runs_in_the_overridden_codex_home(tmp_path):
+    home = tmp_path / "other-codex"
+    spawn = FakeSessionSpawn(SUCCESS_STREAM)
+    session = session_adapter(spawn).open_session(
+        session_request(options={**EXEC, "codex_home": str(home)})
+    )
+
+    list(session.send("hello"))
+
+    assert spawn.envs[0]["CODEX_HOME"] == str(home)
 
 
 def test_resume_session_refuses_a_system_prompt():

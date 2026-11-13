@@ -79,7 +79,13 @@ Both doors — `Bridge.chat()` and `Session.send()` — return an
   terminal. `tools=` / `mcp_servers=` add `ToolCallEvent` / `ToolResultEvent`,
   which are **observations** — the runtime executed them; you never answer one.
 * Every run reaching a terminal appends one line to `~/.modelpass/runs.jsonl`
-  (best-effort, opt-out via `[settings] runLog`).
+  (best-effort, opt-out via `[settings] runLog`). **So does a run the caller
+  abandons** (2026-11-13): closing the iterator, `aclose()`, or cancelling the
+  task that drives it writes one `cancelled` line with the usage seen so far.
+  A terminal already decided and not yet read is written as itself, and a bound
+  that had fired as `timed_out`. Nothing is written for a call closed at its
+  receipt, since no run started, or for a call that ended by raising. A session
+  turn follows the same rule. Until that date an abandoned run left no line.
 * A connection with an `onQuotaExhausted.failover` may finish on a *second*
   connection. That is the only case where one `chat()` call touches two, it
   happens only because somebody wrote the second one down, and it is announced by
@@ -222,7 +228,9 @@ one-shots wearing a session's name.
 Guards on a session are the **session's** envelope, not the turn's: `stop_at_tokens`
 bounds everything this session will ever spend (D18). One tracker for the whole
 session — a per-turn tracker on a fifty-turn worker never fires while the
-allowance drains.
+allowance drains. Each turn's reported total is added to the turns before it.
+(Until 2026-11-13 the tracker kept the largest turn instead, so three turns of
+1,000 tokens never reached `stop_at_tokens=1500`.)
 
 ```python
 with bridge.new_chat(
@@ -468,7 +476,7 @@ consumer reviews asked for the same missing sentence in three different ways.
 
 | field | bounds |
 | --- | --- |
-| `total` | the whole run's wall clock, failover legs included — one call, one clock |
+| `total` | the whole run's wall clock, failover legs included — one call, one clock. A second leg does not start once it has fired (`docs/guards.md`) |
 | `first_token` | the wait for the first event that is **not** the receipt |
 
 Mechanically it is a timer thread that cancels **the run** and nothing else --
@@ -497,7 +505,28 @@ LangChain leaf raises `SubpassTimeoutError`, a `SubpassRunError` subclass, so th
 two consumers matching these classes **by name across the MRO** keep working.
 
 A connection may carry `timeoutSeconds` as a default. A call that names its own
-bound replaces that default rather than being clamped by it.
+bound replaces that default rather than being clamped by it. `Session.send()`
+and `asend()` take the same default (2026-11-13): a turn's own `timeout=`, else
+the connection's `timeoutSeconds`, else none. Before that date a session turn
+ignored the connection's value.
+
+**The cancel has to reach a run that is blocked** (2026-11-13). A timer that
+cancels a run bounds nothing if the cancel only sets a flag. Two places it did:
+
+* **The four API runtimes** read the flag at the top of each tool round, so a
+  request that never answered waited for the vendor SDK's own read timeout (600
+  seconds on `anthropic` and `openai`). A sync run on a client the adapter built
+  now shuts that client's sockets down and closes it. An async run waits on the
+  vendor as a child task and cancels that task; the caller's own task is left
+  alone. The flag is also read on every stream event and after each tool call is
+  announced, so no handler starts after a cancel. A client from an injected
+  `client_factory` may be shared and is never closed; such a run is cancelled at
+  its next event. No timeout is passed to the SDK clients. Driven on Windows
+  against the real clients and a silent loopback server
+  (`tests/test_api_cancel_interrupts.py`). Not run on Linux or macOS with the
+  real SDKs.
+* **`openai-sdk`** killed the process it held, which on Windows is the
+  `codex.cmd` shim. See §3.2, "Process lifetime".
 
 **Cancellation is per run** (2026-09-24). A bridge keeps one adapter per runtime,
 and one `Bridge` may be shared across threads, so one adapter carries every
@@ -524,17 +553,35 @@ with no network.
 `retryable: Retryable` (`YES` / `NO` / `UNKNOWN`) plus `retry_after` where the
 vendor named a wait. **modelpass never retries** — there is no loop here, because
 the library does not know what a second run costs against your allowance and you
-do. The classification lives in `modelpass/retry.py`, one table with a family per
+do. Nor does the layer under it: the vendor SDK clients are built with
+`max_retries=0` (one attempt, stated explicitly, on `google-api`), where until
+2026-11-13 `anthropic` and `openai` kept their default of two silent retries.
+The classification lives in `modelpass/retry.py`, one table with a family per
 adapter kind and a dated note per row, and it reads **typed fields only**: HTTP
 status codes, exception class names, terminal statuses, the connection's declared
 policy. Never message text. The rule is a scar: `"500"` once matched inside
 `"stopAtTokens threshold 500000 reached"` and retried a deterministic guard stop
 four times against a live allowance.
 
-Two rows are worth calling out because they depart from HTTP intuition:
+Four rows are worth calling out because they depart from HTTP intuition:
 
-* **A 429 with no `retry-after` is `UNKNOWN`, not `YES`.** A rate limit that named
-  no wait may be a spent allowance wearing a rate limit's number.
+* **A 429 is `YES` only when it names a wait.** Every built-in API adapter types
+  a 429 as a `quota_exhausted` terminal. With a `retry-after` that terminal reads
+  `YES` and carries the wait, and it does not trigger a configured failover
+  (2026-11-13; `retry.rate_limit_named_a_wait`). With no wait it reads **`NO`**,
+  the spent-allowance row, and a configured failover runs: a rate limit that
+  named no wait may be a spent allowance wearing a rate limit's number. This
+  paragraph used to say `UNKNOWN` for the no-wait case. That is the answer only
+  where no such terminal exists: an exception carrying status 429 with no
+  terminal attached, or a 429 on an `error` terminal, which no built-in adapter
+  emits.
+* **A bare `TimeoutError` is `UNKNOWN`, not `YES`** (2026-11-13). The builtin
+  says a wait ran out and not which one or how far the run got;
+  `asyncio.wait_for` around a whole call raises it. The timeouts that name
+  themselves are still `YES`: the SDK's `APITimeoutError`, a 408 or 504, a
+  `first_token` expiry on a stateless run.
+* **A `CancelledError` is `NO`** (2026-11-13), like the `cancelled` terminal. It
+  was missing from the table and read `UNKNOWN`.
 * **A closed agent transport is `UNKNOWN`, not `YES`.** On a metered endpoint a
   connection reset is transient; on a subscription runtime the child process may
   already have spent allowance nobody can account for.
@@ -1062,6 +1109,39 @@ Three things about them that are settled now rather than later:
   a non-empty value, the base URL parses and is safe, and optionally a cached
   token-free model-list probe.
 
+Four more, settled on 2026-11-13:
+
+* **Nothing ambient reaches the client, and that now includes the endpoint.**
+  Passing an explicit key was not enough: every other constructor argument left
+  unset sends the SDK to the environment. Each default client is now built with
+  all of it stated. The base URL is the connection's `baseUrl`, else the
+  vendor's own endpoint by name. These variables are ignored:
+  `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_BASE_URL`,
+  `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, `GOOGLE_GEMINI_BASE_URL`,
+  `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_GENAI_CLIENT_MODE`. `openai-compatible`
+  refuses a missing base URL. Proxy and CA variables are not touched; the SDKs'
+  HTTP layer reads them as before, and no test here holds that.
+  `tests/test_api_clients_nothing_ambient.py` builds the real clients with every
+  one of those variables set and reads the request off a mock transport.
+* **The clients do not retry.** `max_retries=0` on `anthropic-api`, `openai-api`
+  and `openai-compatible`; one attempt, stated, on `google-api`
+  (`tests/test_api_clients_never_retry.py`).
+* **A cancel interrupts a blocked request**, and no tool handler starts after one
+  (§1.5b).
+* **An ending that is not an answer is not `ok`.** A refusal on `openai-api` and
+  `openai-compatible` is `error`, with the reason `the model refused this
+  request: <the refusal>`, and no `StructuredOutputEvent`. An `anthropic-api`
+  stream that ends with no `stop_reason` is `error`: the Messages API states one
+  on every message that ended, so its absence means the stream was cut.
+  `google-api` and `openai-compatible` still read content with no finish reason
+  as `ok`, because neither wire has another end marker and endpoints that never
+  set the field are real. A turn that was truncated, filtered or failed while it
+  was asking for a tool runs no tool on `openai-api`, `openai-compatible` and
+  `google-api`, and ends on that terminal; `anthropic-api` already entered its
+  loop only on `stop_reason == "tool_use"`. On the two OpenAI-shaped runtimes,
+  arguments that do not parse as a JSON object get a failed tool result without
+  the handler being called. None of this was driven against a vendor.
+
 `openai-compatible` is `unverified` **by construction** and stays that way: two
 installs can legitimately disagree about every cell, because what answers is
 whatever the base URL points at. `CapabilityRegistry.refine()` is the per-install
@@ -1095,7 +1175,10 @@ log and guards do not learn that a run changed runtimes.
   are. **No turn cap** — the guard's `stopAtTokens` is the bound. A raising
   handler becomes a failed tool result, so the model can retry or explain rather
   than the run dying. D12 is unchanged: `ToolCallEvent` still has no reply path,
-  because nothing outside the adapter answers one.
+  because nothing outside the adapter answers one. A handler that returns an MCP
+  image block (`data`, `mimeType`) has it rewritten to the Messages image shape
+  on the way out (2026-11-13); content with no Messages shape becomes the
+  `[<type>]` text marker the `tool_result` event shows. Not sent to the vendor.
 * **Usage arrives per response**, so a token guard stops the loop *between*
   rounds — before the next round's tools run. Better granularity than either
   agent runtime; `interim_usage` is `supported` here and means it.
@@ -1171,7 +1254,8 @@ option to select the other transport. That shape belongs to `openai-compatible`
 
 **What is the same as `anthropic-api`, deliberately.** The event vocabulary, the
 tool loop's three rules (no turn cap, a raising handler becomes a failed tool
-result, cancellation checked between rounds), the receipt fields, the session
+result, cancellation checked on every stream event and before each handler since
+2026-11-13, where it was between rounds), the receipt fields, the session
 refusals, and the credential handling — an explicit `api_key=` from the
 connection, so an ambient `OPENAI_API_KEY` can never bill an account nobody
 named. `tests/test_adapter_openai_api.py` is deliberately the same file, section
@@ -1209,7 +1293,11 @@ by section, as `tests/test_adapter_anthropic_api.py`.
   caller's schema is run through `schema.to_openai_strict()` rather than refused,
   and `schema.openai_strict_issues()` is reported **as receipt notes before the
   call** — so "your optional `note` will come back present and possibly null" is
-  something you read in the preflight rather than discover in the answer.
+  something you read in the preflight rather than discover in the answer. The
+  answer is validated against the rewritten schema, the one that was sent, so
+  that null is `valid` (2026-11-13; it was judged against the caller's original
+  and failed). The rewrite reaches `$defs` and `definitions`. The same holds on
+  `openai-compatible`.
 * **No default ceiling.** `max_output_tokens` is optional on this API, so
   modelpass sends none when nobody asked. The opposite of `anthropic-api`, where
   the field is required and 4096 is supplied and reported. Inventing one here
@@ -1375,9 +1463,9 @@ bridge.chat(connection="gemini-api", message="...", schema=s)  # native json sch
 
 **What is the same as the three before it, deliberately.** The event vocabulary,
 the tool loop's three rules (no turn cap, a raising handler becomes a failed tool
-result, cancellation checked between rounds), the receipt fields, the session
-refusals, and the credential handling — an explicit `api_key=` from the
-connection. That last one matters more here than anywhere else: `genai.Client()`
+result, cancellation checked on every stream event and before each handler), the
+receipt fields, the session refusals, and the credential handling — an explicit
+`api_key=` from the connection. That last one matters more here than anywhere else: `genai.Client()`
 discovers **two** ambient names, `GEMINI_API_KEY` *and* `GOOGLE_API_KEY`, so an
 adapter that let the SDK find its own key would have two ways to bill an account
 nobody named. `tests/test_adapter_google_api.py` is the same file, section by
@@ -1457,6 +1545,14 @@ section, as `tests/test_adapter_openai_api.py`.
   `prompt_feedback.block_reason`. It is read separately from `finish_reason` and
   reported ahead of it, because a run that said `ok` there would be reporting an
   empty success.
+* **Every member of the installed `FinishReason` enum is judged** (2026-11-13,
+  `google-genai` 1.73.1). `LANGUAGE`, `NO_IMAGE` and `IMAGE_OTHER` fell through
+  to `ok` and are `error` now. A test walks the installed enum, so a member a
+  later SDK adds fails the suite instead of being waved through.
+* **Parallel calls to one tool get distinct ids** (2026-11-13). `FunctionCall.id`
+  is usually absent, and the fallback id on the `tool_call` and `tool_result`
+  events was the tool name. The first call keeps the name; later ones are
+  `name#2`, `name#3`, counted across the run. A vendor id is used unchanged.
 
 **The open cells, and the one that matters.**
 
@@ -1724,6 +1820,16 @@ travels with the install.
 | 2026-11-04 | `input_support` | `anthropic` 0.97.0 (`ModelInfo.capabilities`, `ModelCapabilities`); `openai-codex` 0.154.0 generated `Model.input_modalities`; `model/list` driven live on codex 0.154.0, token-free, every listed model answering `['text', 'image']`; `openai` 2.32.0 and `google-genai` 1.73.1 `Model`, which have no such field; `tests/test_document_blocks_api.py` | Query on two rows, send-time refusal on the other two. No file has been sent to any vendor yet |
 | 2026-11-04 | `document_input` on `openai-sdk` | `UserInput` and `ContentItem` in `codex-rs/protocol` on `openai/codex` main (latest release `rust-v0.166.0`); the `codex` 0.154.0 binary, which contains no `input_file` string; a third-party report on `openai/codex#1797` that `thread/inject_items` rejects `input_file` locally | Stays a checked `unsupported`. The route is closed in the Codex client. Revisit when `#1797` lands |
 
+A code review on 2026-11-13 changed behaviour on every runtime and moved no cell.
+What it read: `claude-agent-sdk` 0.2.180's transport (the child environment is
+still `{**os.environ, **options.env}`, and `ClaudeSDKClient` takes a
+`transport`); `anthropic` 0.97.0 over a mock transport (a stream closed before
+`message_delta` leaves `stop_reason` as `None`); `google-genai` 1.73.1's
+`FinishReason` enum and its retry default; the real `anthropic`, `openai` and
+`google-genai` clients against a mock transport and a silent loopback server, on
+Windows. Nothing was driven against a vendor or a real Codex server, and the
+POSIX process-group kill was not run.
+
 #### The auth-mode findings, which are the reason this library exists
 
 **Anthropic fails *toward* metered.** Subscription OAuth from `/login` resolves
@@ -1744,6 +1850,12 @@ an empty `ANTHROPIC_API_KEY` still occupies its precedence slot and
 authenticates as an empty key. The residual risk is stated rather than hidden —
 another thread mutating `os.environ` during the spawn window is a race this
 design cannot close.
+
+"The duration of the spawn" was wider than it sounds until 2026-11-13: the scrub
+wrapped `ClaudeSDKClient.connect()`, which goes on to the initialize handshake,
+up to a minute on a slow start. It now covers the transport's own `connect()`
+only, which starts the child, and is released before the handshake (§3.1). The
+merge was re-read on 0.2.180 and is unchanged.
 
 **OpenAI fails toward metered too**, for a different reason: the SDK injects
 `CODEX_API_KEY` into the CLI environment and the vendor's own CI guidance
@@ -2162,6 +2274,20 @@ which owns its own subprocess. Three things are load-bearing:
   silently win and move the run onto metered billing. modelpass therefore removes
   the planned names from `os.environ` for the duration of the spawn, under a
   lock, and restores them afterwards.
+  **The spawn only** (2026-11-13). The client is handed the SDK's own
+  `SubprocessCLITransport` with its `connect()` wrapped in the scrub, so the
+  names are back before the initialize handshake. modelpass's own readers do not
+  see the gap either: `adapters.anthropic.process_env()` answers with the removed
+  names put back, and `Bridge.env` reads through it, so an `anthropic-api` call
+  resolving `env:ANTHROPIC_API_KEY` during a spawn still finds its key. The scrub
+  across the whole `connect()` remains as the fallback, for options the client
+  applies only to a transport it builds itself (`can_use_tool`,
+  `session_store`) and for an SDK without the class or the parameter. Still
+  exposed: code that is not modelpass reading `os.environ`, or starting a child,
+  during the spawn itself, which is the transport's version probe (bounded at
+  2 seconds by the SDK) plus process creation.
+  `tests/test_anthropic_sdk_seams.py` holds the SDK facts this rests on against
+  the installed package. Not driven live.
   `CLAUDE_CONFIG_DIR` is included in the same enforcement: scrub ambient selection,
   then add the connection's explicit directory through `options.env`, whose value wins
   in the SDK's child-environment merge.
@@ -2191,7 +2317,11 @@ every launch so a run can never silently land on metered billing.
 **Multiple accounts.** Codex documents `CODEX_HOME` as the root for its state,
 including `config.toml` and `auth.json`. A profile's `configDir` becomes `CODEX_HOME`
 for preflight and for every exec or app-server child; an ambient `CODEX_HOME` is
-scrubbed when the selected profile does not explicitly name one. No credential-store
+scrubbed when the selected profile does not explicitly name one. A per-call
+`options={"codex_home": ...}`, or the adapter's own `codex_home=`, is written into the
+child's environment as `CODEX_HOME` too (2026-11-13). Until then the override chose the
+home the preflight read and the child ran in the plan's, so the receipt could describe
+one login and the run use another. No credential-store
 setting is required: `cli_auth_credentials_store` defaults to `file`, `auto` falls back
 to `auth.json` when no keyring is available, and the keyring entry is itself keyed by
 `CODEX_HOME` — service `Codex Auth`, account key the SHA-256 of the canonicalized codex
@@ -2282,6 +2412,34 @@ default this call opted out of.
 The SDK remains a perfectly good **binary source** through its pinned CLI,
 exactly as it is for `codex exec` today.
 
+**Process lifetime** (2026-11-13). On Windows the `codex` that resolves is
+`codex.cmd`, so the process modelpass holds is `cmd.exe` and the turn runs two
+levels below it. Killing that one process left the turn running and spending.
+Every Codex child, on both transports, is now started and killed as a tree:
+
+* **Windows**: the child is put in a kill-on-close Job Object as it is launched,
+  so the tree also dies if this process dies without running a `finally`. A kill
+  runs `taskkill /T` first, then ends the job. Run here against a real
+  `.cmd` → python → python chain.
+* **Elsewhere**: the child leads its own session and the kill is SIGKILL to its
+  process group. **Not run**; held by tests with a faked `os`.
+* A child that exited on its own is released without killing what it left
+  running. A process modelpass did not launch (an injected spawn) is killed
+  through its own `kill()`.
+* Closing an app-server child on Windows gives it 2 seconds to leave on a closed
+  stdin and then kills the tree.
+* A run cancelled before it starts launches nothing and ends `cancelled`.
+* A stateless run removes the temporary working directory it made, after the
+  child is stopped. A directory the caller named is never touched.
+
+**Cancelling a session turn** on the app-server transport tries `turn/interrupt`
+first, since a server that honours it keeps the child and the thread. If the
+interrupt cannot be sent, is not answered within 2 seconds, or is answered and
+the turn has not ended 3 seconds later, the child is closed and the turn ends
+`cancelled` (`timed_out` where a bound fired). The next turn starts a new child
+and resumes the thread (§3.4). Assumed, not driven: that a real server's
+interrupted turn ends inside the 3 seconds and leaves the thread usable.
+
 One defect worth knowing about the exec transport, since it silently corrupted
 runs before 2026-08-31: **a multi-line argv element does not survive the Windows
 `.cmd` shim** — `cmd.exe` terminates its command line at the first newline, so
@@ -2371,7 +2529,15 @@ Here the **runtime owns the history** and modelpass holds no shadow copy.
   long-lived child. `thread/start` once, `turn/start` per turn — so turn two
   sends the new message and nothing else — and `thread/resume` picks a stored
   thread back up, which is also where "that thread is gone" is answered *before*
-  anything is spent rather than by a turn that failed.
+  anything is spent rather than by a turn that failed. **If the child dies, or
+  is closed by a cancel, the next turn resumes the thread by id on a new child**
+  (2026-11-13); before, the new child was sent a turn for a thread it had never
+  loaded. A thread no turn finished on has no rollout, so the next turn starts
+  one the way a first turn does. `SessionNotFound` now means exactly Codex's
+  `no rollout found for thread id`; any other `thread/resume` refusal surfaces
+  as itself, where every one used to read as a missing conversation. That a
+  second child continues a thread the first wrote is read from the schema and
+  has not been driven against a real Codex.
 
 **`get_history()` returns empty on the Codex exec opt-out**, and honestly so:
 that transport has no counterpart to `get_session_messages()`, and the rollout file under

@@ -3,7 +3,11 @@
 Reading TOML is stdlib (``tomllib``); writing is not, and core takes no runtime
 dependencies (D8). Rather than fall back to JSON, this module serializes the
 narrow subset the connection store actually produces -- nested tables of
-strings, integers, floats, booleans and string arrays.
+strings, integers, floats, booleans and string arrays -- plus everything
+``tomllib`` can hand back, because the store also carries keys it did not write
+(2026-11-13): dates and times, and tables inside arrays, which are written as
+inline tables. An array of tables (``[[x]]``) therefore comes back out as
+``x = [{...}, {...}]``: the same data, on one line.
 
 The reason to keep TOML rather than write JSON: the connection file is user
 configuration that the product asks people to read and trust. Comments, plain
@@ -13,6 +17,7 @@ sixty lines here, tested by round-tripping through ``tomllib``.
 
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -90,7 +95,14 @@ def _format_value(value: Any) -> str:
         return repr(value)
     if isinstance(value, str):
         return _format_string(value)
-    if isinstance(value, Sequence):
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        # ``isoformat`` is RFC 3339 for all three, offset included where the
+        # value carries one, which is the form TOML reads back.
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        # A table inside an array has no header form; inline is the only one.
+        return dumps_inline(value)
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
         return "[" + ", ".join(_format_value(item) for item in value) + "]"
     raise TypeError(f"cannot serialize {type(value).__name__} to TOML")
 

@@ -218,6 +218,27 @@ What modelpass guarantees around it:
   has already spent one allowance does not arrive at the next one half-budgeted.
   On a metered target that is the guard that matters, and it is a separate
   number you have to have written down.
+* **A rate limit is not a spent allowance** (2026-11-13). On the API runtimes a
+  429 arrives as `quota_exhausted`. If it names a `retry-after`, the same
+  connection will answer again once the wait has passed, so the call **does not
+  fail over**: it ends on the first connection with `retryable = yes`, the wait
+  on `retry_after`, and a reason ending `the failover to '<name>' was not used`.
+  A 429 that names no wait still fails over, and so does a spent subscription
+  allowance. Before this date every 429 failed over, so a per-minute limit
+  could move a call onto the metered connection. The documents had not said
+  which was meant; this is the conservative reading.
+* **The call's sampling crosses, its effort level does not** (2026-11-13). A
+  `Sampling(max_output_tokens=..., temperature=...)` passed to the call reaches
+  the second leg, where it used to be dropped, leaving the metered leg with no
+  ceiling. A field the target cannot take is dropped by the target's own rules
+  and named on its receipt. The target uses its own connection's reasoning
+  level. On a same-runtime target the model is the target's own unless the
+  caller named one on the call.
+* **One clock, and no second leg after it** (2026-11-13). `Timeout(total=...)`
+  covers both legs. If it has fired before or during the target's preflight,
+  the second leg does not start: the call ends with one `timed_out` terminal on
+  the first connection, carrying the first leg's usage and the quota stop in its
+  reason. There is no `failover` event, no second receipt and one ledger line.
 
 `FailoverEvent.crosses_to_metered` is the one property to check if you want to
 log loudly, or refuse, when a call moves onto metered billing.

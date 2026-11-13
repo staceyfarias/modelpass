@@ -892,3 +892,50 @@ def test_a_guard_stop_through_the_leaf_reads_no(tmp_path):
     assert excinfo.value.retryable is Retryable.NO
     assert excinfo.value.terminal.status is TerminalStatus.GUARD_STOP
     assert classify_error(excinfo.value).retryable is Retryable.NO
+
+
+# --- tool_choice is a choice, not always a name (2026-11-13) ----------------------
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "any",
+        "auto",
+        "required",
+        "none",
+        True,
+        False,
+        None,
+        {"type": "function", "function": {"name": "DocumentDecision"}},
+        {"type": "tool", "name": "DocumentDecision"},
+        "DocumentDecision",
+    ],
+)
+def test_a_tool_choice_keyword_is_not_mistaken_for_the_schema_name(tmp_path, tool_choice):
+    # LangChain's ``with_structured_output`` and most callers pass
+    # ``tool_choice="any"`` ("call some tool") or a provider-style dict. The
+    # name travelled as wire protocol (D13), so "any" became the name of the
+    # structured-output tool and of the tool_call handed back.
+    bridge, adapter = build_bridge(
+        tmp_path, [structured(DECISION, schema=to_json_schema(DocumentDecision))]
+    )
+    model = ChatSubpass(connection="claude-sub", bridge=bridge)
+
+    result = model.bind_tools([DocumentDecision], tool_choice=tool_choice).invoke(
+        [HumanMessage(content="q")]
+    )
+
+    assert adapter.requests[0].schema_name == "DocumentDecision"
+    assert result.tool_calls[0]["name"] == "DocumentDecision"
+
+
+def test_a_tool_choice_that_names_the_schema_differently_is_still_passed_through(tmp_path):
+    bridge, adapter = build_bridge(
+        tmp_path, [structured(DECISION, schema=to_json_schema(DocumentDecision))]
+    )
+    model = ChatSubpass(connection="claude-sub", bridge=bridge)
+    model.bind_tools([DocumentDecision], tool_choice="pick_sources").invoke(
+        [HumanMessage(content="q")]
+    )
+    assert adapter.requests[0].schema_name == "pick_sources"

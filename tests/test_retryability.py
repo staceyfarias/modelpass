@@ -165,6 +165,45 @@ def test_a_429_is_transient_only_when_the_vendor_named_a_wait():
     assert without.retryable is Retryable.UNKNOWN
 
 
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        Runtime.ANTHROPIC_API,
+        Runtime.OPENAI_API,
+        Runtime.GOOGLE_API,
+        Runtime.OPENAI_COMPATIBLE,
+    ],
+)
+def test_the_429_an_api_adapter_really_emits_is_transient_with_a_wait(runtime):
+    """Every API adapter types a 429 as ``quota_exhausted``, never ``error``.
+
+    So this is the row a real rate limit reaches, and until 2026-11-13 it read
+    NO whatever the vendor said: the status row was consulted before the code.
+    """
+    with_wait = classify_terminal(
+        runtime, TerminalStatus.QUOTA_EXHAUSTED, status_code=429, retry_after=7.0
+    )
+    assert with_wait.retryable is Retryable.YES
+    assert with_wait.retry_after == 7.0
+
+    without = classify_terminal(
+        runtime, TerminalStatus.QUOTA_EXHAUSTED, status_code=429
+    )
+    assert without.retryable is Retryable.NO
+
+
+def test_a_spent_subscription_allowance_is_not_made_retryable_by_a_reset_time():
+    """An agent runtime reports no status code; a wait there is a plan window."""
+    verdict = classify_terminal(
+        Runtime.ANTHROPIC_SDK,
+        TerminalStatus.QUOTA_EXHAUSTED,
+        status_code=429,
+        retry_after=7.0,
+    )
+    assert verdict.retryable is Retryable.NO
+    assert verdict.retry_after == 7.0
+
+
 def test_a_status_code_on_an_agent_runtime_is_not_consulted():
     """Agent runtimes report no HTTP status, so nothing pretends they do."""
     assert family_of(Runtime.ANTHROPIC_SDK) == AGENT
@@ -378,12 +417,18 @@ def test_every_verdict_carries_a_note_a_human_can_read():
 # terminal's place now carries that terminal.
 
 
+# The shape every API adapter really emits for a 429 (2026-11-13): the status is
+# ``quota_exhausted``, typed off the code, and the code and the vendor's wait
+# ride beside it. This constant used to script ``status=ERROR`` with a 429 -- a
+# shape no adapter produces -- so the tests below passed while a real rate limit
+# read ``retryable=no`` and, with a failover configured, moved the call onto
+# another (possibly metered) connection.
 RATE_LIMITED = TerminalEvent(
-    status=TerminalStatus.ERROR,
+    status=TerminalStatus.QUOTA_EXHAUSTED,
     connection="",
     runtime=Runtime.ANTHROPIC_API,
     auth_mode=AuthMode.API_KEY,
-    reason="429: rate limited",
+    reason="the endpoint reported HTTP 429 (rate limit / quota): rate limited",
     status_code=429,
     retry_after=7.0,
 )
@@ -417,7 +462,7 @@ def assert_rate_limited(error):
     assert error.status_code == 429
     assert error.retry_after == 7.0
     assert error.terminal is not None
-    assert error.terminal.status is TerminalStatus.ERROR
+    assert error.terminal.status is TerminalStatus.QUOTA_EXHAUSTED
     # And the consumer's own call answers the same thing, which is the whole
     # point: they hold the exception, not the event.
     verdict = classify_error(error)
@@ -425,22 +470,75 @@ def assert_rate_limited(error):
     assert verdict.retry_after == 7.0
 
 
-def test_vendor_run_failed_from_ask_carries_the_429(tmp_path, metered):
+def test_a_rate_limit_from_ask_carries_the_429(tmp_path, metered):
+    """The error is ``QuotaExhausted`` -- the class a 429 has always raised --
+    and it reads *retry after seven seconds*, not *the allowance is gone*."""
     bridge = metered_bridge(
         tmp_path, metered, [TextDeltaEvent(text="half an ans"), RATE_LIMITED]
     )
-    with pytest.raises(VendorRunFailed) as caught:
+    with pytest.raises(QuotaExhausted) as caught:
         bridge.ask("claude-api", "go")
     assert_rate_limited(caught.value)
 
 
-def test_vendor_run_failed_from_aask_carries_the_same(tmp_path, metered):
+def test_a_rate_limit_from_aask_carries_the_same(tmp_path, metered):
     import asyncio
 
     bridge = metered_bridge(tmp_path, metered, [RATE_LIMITED])
-    with pytest.raises(VendorRunFailed) as caught:
+    with pytest.raises(QuotaExhausted) as caught:
         asyncio.run(bridge.aask("claude-api", "go"))
     assert_rate_limited(caught.value)
+
+
+def test_vendor_run_failed_from_ask_carries_its_status_code(tmp_path, metered):
+    """The error arm, which a 5xx does reach: the code and the wait survive."""
+    overloaded = TerminalEvent(
+        status=TerminalStatus.ERROR,
+        connection="",
+        runtime=Runtime.ANTHROPIC_API,
+        auth_mode=AuthMode.API_KEY,
+        reason="HTTP 503: overloaded",
+        status_code=503,
+        retry_after=3.0,
+    )
+    bridge = metered_bridge(tmp_path, metered, [overloaded])
+    with pytest.raises(VendorRunFailed) as caught:
+        bridge.ask("claude-api", "go")
+    error = caught.value
+    assert error.retryable is Retryable.YES
+    assert error.status_code == 503
+    assert error.retry_after == 3.0
+    assert error.terminal.status is TerminalStatus.ERROR
+    assert classify_error(error).retryable is Retryable.YES
+
+
+def test_a_rate_limited_terminal_reads_yes_on_the_stream(tmp_path, metered):
+    """The same verdict for a caller who reads events rather than catching."""
+    bridge = metered_bridge(tmp_path, metered, [RATE_LIMITED])
+    terminal = list(bridge.chat(connection="claude-api", message="go"))[-1]
+    assert terminal.status is TerminalStatus.QUOTA_EXHAUSTED
+    assert terminal.status_code == 429
+    assert terminal.retryable is Retryable.YES
+    assert terminal.retry_after == 7.0
+
+
+def test_a_429_that_named_no_wait_still_reads_no(tmp_path, metered):
+    """No wait named: it may be a spent allowance wearing a rate limit's number."""
+    from dataclasses import replace
+
+    bridge = metered_bridge(tmp_path, metered, [replace(RATE_LIMITED, retry_after=None)])
+    terminal = list(bridge.chat(connection="claude-api", message="go"))[-1]
+    assert terminal.status is TerminalStatus.QUOTA_EXHAUSTED
+    assert terminal.retryable is Retryable.NO
+
+
+def test_retry_never_still_outranks_a_named_wait(tmp_path, metered):
+    from dataclasses import replace
+
+    bridge = metered_bridge(tmp_path, replace(metered, retry=NEVER), [RATE_LIMITED])
+    terminal = list(bridge.chat(connection="claude-api", message="go"))[-1]
+    assert terminal.retryable is Retryable.NO
+    assert terminal.retry_after == 7.0
 
 
 def test_a_guard_stop_from_ask_carries_the_terminal_and_reads_no(tmp_path, metered):
@@ -635,9 +733,61 @@ def test_a_never_connection_still_outranks_a_carried_verdict(tmp_path):
         retry="never",
     )
     bridge = metered_bridge(tmp_path, never, [RATE_LIMITED])
-    with pytest.raises(VendorRunFailed) as caught:
+    with pytest.raises(QuotaExhausted) as caught:
         bridge.ask("claude-api", "go")
     assert caught.value.retryable is Retryable.NO
     assert classify_error(caught.value, connection_retry=NEVER).retryable is (
         Retryable.NO
     )
+
+
+# --- two builtin exceptions the name table got wrong (2026-11-13) -----------------
+
+
+def test_a_cancellation_is_the_callers_own_act_and_reads_no():
+    """The terminal row for ``cancelled`` says NO; the exception has to agree.
+
+    It read UNKNOWN -- "not in the retry table" -- which a loop treating
+    UNKNOWN as "ask a human or try once" would act on, for a run somebody
+    stopped on purpose.
+    """
+    import asyncio
+    import concurrent.futures
+
+    for exc in (asyncio.CancelledError(), concurrent.futures.CancelledError()):
+        verdict = classify_error(exc)
+        assert verdict.retryable is Retryable.NO, type(exc)
+        assert "cancel" in verdict.note
+
+
+def test_a_bare_timeout_error_does_not_claim_nothing_was_left_half_done():
+    """A builtin ``TimeoutError`` does not say what timed out or how far it got.
+
+    It read YES unconditionally. The only timeout this table calls transient
+    outright is a first-token expiry on a stateless run, and a bare
+    ``TimeoutError`` -- ``asyncio.wait_for`` around a whole call, say -- carries
+    none of that evidence.
+    """
+    # ``asyncio.TimeoutError`` is this same class since Python 3.11.
+    assert classify_error(TimeoutError("timed out")).retryable is Retryable.UNKNOWN
+
+    class Narrower(TimeoutError):
+        pass
+
+    assert classify_error(Narrower()).retryable is Retryable.UNKNOWN
+
+
+def test_a_timeout_that_carries_a_status_code_is_still_read_off_the_code():
+    class GatewayTimeout(TimeoutError):
+        status_code = 504
+
+    assert classify_error(GatewayTimeout()).retryable is Retryable.YES
+
+
+def test_the_sdks_own_request_timeout_is_still_transient():
+    """Typed by the vendor SDK as its request timeout: that one names itself."""
+
+    class APITimeoutError(Exception):
+        pass
+
+    assert classify_error(APITimeoutError()).retryable is Retryable.YES

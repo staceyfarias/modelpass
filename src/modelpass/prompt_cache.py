@@ -579,12 +579,19 @@ def _mark_system(messages: tuple[Message, ...]) -> tuple[Message, ...]:
     return messages
 
 
-def _with_lifetime(messages: tuple[Message, ...], ttl: str) -> tuple[Message, ...]:
+def _with_lifetime(
+    messages: tuple[Message, ...], ttl: str | None
+) -> tuple[Message, ...]:
     """Put ``ttl`` on every breakpoint that pins none.
 
     The vendor refuses a longer lifetime after a shorter one. So a caller's shorter
     pin caps every breakpoint after it, and a caller's longest pin raises every
     breakpoint before it.
+
+    ``ttl`` is ``None`` where the connection names no lifetime (``auto``, and
+    ``custom`` with no ``promptCacheTime``). Nothing is written on a breakpoint
+    then except the raise: an unpinned breakpoint is the vendor's 5-minute one,
+    so it is still a shorter lifetime ahead of a caller's ``"1h"`` pin.
     """
     pins: list[str | None] = []
 
@@ -603,7 +610,11 @@ def _with_lifetime(messages: tuple[Message, ...], ttl: str) -> tuple[Message, ..
         nonlocal seen, shorter
         if control.ttl is None and seen < last_longest:
             control = replace(control, ttl=LONGEST_CACHE_TTL)
-        elif control.ttl is None and (ttl != LONGEST_CACHE_TTL or not shorter):
+        elif (
+            ttl is not None
+            and control.ttl is None
+            and (ttl != LONGEST_CACHE_TTL or not shorter)
+        ):
             control = replace(control, ttl=ttl)
         seen += 1
         shorter = shorter or control.ttl != LONGEST_CACHE_TTL
@@ -681,8 +692,9 @@ def arrange_prompt_cache(
             f"carry {rules.limit}, and the vendor reads the first ones first"
         )
 
-    if rules.ttl:
-        messages = _with_lifetime(messages, rules.ttl)
+    # Run where the connection names no lifetime too (2026-11-13): the order
+    # rule is the vendor's and holds at its own lifetime as well.
+    messages = _with_lifetime(messages, rules.ttl or None)
 
     return messages, tuple(notes)
 
