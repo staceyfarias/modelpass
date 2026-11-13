@@ -429,13 +429,26 @@ def terminal_status(message: Any) -> tuple[TerminalStatus, str | None]:
       fix -- raise it -- is in the message rather than in a doc.
     * ``refusal`` is ``error``, carrying ``stop_details.category`` where the
       vendor supplied one.
+    * **No ``stop_reason`` at all is ``error``.** The reason arrives in
+      ``message_delta``, near the end of the stream, and the Messages API states
+      one on every message that ended. A message without one is a stream that
+      was cut -- a server or proxy closing the body after a few deltas -- and
+      the SDK hands back what it had accumulated (anthropic 0.97.0, driven over
+      a mock transport 2026-11-13). Reporting that ``ok`` is reporting half a
+      sentence as a finished call.
 
     Anything else -- ``pause_turn`` today, whatever the vocabulary grows next --
     is ``ok`` with the raw reason recorded, because an adapter inventing a
     verdict for a value it does not know is rule 3 broken in the other direction.
     """
     reason = getattr(message, "stop_reason", None)
-    if reason in (None, "end_turn", "stop_sequence"):
+    if reason is None:
+        return (
+            TerminalStatus.ERROR,
+            "the response stream ended before the vendor sent a stop_reason, so "
+            "the answer is unfinished",
+        )
+    if reason in ("end_turn", "stop_sequence"):
         return TerminalStatus.OK, reason
     if reason == "max_tokens":
         return (
