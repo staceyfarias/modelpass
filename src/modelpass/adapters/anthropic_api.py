@@ -1256,10 +1256,15 @@ _NO_MODEL = (
 def _vendor_failure(exc: Exception) -> tuple[TerminalStatus, str]:
     """Classify a vendor exception into a terminal status and a reason.
 
-    A 429 is :attr:`TerminalStatus.QUOTA_EXHAUSTED` and not an error, because it
-    is the outcome a quota failover exists to act on -- typed off the status code
-    the SDK carries rather than matched on the message, which is the substring
-    matching that burned a real allowance once already (R6).
+    A 429 is :attr:`TerminalStatus.QUOTA_EXHAUSTED` and not an error -- typed off
+    the status code the SDK carries rather than matched on the message, which is
+    the substring matching that burned a real allowance once already (R6).
+
+    What a 429 then *leads to* is not decided here. The bridge reads the
+    ``retry-after`` this terminal carries: a 429 that names a wait is a rate
+    limit, reported as retryable after that wait, and does **not** fail over;
+    a 429 that names none may be a spent allowance, and is the one a configured
+    quota failover acts on.
     """
     status_code = getattr(exc, "status_code", None)
     if status_code == 429:
