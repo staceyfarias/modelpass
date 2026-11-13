@@ -294,7 +294,10 @@ def test_a_leading_marker_has_nothing_to_mark():
 def test_a_block_keeps_its_own_breakpoint_when_a_marker_splits_it():
     block = TextBlock(f"a{M}b", cache_control=CacheControl(ttl="1h"))
     wire = params(custom(), system((block,)), user("hi"))
-    assert wire["system"][0]["cache_control"] == AUTO
+    # The marker's own breakpoint pins nothing and sits ahead of the block's
+    # 1-hour pin, so it is raised: this asserted ``AUTO`` until 2026-11-13,
+    # which is a 5-minute breakpoint before a 1-hour one and a refused request.
+    assert wire["system"][0]["cache_control"] == HOUR
     assert wire["system"][1]["cache_control"] == HOUR
 
 
@@ -461,6 +464,33 @@ def test_a_longer_pin_raises_everything_before_it():
     pinned = TextBlock("text", cache_control=CacheControl(ttl="1h"))
     wire = params(claude(), system("s"), user((pinned,)), assistant("b"), user("c"))
     assert controls(wire) == [HOUR, HOUR, FIVE]
+
+
+def test_a_longer_pin_raises_everything_before_it_at_the_vendors_own_lifetime():
+    """``auto`` names no lifetime, and the vendor's own is the 5-minute one.
+
+    The raise ran only when the connection named a lifetime, so an ``auto``
+    connection sent an unpinned (5-minute) system breakpoint ahead of a
+    caller's 1-hour pin -- the order the vendor refuses (2026-11-13).
+    """
+    pinned = TextBlock("text", cache_control=CacheControl(ttl="1h"))
+    connection = claude(prompt_cache_time="auto")
+    wire = params(connection, system("s"), user((pinned,)), assistant("b"), user("c"))
+    assert controls(wire) == [HOUR, HOUR, AUTO]
+
+
+def test_a_longer_pin_raises_an_earlier_marker_in_custom():
+    """Custom carries no lifetime either, and the same order applies to it."""
+    pinned = TextBlock("text", cache_control=CacheControl(ttl="1h"))
+    wire = params(custom(), system(f"s{M}"), user((pinned,)))
+    assert controls(wire) == [HOUR, HOUR]
+
+
+def test_a_call_with_no_longer_pin_is_left_at_the_vendors_own_lifetime():
+    later = TextBlock("later", cache_control=CacheControl())
+    connection = claude(prompt_cache_time="auto")
+    wire = params(connection, system("s"), user((later,)), assistant("b"), user("c"))
+    assert controls(wire) == [AUTO, AUTO, AUTO]
 
 
 def test_a_longer_pin_on_the_current_turn_raises_the_turn_breakpoint():
