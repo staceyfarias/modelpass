@@ -861,8 +861,9 @@ def test_a_handler_with_no_callable_at_all_still_answers_the_model():
     assert "has no handler" in result.content
 
 
-def test_unparseable_call_arguments_reach_the_handler_as_an_empty_mapping():
-    """A dead run is worse than a tool that can say what it was given."""
+def test_unparseable_call_arguments_are_answered_without_running_the_handler():
+    """A dead run is worse than a model that is told its call did not parse --
+    and a handler run with arguments nobody sent is worse than either."""
     seen: list[dict[str, Any]] = []
     tool = echo_tool(seen)
     broken = Round(
@@ -872,7 +873,9 @@ def test_unparseable_call_arguments_reach_the_handler_as_an_empty_mapping():
     )
     factory = Factory([broken, text_round("done")])
     events = drive(run_request(tools=(tool,)), factory)
-    assert seen == [{}]
+    assert seen == []
+    result = next(e for e in events if isinstance(e, ToolResultEvent))
+    assert result.is_error is True
     assert events[-1].status is TerminalStatus.OK
 
 

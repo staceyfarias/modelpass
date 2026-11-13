@@ -126,6 +126,7 @@ class FakeDelta:
     content: str | None = None
     role: str | None = None
     tool_calls: list[FakeToolCallDelta] | None = None
+    refusal: str | None = None
 
 
 @dataclass
@@ -930,9 +931,11 @@ def test_a_tool_the_run_never_declared_is_a_failed_result_rather_than_a_crash():
     assert "not declared" in result.content
 
 
-def test_unparseable_call_arguments_reach_the_handler_as_an_empty_mapping():
+def test_unparseable_call_arguments_are_an_empty_mapping_on_the_event():
     """More likely here than on Responses: the string was concatenated from
-    stream fragments and a truncated turn can end mid-JSON."""
+    stream fragments and a truncated turn can end mid-JSON. The ``{}`` is what
+    the ``tool_call`` event shows; ``tests/test_truncated_tool_calls.py`` holds
+    that no handler is run with it."""
     assert call_arguments('{"topic": "x"') == {}
     assert call_arguments("") == {}
     assert call_arguments("[1, 2]") == {}

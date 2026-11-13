@@ -375,12 +375,50 @@ def to_json_schema(tool: Any) -> dict:
     return schema
 
 
+#: The runtimes whose structured output is OpenAI's strict subset, and whose
+#: answers therefore carry a ``null`` for every optional field the model had
+#: nothing to say about. ``openai-sdk`` requires the caller to send the strict
+#: form; ``openai-api`` and ``openai-compatible`` rewrite to it themselves.
+_STRICT_SCHEMA_RUNTIMES = frozenset(
+    {Runtime.OPENAI_SDK, Runtime.OPENAI_API, Runtime.OPENAI_COMPATIBLE}
+)
+
+
+#: ``tool_choice`` values that choose *whether* a tool is called. None of them
+#: is the name of one. ``"any"`` is LangChain's cross-provider spelling of
+#: "must call some tool" and what ``with_structured_output`` implementations
+#: pass; ``"required"`` is OpenAI's word for the same thing.
+_TOOL_CHOICE_KEYWORDS = frozenset({"any", "auto", "required", "none"})
+
+
+def _tool_choice_name(tool_choice: Any) -> str:
+    """The tool a ``tool_choice`` names, or ``""`` when it names none.
+
+    Three spellings carry a name: a bare string that is not one of
+    :data:`_TOOL_CHOICE_KEYWORDS`, OpenAI's ``{"type": "function", "function":
+    {"name": ...}}`` and Anthropic's ``{"type": "tool", "name": ...}``. A bool,
+    ``None`` or a keyword carries none -- and treating ``"any"`` as a name made
+    it the name of the runtime's structured-output tool (D13) and of the
+    ``tool_call`` handed back to the caller.
+    """
+    if isinstance(tool_choice, str):
+        name = tool_choice.strip()
+        return "" if name.lower() in _TOOL_CHOICE_KEYWORDS else name
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        name = name or tool_choice.get("name")
+        return name.strip() if isinstance(name, str) else ""
+    return ""
+
+
 def _strip_nulls(value: Any) -> Any:
     """Drop ``None`` values, recursively, from a strict-schema answer.
 
     :func:`modelpass.to_openai_strict` expresses "optional" as *required and
     nullable*, because OpenAI's strict subset has no notion of an absent key. So
-    an ``openai-sdk`` run reports every field it had nothing to say about as
+    a run on any of :data:`_STRICT_SCHEMA_RUNTIMES` reports every field it had
+    nothing to say about as
     ``null``, and handing that to a dataclass or model constructor overwrites
     the class's own default with ``None`` -- a ``list`` field becomes ``None``
     and the next thing to iterate it raises, three layers from here.
@@ -652,8 +690,13 @@ class ChatSubpass(BaseChatModel):
         field comes back explicitly null. See :func:`_strip_nulls`.
         """
         runtime = getattr(connection, "runtime", None)
-        if runtime is not Runtime.OPENAI_SDK:
+        if runtime not in _STRICT_SCHEMA_RUNTIMES:
             return schema
+        # Converted here for all three, though the two API adapters would do it
+        # themselves: the rewrite is idempotent, and one place deciding both
+        # "this was tightened" and "so strip its nulls" cannot disagree with
+        # itself. Keying the strip on openai-sdk alone left the API runtimes
+        # handing a constructor nulls in place of its own defaults.
         state["strict_schema"] = True
         return to_openai_strict(schema)
 
@@ -1151,7 +1194,7 @@ class ChatSubpass(BaseChatModel):
         self,
         tools: Sequence,
         *,
-        tool_choice: str | None = None,
+        tool_choice: Any = None,
         **kwargs: Any,
     ):
         """Bind the one schema this call must answer in.
@@ -1162,8 +1205,13 @@ class ChatSubpass(BaseChatModel):
         the binding is translated rather than emulated -- the class becomes a
         JSON Schema and rides ``Bridge.chat(schema=..., schema_name=...)``.
 
-        ``tool_choice`` is the schema name, and it is **wire protocol, not a
-        label**. On ``anthropic-sdk`` the runtime's structured-output mechanism
+        ``tool_choice``, **when it names a tool**, is the schema name, and it is
+        **wire protocol, not a label**. LangChain's own keywords -- ``"any"``,
+        ``"auto"``, ``"required"``, ``"none"``, a bool -- say *whether* to call a
+        tool, not which, and name nothing: exactly one schema is bound and it is
+        always answered, so they change nothing here and the name falls back to
+        the schema's own (:func:`_tool_choice_name`). On ``anthropic-sdk`` the
+        runtime's structured-output mechanism
         *is* a tool call, so modelpass lets the caller own the name and never
         invents one (D13); prompts that refer to the schema by name keep
         working only because it is passed through unchanged.
@@ -1182,7 +1230,11 @@ class ChatSubpass(BaseChatModel):
                 "choose between them."
             )
         schema = to_json_schema(bound[0])
-        name = tool_choice or schema.get("title") or getattr(bound[0], "__name__", "")
+        name = (
+            _tool_choice_name(tool_choice)
+            or schema.get("title")
+            or getattr(bound[0], "__name__", "")
+        )
         if not name:
             raise ValueError(
                 "A schema-bound modelpass call needs a schema name: it is the name "
