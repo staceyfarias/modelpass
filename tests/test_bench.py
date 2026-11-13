@@ -471,6 +471,80 @@ def test_renaming_a_connection_moves_it(bench):
     assert bridge.store.names() == ("claude-main",)
 
 
+def test_a_refused_save_does_not_leave_the_rename_behind(bench):
+    """A rename plus one bad field used to answer 400 with the store already
+    holding the new name -- and the form, still carrying the old one as
+    ``original_name``, then failed on every resubmit (2026-11-13)."""
+    _, client, bridge, _ = bench([anthropic()])
+    data = {
+        "original_name": "claude-sub",
+        "name": "claude-main",
+        "runtime": "anthropic-sdk",
+        "auth_mode": "subscription",
+        "quota_action": "stop",
+        "warn_at_tokens": "abc",
+    }
+    response = client.post("/connections/save", data=data)
+    assert response.status_code == 400
+    assert "whole number" in response.get_data(as_text=True)
+    assert bridge.store.names() == ("claude-sub",)
+
+    # Corrected and sent again, exactly as the re-rendered form would.
+    again = client.post(
+        "/connections/save", data={**data, "warn_at_tokens": "100"}, follow_redirects=True
+    )
+    assert again.status_code == 200
+    assert bridge.store.names() == ("claude-main",)
+    assert bridge.store.get("claude-main").guards.warn_at_tokens == 100
+
+
+def test_a_refused_runtime_does_not_leave_the_rename_behind(bench):
+    _, client, bridge, _ = bench([anthropic()])
+    response = client.post(
+        "/connections/save",
+        data={
+            "original_name": "claude-sub",
+            "name": "claude-main",
+            "runtime": "no-such-runtime",
+            "quota_action": "stop",
+        },
+    )
+    assert response.status_code == 400
+    assert bridge.store.names() == ("claude-sub",)
+
+
+def test_a_refused_save_does_not_move_the_stored_key(bench, store):
+    from modelpass.secrets import SecretStore
+
+    SecretStore(store.root).set("claude-api", SECRET)
+    _, client, bridge, _ = bench(
+        [
+            Connection(
+                name="claude-api",
+                runtime=Runtime.ANTHROPIC_API,
+                auth_mode=AuthMode.API_KEY,
+                credential_ref=CredentialRef.parse("secret:claude-api"),
+            )
+        ],
+        adapters={Runtime.ANTHROPIC_API: FakeAdapter(runtime=Runtime.ANTHROPIC_API)},
+    )
+    response = client.post(
+        "/accounts/save",
+        data={
+            "original_name": "claude-api",
+            "name": "claude-work",
+            "runtime": "anthropic-api",
+            "credential": "keep",
+            "secret_entry": "claude-api",
+            "stop_at_tokens": "lots",
+        },
+    )
+    assert response.status_code == 400
+    assert "whole number" in response.get_data(as_text=True)
+    assert bridge.store.names() == ("claude-api",)
+    assert SecretStore(store.root).entries() == ("claude-api",)
+
+
 def test_disable_and_enable_round_trip(bench):
     _, client, bridge, _ = bench([anthropic()])
     client.post(

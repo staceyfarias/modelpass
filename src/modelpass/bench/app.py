@@ -725,27 +725,11 @@ def create_app(
         # guard thresholds as a side effect of a typed name.
         new_name = str(form.get("name") or "").strip()
         editing_in_place = bool(original) and original == new_name
-        try:
-            credential = _credential_from_form(form, pasted_key, previous)
-            if original and not editing_in_place:
-                # A rename goes through the manager rather than through an add
-                # and a remove, because those two orders each get the secrets
-                # file wrong in their own way: one orphans the key, the other
-                # destroys it. `rename_connection` moves the entry when it is
-                # unambiguously this connection's and says so when it is not
-                # (ticket 1.4).
-                renamed = active.manage.rename_connection(original, new_name)
-                previous = active.connection(new_name)
-                if credential.kind is CredentialKind.SECRET and not credential.value:
-                    # The entry moved with the connection, so "keep the stored
-                    # key" now means the new name.
-                    credential = Credential.stored_secret(
-                        renamed.secret_entry or credential.locator or new_name
-                    )
+        def fields_for(credential: Credential) -> dict[str, Any]:
             # Everything a connection is made of, validated by the same manager
             # `modelpass connect` uses -- so the secrets file is written first
             # and by one implementation, not two (ticket 1.4).
-            fields = dict(
+            return dict(
                 name=new_name,
                 runtime=Runtime(form.get("runtime") or ""),
                 credential=credential,
@@ -760,8 +744,10 @@ def create_app(
                 enabled=bool(form.get("enabled", True)),
                 overwrite=bool(original),
             )
+
+        def plan_for(fields: dict[str, Any]) -> ConnectionPlan:
             try:
-                plan = active.manage.plan_connection(**fields)
+                return active.manage.plan_connection(**fields)
             except PreflightFailed as exc:
                 # This page has never refused a connection whose credential is
                 # not resolvable *yet* -- naming a variable you are about to set
@@ -773,9 +759,39 @@ def create_app(
                 # exception: it resolves in memory, so a failure here is a real
                 # one and writing the key anyway would store a secret for a
                 # connection that does not work.
-                if credential.value is not None:
+                if fields["credential"].value is not None:
                     raise
-                plan = _unpreflighted_plan(active, fields, exc)
+                return _unpreflighted_plan(active, fields, exc)
+
+        try:
+            credential = _credential_from_form(form, pasted_key, previous)
+            if original and not editing_in_place:
+                # **Everything is validated before the rename is written**
+                # (2026-11-13). The rename is a write to the connection file
+                # and sometimes to the secrets file, and it used to happen
+                # first: a rename plus `warn_at_tokens=abc` answered 400 with
+                # the store already holding the new name, and the form -- still
+                # carrying the old name as its original -- then failed on every
+                # resubmit. Planning writes nothing, so the whole save is
+                # planned once here against the store as it stands, and any
+                # refusal leaves the store exactly as it was.
+                plan_for(fields_for(credential))
+                # A rename goes through the manager rather than through an add
+                # and a remove, because those two orders each get the secrets
+                # file wrong in their own way: one orphans the key, the other
+                # destroys it. `rename_connection` moves the entry when it is
+                # unambiguously this connection's and says so when it is not
+                # (ticket 1.4).
+                renamed = active.manage.rename_connection(original, new_name)
+                previous = active.connection(new_name)
+                if credential.kind is CredentialKind.SECRET and not credential.value:
+                    # The entry moved with the connection, so "keep the stored
+                    # key" now means the new name.
+                    credential = Credential.stored_secret(
+                        renamed.secret_entry or credential.locator or new_name
+                    )
+            fields = fields_for(credential)
+            plan = plan_for(fields)
             connection = plan.connection
             if previous is not None:
                 # Carried rather than re-derived: `retry`, `timeoutSeconds`,
