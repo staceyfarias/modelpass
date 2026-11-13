@@ -1626,3 +1626,80 @@ def test_the_sdk_carries_a_thinking_level_matching_modelpasss_own_dial():
     # And the field modelpass refuses to fill in, with the reason in its own docs.
     budget = genai_types.ThinkingConfig.model_fields["thinking_budget"]
     assert "model dependent" in (budget.description or "")
+
+
+# --- finish reasons that are not an answer, and ids for parallel calls (2026-11-13) --
+
+
+@NEEDS_SDK
+def test_every_finish_reason_but_a_clean_stop_is_an_error():
+    """Read off the installed enum, so a member the SDK adds is judged here.
+
+    ``LANGUAGE`` (generation stopped on an unsupported language), ``NO_IMAGE``
+    and ``IMAGE_OTHER`` (the image that was asked for was not produced) used to
+    fall through to the "unknown value, so ``ok``" arm: three known ways of not
+    answering, reported as answers.
+    """
+    from google.genai import types as genai_types
+
+    clean = {"STOP", "FINISH_REASON_UNSPECIFIED"}
+    for member in genai_types.FinishReason:
+        status, reason = terminal_status(member, unanswered_call=False)
+        if member.value in clean:
+            assert status is TerminalStatus.OK, member
+        else:
+            assert status is TerminalStatus.ERROR, member
+            assert reason
+
+
+@pytest.mark.parametrize("reason", ["LANGUAGE", "NO_IMAGE", "IMAGE_OTHER"])
+def test_the_three_finish_reasons_that_were_ok_end_the_run_as_an_error(reason):
+    events = drive(run_request(), Factory([text_round("partial", finish_reason=reason)]))
+    assert events[-1].status is TerminalStatus.ERROR
+    assert reason in (events[-1].reason or "")
+
+
+def test_parallel_calls_to_one_tool_get_distinct_ids_that_pair_with_their_results():
+    """``FunctionCall.id`` is usually absent, and the fallback was the tool's name --
+    so two calls to one tool in a turn were indistinguishable to a consumer
+    pairing ``tool_call`` with ``tool_result``."""
+    seen: list[dict[str, Any]] = []
+    tool = echo_tool(seen)
+    two = Round(
+        chunks=[
+            chunk(
+                FakePart(function_call=FakeFunctionCall(name="look_up", args={"topic": "a"})),
+                FakePart(function_call=FakeFunctionCall(name="look_up", args={"topic": "b"})),
+                finish_reason="STOP",
+                usage=FakeUsage(prompt_token_count=8, candidates_token_count=4),
+            )
+        ]
+    )
+    again = Round(
+        chunks=[
+            chunk(
+                FakePart(function_call=FakeFunctionCall(name="look_up", args={"topic": "c"})),
+                finish_reason="STOP",
+                usage=FakeUsage(prompt_token_count=8, candidates_token_count=4),
+            )
+        ]
+    )
+    events = drive(run_request(tools=(tool,)), Factory([two, again, text_round("done")]))
+
+    calls = [e for e in events if isinstance(e, ToolCallEvent)]
+    results = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len({e.id for e in calls}) == 3
+    assert [e.id for e in calls] == [e.id for e in results]
+    # The first call keeps the id it always had; a vendor id is still used as is.
+    assert calls[0].id == "look_up"
+    assert all(e.name == "look_up" for e in calls)
+    assert events[-1].status is TerminalStatus.OK
+
+
+def test_a_vendor_supplied_call_id_is_used_unchanged():
+    tool = echo_tool([])
+    events = drive(
+        run_request(tools=(tool,)),
+        Factory([tool_round("look_up", {"topic": "a"}, call_id="call_7"), text_round("done")]),
+    )
+    assert next(e for e in events if isinstance(e, ToolCallEvent)).id == "call_7"

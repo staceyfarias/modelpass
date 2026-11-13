@@ -520,10 +520,13 @@ def _reason_value(reason: Any) -> str | None:
 #: named on the terminal. Read off ``google-genai`` 1.73.1's ``FinishReason``
 #: enum on 2026-09-13; every one of them is a *content* judgement, which is the
 #: same kind of event as Anthropic's ``refusal`` and OpenAI's ``content_filter``.
+#: ``LANGUAGE`` joined on 2026-11-13: generation stopped because the content is
+#: in a language the model does not support, which is the vendor declining too.
 _BLOCKED_REASONS = frozenset(
     {
         "SAFETY",
         "RECITATION",
+        "LANGUAGE",
         "PROHIBITED_CONTENT",
         "BLOCKLIST",
         "SPII",
@@ -536,7 +539,13 @@ _BLOCKED_REASONS = frozenset(
 #: Finish reasons that mean the answer is unfinished for a mechanical reason.
 #: Separate from the set above because the sentence a caller needs is different:
 #: nothing was refused, something went wrong.
-_BROKEN_REASONS = frozenset({"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "OTHER"})
+#: ``NO_IMAGE`` and ``IMAGE_OTHER`` joined on 2026-11-13: an image was expected
+#: and was not produced. With ``LANGUAGE`` above, that makes every member of the
+#: installed ``FinishReason`` enum (1.73.1) a decision rather than a fall-through
+#: to "unknown, so ``ok``" -- which is where those three had been.
+_BROKEN_REASONS = frozenset(
+    {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "OTHER", "NO_IMAGE", "IMAGE_OTHER"}
+)
 
 
 def terminal_status(
@@ -629,6 +638,28 @@ def _unfinished(finish_reason: Any, blocked: str | None) -> bool:
         finish_reason, unanswered_call=False, blocked=blocked, answered=True
     )
     return status is not TerminalStatus.OK
+
+
+def event_call_id(call: Any, name: str, issued: dict[str, int]) -> str:
+    """The id a call's ``tool_call`` and ``tool_result`` events share.
+
+    The vendor's own ``FunctionCall.id`` when there is one. It is optional here
+    and usually absent, and an event with an empty id cannot be paired with its
+    result by a consumer reading the stream, so the fallback is the tool's
+    name -- made distinct. Two calls to one tool in a turn (parallel calls) used
+    to share that name as their id; now the first is ``look_up`` as before and
+    the next are ``look_up#2``, ``look_up#3``, counted across the whole run in
+    ``issued`` so a later round does not reuse one either.
+
+    Only the events carry it. What goes back to the vendor is the call itself
+    (:func:`function_response_part`), so a made-up id never reaches the wire.
+    """
+    vendor_id = getattr(call, "id", None)
+    if vendor_id:
+        return str(vendor_id)
+    count = issued.get(name, 0) + 1
+    issued[name] = count
+    return name if count == 1 else f"{name}#{count}"
 
 
 def _bare_terminal(
@@ -1077,6 +1108,7 @@ class GoogleAPIAdapter(Adapter):
     def _loop(self, client: Any, request: RunRequest, cancel: RunCancel) -> Iterator[AgentEvent]:
         contents = content_items(request)
         by_name = {tool.name: tool for tool in request.tools}
+        issued_ids: dict[str, int] = {}
         final_text = ""
 
         while True:
@@ -1187,10 +1219,7 @@ class GoogleAPIAdapter(Adapter):
             for call in calls:
                 name = getattr(call, "name", "") or ""
                 arguments = call_arguments(call)
-                # FunctionCall.id is optional here and usually absent, so the
-                # name is the fallback: an event with an empty id cannot be
-                # paired with its result by a consumer reading the stream.
-                call_id = getattr(call, "id", None) or name
+                call_id = event_call_id(call, name, issued_ids)
                 yield ToolCallEvent(
                     name=name,
                     arguments=arguments,
@@ -1260,6 +1289,7 @@ class GoogleAPIAdapter(Adapter):
         """
         contents = content_items(request)
         by_name = {tool.name: tool for tool in request.tools}
+        issued_ids: dict[str, int] = {}
         final_text = ""
 
         # Every vendor wait below goes through this, so a cancel -- the
@@ -1364,7 +1394,7 @@ class GoogleAPIAdapter(Adapter):
             for call in calls:
                 name = getattr(call, "name", "") or ""
                 arguments = call_arguments(call)
-                call_id = getattr(call, "id", None) or name
+                call_id = event_call_id(call, name, issued_ids)
                 yield ToolCallEvent(
                     name=name,
                     arguments=arguments,
