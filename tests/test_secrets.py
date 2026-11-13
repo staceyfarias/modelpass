@@ -271,18 +271,123 @@ def test_a_widened_mode_is_reported_and_not_refused(secrets):
     assert secrets.get("one") == KEY
 
 
+# The Windows tests come in two kinds, and the difference is the point
+# (2026-11-13). The ones that say "real" run the real ``icacls`` against a temp
+# directory and then read the file's ACL back **independently** -- by asking
+# ``icacls`` to print it. The ones that mock ``subprocess.run`` are about what
+# is reported when the restriction did not happen. Until this date every
+# Windows test here was of the second kind and then asserted "restricted": a
+# mocked icacls restricts nothing, so they were asserting the recorded claim,
+# and the claim was false on a real machine after the very first write.
+
+
+def _inherited_aces(path) -> list[str]:
+    """The inherited entries on ``path``, as ``icacls`` prints them: ``(I)``."""
+    shown = subprocess.run(
+        ["icacls", str(path)], capture_output=True, text=True, check=True
+    ).stdout
+    return [line.strip() for line in shown.splitlines() if "(I)" in line]
+
+
 @WINDOWS_SHAPED
-def test_the_windows_acl_attempt_is_recorded_when_it_succeeds(secrets):
-    completed = subprocess.CompletedProcess(["icacls"], 0, stdout="ok", stderr="")
-    with mock.patch("modelpass.secrets.subprocess.run", return_value=completed) as run:
-        secrets.set("one", KEY)
-    assert run.call_count == 1
-    argv = run.call_args.args[0]
-    assert argv[0] == "icacls"
-    assert "/inheritance:r" in argv and "/grant:r" in argv
+def test_real_the_acl_survives_the_first_write(secrets):
+    """The defect: icacls ran on the new file, then the result was recorded by
+    rewriting the file through a temp file -- which arrived with the directory's
+    inherited ACL and replaced the restricted one."""
+    secrets.set("one", KEY)
+    assert _inherited_aces(secrets.path) == []
     permissions = secrets.permissions()
     assert permissions.windows_acl == "restricted"
     assert permissions.note == "the secrets file is restricted to your account"
+    assert secrets.get("one") == KEY
+
+
+@WINDOWS_SHAPED
+def test_real_the_acl_survives_every_later_write(secrets):
+    secrets.set("one", KEY)
+    secrets.set("two", OTHER_KEY)
+    assert _inherited_aces(secrets.path) == []
+    secrets.rename("two", "three")
+    assert _inherited_aces(secrets.path) == []
+    secrets.remove("three")
+    assert _inherited_aces(secrets.path) == []
+    assert secrets.permissions().windows_acl == "restricted"
+    assert secrets.get("one") == KEY
+
+
+@WINDOWS_SHAPED
+def test_real_permissions_reads_the_acl_and_not_the_record(secrets):
+    """Widen the ACL behind modelpass's back: the file still *says* restricted."""
+    secrets.set("one", KEY)
+    assert secrets.permissions().windows_acl == "restricted"
+    subprocess.run(
+        ["icacls", str(secrets.path), "/inheritance:e"],
+        capture_output=True,
+        check=True,
+    )
+    assert 'windowsAcl = "restricted"' in secrets.path.read_text(encoding="utf-8")
+    permissions = secrets.permissions()
+    assert permissions.windows_acl == "open"
+    assert "restricted to your account" not in permissions.note
+    assert "readable beyond your account" in permissions.note
+    assert "inherits its directory's permissions" in permissions.note
+    assert "the profile directory's own ACL is the floor" in permissions.note
+    # And the next write puts it back.
+    secrets.set("two", OTHER_KEY)
+    assert _inherited_aces(secrets.path) == []
+    assert secrets.permissions().windows_acl == "restricted"
+
+
+@WINDOWS_SHAPED
+def test_real_the_grantee_is_the_process_account_not_the_username_variable(
+    secrets, monkeypatch
+):
+    """``%USERNAME%`` is whatever the launcher set it to, or nothing at all."""
+    from modelpass.secrets import windows_account_sid
+
+    monkeypatch.setenv("USERNAME", "somebody-else-entirely")
+    monkeypatch.delenv("USERDOMAIN", raising=False)
+    sid = windows_account_sid()
+    assert sid and sid.startswith("S-1-")
+    secrets.set("one", KEY)
+    assert secrets.permissions().windows_acl == "restricted"
+    assert secrets.get("one") == KEY
+
+    monkeypatch.delenv("USERNAME")
+    secrets.set("two", OTHER_KEY)
+    assert secrets.permissions().windows_acl == "restricted"
+
+
+@WINDOWS_SHAPED
+def test_the_acl_is_applied_to_the_file_about_to_be_moved_into_place(secrets):
+    """On every write, and to the temp file: a move keeps the ACL it arrives with."""
+    from modelpass.secrets import windows_account_sid
+
+    completed = subprocess.CompletedProcess(["icacls"], 0, stdout="ok", stderr="")
+    with mock.patch("modelpass.secrets.subprocess.run", return_value=completed) as run:
+        secrets.set("one", KEY)
+        secrets.set("two", OTHER_KEY)
+        secrets.remove("two")
+    assert run.call_count == 3
+    for call in run.call_args_list:
+        argv = call.args[0]
+        assert argv[0] == "icacls"
+        assert argv[1] != str(secrets.path)
+        assert argv[1].endswith(".tmp")
+        assert "/inheritance:r" in argv and "/grant:r" in argv
+        assert argv[-1] == f"*{windows_account_sid()}:F"
+
+
+@WINDOWS_SHAPED
+def test_an_icacls_that_reports_success_is_not_believed_over_the_acl(secrets):
+    """The mocked icacls restricts nothing, and the report has to notice."""
+    completed = subprocess.CompletedProcess(["icacls"], 0, stdout="ok", stderr="")
+    with mock.patch("modelpass.secrets.subprocess.run", return_value=completed):
+        secrets.set("one", KEY)
+    assert 'windowsAcl = "restricted"' in secrets.path.read_text(encoding="utf-8")
+    permissions = secrets.permissions()
+    assert permissions.windows_acl == "open"
+    assert "restricted to your account" not in permissions.note
 
 
 @WINDOWS_SHAPED
@@ -313,13 +418,17 @@ def test_an_icacls_that_cannot_be_run_is_a_recorded_failure_not_a_crash(secrets)
 
 
 @WINDOWS_SHAPED
-def test_the_acl_is_attempted_once_at_creation_and_not_on_every_write(secrets):
-    completed = subprocess.CompletedProcess(["icacls"], 0, stdout="", stderr="")
-    with mock.patch("modelpass.secrets.subprocess.run", return_value=completed) as run:
+def test_a_failure_is_forgotten_once_a_later_write_restricts_the_file(secrets):
+    with mock.patch(
+        "modelpass.secrets.subprocess.run", side_effect=OSError("not found")
+    ):
         secrets.set("one", KEY)
-        secrets.set("two", OTHER_KEY)
-        secrets.remove("two")
-    assert run.call_count == 1
+    assert secrets.permissions().windows_acl == "failed"
+    secrets.set("two", OTHER_KEY)
+    assert secrets.permissions().windows_acl == "restricted"
+    text = secrets.path.read_text(encoding="utf-8")
+    assert 'windowsAcl = "restricted"' in text
+    assert "windowsAclDetail" not in text
 
 
 def test_permissions_of_a_missing_file_claim_nothing(secrets):

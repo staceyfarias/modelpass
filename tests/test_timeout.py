@@ -332,3 +332,34 @@ def test_a_session_turn_is_bounded_and_the_session_survives(tmp_path, connection
     events = list(session.send("hi", timeout=Timeout(total=30)))
     assert events[-1].status is TerminalStatus.OK
     assert not session.closed
+
+
+# --- the watchdog across two legs (2026-11-13) ------------------------------------
+
+
+def test_a_bound_that_fired_before_the_second_leg_is_owed_to_it():
+    """``bind`` on a deadline that already fired must not leave leg 2 unwatched."""
+    import time
+
+    from modelpass._deadline import Deadline
+    from modelpass.testing import FakeAdapter
+
+    first, second = FakeAdapter([]), FakeAdapter([])
+    deadline = Deadline(Timeout(total=0.05))
+    cancelled = []
+    try:
+        deadline.start(first, run_scoped=True)
+        deadline.bind_run(lambda: cancelled.append("leg 1"))
+        # Leg 1 is over, and then the bound runs out with no run in flight.
+        deadline.release_run()
+        time.sleep(0.2)
+        assert deadline.fired == "total"
+        assert cancelled == []
+
+        deadline.bind(second, run_scoped=True)
+        deadline.bind_run(lambda: cancelled.append("leg 2"))
+    finally:
+        deadline.stop()
+    assert cancelled == ["leg 2"]
+    assert first.cancelled == 0
+    assert second.cancelled == 0

@@ -55,7 +55,11 @@
       <dt>group:{{ g.name }}</dt>
       <dd>
         {% if g.selection %}
-          resolves to <a class="mono" href="/?check={{ g.selection.chosen }}#receipt">{{ g.selection.chosen }}</a>
+          resolves to
+          <form class="inline" method="post" action="/accounts/{{ g.selection.chosen }}/check#receipt">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="linklike mono" title="Check this connection">{{ g.selection.chosen }}</button>
+          </form>
           {% if g.selection.passed_over %}
             <div class="small muted">
               {% for skipped in g.selection.passed_over %}

@@ -47,6 +47,7 @@ __all__ = [
     "classify_error",
     "classify_terminal",
     "family_of",
+    "rate_limit_named_a_wait",
     "vendor_error_facts",
 ]
 
@@ -139,6 +140,11 @@ _TERMINAL_ROWS: dict[tuple[str, TerminalStatus], tuple[Retryable, str]] = {
     # resets and not before, so an immediate retry spends nothing but patience.
     # Where a failover is configured the bridge has already used it before this
     # terminal was stamped, so reaching here means there was none or it refused.
+    #
+    # 2026-11-13. On the API family this row is the *no wait named* half only.
+    # Every API adapter types a 429 as QUOTA_EXHAUSTED, so a per-minute rate
+    # limit arrives here too, and one that named a wait is answered before this
+    # row is read -- see rate_limit_named_a_wait.
     (API, TerminalStatus.QUOTA_EXHAUSTED): (
         Retryable.NO,
         "the allowance is gone until the plan's window resets; failover, where "
@@ -175,6 +181,12 @@ _STATUS_ROWS: dict[int, tuple[Retryable, str]] = {
     # somewhere deliberate, and it is YES *only* with a retry-after -- a rate
     # limit that named a wait is transient, one that named nothing may be a
     # spent allowance wearing a rate limit's number.
+    #
+    # 2026-11-13. "Never reaches here" was true and was the defect: the rule in
+    # this comment was written against a shape no adapter emits, so the 429 an
+    # adapter does emit read NO with the vendor's wait beside it. The rule now
+    # also stands where a 429 really lands -- rate_limit_named_a_wait, consulted
+    # ahead of the QUOTA_EXHAUSTED row.
     429: (Retryable.YES, "HTTP 429 rate limit"),
     500: (Retryable.YES, "HTTP 500, a server-side fault"),
     502: (Retryable.YES, "HTTP 502 bad gateway"),
@@ -281,7 +293,22 @@ _ERROR_NAME_ROWS: dict[str, tuple[Retryable, str]] = {
     "APITimeoutError": (Retryable.YES, "the SDK's own request timeout fired"),
     "ConnectionResetError": (Retryable.YES, "the connection was reset"),
     "ConnectionError": (Retryable.YES, "the connection failed"),
-    "TimeoutError": (Retryable.YES, "a transport timeout"),
+    # 2026-11-13. UNKNOWN, where this row said YES. The builtin says a wait
+    # ran out and nothing else: not which wait, not whether a request was
+    # mid-answer when it did. ``asyncio.wait_for`` around a whole call raises
+    # exactly this, for a run that may have spent most of its allowance -- the
+    # case the RunTimedOut row above already answers UNKNOWN for the same
+    # reason. The timeouts this table does call transient name themselves: the
+    # SDK's APITimeoutError, a 408 or a 504, a first-token expiry.
+    "TimeoutError": (
+        Retryable.UNKNOWN,
+        "a timeout with no typed fact saying what timed out or how far it got",
+    ),
+    # 2026-11-13. A cancellation is the caller's own act, as on the CANCELLED
+    # terminal row: retrying a run somebody deliberately stopped is the library
+    # second-guessing them. Matches asyncio's and concurrent.futures' classes,
+    # which share the name. It was absent, and so read UNKNOWN.
+    "CancelledError": (Retryable.NO, "the caller cancelled this run"),
     "ServiceUnavailable": (Retryable.YES, "the service reported itself unavailable"),
     "InternalServerError": (Retryable.YES, "a server-side fault"),
     "RateLimitError": (Retryable.YES, "the endpoint reported a rate limit"),
@@ -291,6 +318,38 @@ _ERROR_NAME_ROWS: dict[str, tuple[Retryable, str]] = {
     "BadRequestError": (Retryable.NO, "the request itself is wrong"),
     "UnprocessableEntityError": (Retryable.NO, "the request is not processable"),
 }
+
+
+def rate_limit_named_a_wait(
+    runtime: Runtime,
+    status: TerminalStatus,
+    status_code: int | None,
+    retry_after: float | None,
+) -> bool:
+    """Whether this terminal is a rate limit the vendor said how long to wait out.
+
+    2026-11-13. Three typed facts, all required: an API runtime (the family that
+    reports HTTP status codes at all), a ``quota_exhausted`` terminal carrying
+    status 429 -- the shape every API adapter gives a 429 -- and a
+    ``retry_after``. Together they describe a window that reopens in the named
+    number of seconds, which is a different outcome from an allowance that is
+    gone until a plan resets, even though the two share a status.
+
+    Two callers, and they have to agree, which is why this is one function: the
+    verdict (:func:`classify_terminal` answers ``YES``) and the failover decision
+    (:class:`modelpass._fold.CallFold` does not move such a call to a second
+    connection). Without the wait it is ``False``: a 429 that named nothing may
+    be a spent allowance wearing a rate limit's number.
+
+    A subscription runtime never answers ``True``. It reports no status code,
+    and a reset time on a spent plan is a window measured in hours.
+    """
+    return (
+        family_of(runtime) == API
+        and status is TerminalStatus.QUOTA_EXHAUSTED
+        and status_code == 429
+        and retry_after is not None
+    )
 
 
 def classify_terminal(
@@ -317,9 +376,19 @@ def classify_terminal(
     row: :data:`NEVER` forces :attr:`~modelpass.types.Retryable.NO`.
     """
     family = family_of(runtime)
-    verdict = _terminal_verdict(
-        family, status, status_code, retry_after, first_token, stateless
-    )
+    if rate_limit_named_a_wait(runtime, status, status_code, retry_after):
+        # 2026-11-13. Ahead of the status rows, because the QUOTA_EXHAUSTED row
+        # would otherwise answer NO for it -- which it did, for every real 429.
+        verdict = RetryVerdict(
+            Retryable.YES,
+            retry_after,
+            "HTTP 429 that named a wait: a rate limit, transient once the "
+            "vendor's retry-after has passed",
+        )
+    else:
+        verdict = _terminal_verdict(
+            family, status, status_code, retry_after, first_token, stateless
+        )
     return _apply_policy(verdict, connection_retry)
 
 

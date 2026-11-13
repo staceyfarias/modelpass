@@ -536,6 +536,33 @@ def _with_call_reasoning(
         replace(sampling, reasoning_effort=None),
     )
 
+#: How a receipt attributes a model the caller named on the call itself. A
+#: constant because :meth:`Bridge._begin_failover` reads it back: it is the one
+#: typed trace of *who chose this model* that a built request still carries.
+_CALL_MODEL_SOURCE = "requested for this call"
+
+
+def _sampling_for_failover(sampling: Sampling | None) -> Sampling | None:
+    """What the caller asked about sampling, as the second leg should hear it.
+
+    2026-11-13. A failover is still the caller's call, so the ceiling and the
+    temperature they set cross with it -- the second leg is the one most likely
+    to be metered, and it used to run with neither. A field the target runtime
+    cannot take is dropped by the target's own sampling rules and named on its
+    receipt, exactly as on a first leg.
+
+    **The effort level does not cross.** A level is a vendor's vocabulary, the
+    first request's copy may be the first *connection's* standing level rather
+    than anything the caller said, and the documented rule is that a failover
+    target uses its own connection's level -- which ``_build_request`` fills in
+    from the target once this field is empty.
+    """
+    if sampling is None or sampling.reasoning_effort is None:
+        return sampling
+    carried = replace(sampling, reasoning_effort=None)
+    return None if carried == Sampling() else carried
+
+
 class Bridge:
     """Entry point. Owns a connection store, a capability registry and adapters.
 
@@ -2991,7 +3018,7 @@ class Bridge:
             # so rather than reporting a name with no provenance -- the whole
             # point of putting a model on the receipt is that a rejected model is
             # diagnosable from what was printed before the run.
-            plan = replace(plan, model=model, model_source="requested for this call")
+            plan = replace(plan, model=model, model_source=_CALL_MODEL_SOURCE)
         connection, sampling = _with_call_reasoning(connection, sampling, self.registry)
         sampling = _with_standing_reasoning(connection, sampling)
         arranged, cache_notes = arrange_prompt_cache(messages, connection, self.registry)
@@ -3257,18 +3284,7 @@ class Bridge:
         :meth:`achat` can hand it to a thread without copying the decorations
         that follow it.
         """
-        receipt = self._with_recorded_identity(
-            plan.request.connection, plan.adapter.preflight(plan.request)
-        )
-        _note = self._option_note(plan.adapter, plan.request.options)
-        if _note is not None:
-            receipt = replace(receipt, notes=(*receipt.notes, _note))
-        receipt = self._with_cache_disclosure(plan.adapter, plan.request, receipt)
-        receipt = self._with_cache_breakpoints(plan.request, receipt)
-        receipt = self._with_documents(plan.request, receipt)
-        receipt = self._with_reasoning_disclosure(plan.request, receipt)
-        receipt = self._with_prompt_cache(plan.request, receipt)
-        receipt = self._with_sampling_disclosure(plan.request, receipt)
+        receipt = self._decorated_receipt(plan.adapter, plan.request)
         receipt.require_ok()
         receipt.require_auth_mode(
             AuthMode(plan.expect_auth_mode)
@@ -3276,6 +3292,29 @@ class Bridge:
             else None
         )
 
+        return receipt
+
+    def _decorated_receipt(self, adapter: Adapter, request: RunRequest) -> Receipt:
+        """One leg's preflight, with every disclosure the bridge adds to it.
+
+        Its own method so the two places a leg starts share it (2026-11-13). A
+        failover's second leg used to take the adapter's receipt bare, so the
+        leg most likely to be metered was the one whose receipt -- and whose
+        ledger line, which is read off the receipt -- said nothing about
+        sampling, cache breakpoints, documents, reasoning or ignored options.
+        """
+        receipt = self._with_recorded_identity(
+            request.connection, adapter.preflight(request)
+        )
+        _note = self._option_note(adapter, request.options)
+        if _note is not None:
+            receipt = replace(receipt, notes=(*receipt.notes, _note))
+        receipt = self._with_cache_disclosure(adapter, request, receipt)
+        receipt = self._with_cache_breakpoints(request, receipt)
+        receipt = self._with_documents(request, receipt)
+        receipt = self._with_reasoning_disclosure(request, receipt)
+        receipt = self._with_prompt_cache(request, receipt)
+        receipt = self._with_sampling_disclosure(request, receipt)
         return receipt
 
     def _stream(self, prepared: _Prepared) -> Iterator[AgentEvent]:
@@ -3303,6 +3342,13 @@ class Bridge:
             # The durable half of D3's stamp, then the one terminal event.
             yield from call.finish()
             call.raise_for_stop()
+        except GeneratorExit:
+            # The caller closed the iterator. That is a cancel (D10), and the
+            # run it cancelled still goes in the ledger -- see CallFold.abandon.
+            # Only this exit: a refusal or an adapter bug raised out of the pump
+            # is not a cancellation and must not be written down as one.
+            call.abandon()
+            raise
         finally:
             # Always, on every exit -- a terminal, a raise, or the caller
             # letting go of the iterator. A timer left armed after the run would
@@ -3340,6 +3386,7 @@ class Bridge:
             # a run failure like any other and must not escape the
             # classification below.
             stream = leg.adapter.run(leg.request)
+            call.leg_running = True
             if fold.deadline is not None:
                 # The watchdog cancels this run and nothing else (see Deadline).
                 fold.deadline.bind_run(run_canceller(stream, leg.adapter))
@@ -3388,6 +3435,10 @@ class Bridge:
                         fold.deadline is None or fold.deadline.fired is None
                     ):
                         run_canceller(stream, leg.adapter)()
+            if fold.deadline is not None:
+                # This leg's run is over, however it ended. The watchdog must
+                # not keep its cancel: see Deadline.release_run.
+                fold.deadline.release_run()
 
     async def _astream(self, plan: _CallPlan) -> AsyncIterator[AgentEvent]:
         """The async face: the same fold, pumped with ``async for``.
@@ -3423,16 +3474,40 @@ class Bridge:
                     # into an error nobody can act on.
                     with suppress(RuntimeError):
                         await pump.aclose()
-                events, running = call.advance()
+                events, running = await self._aadvance(call)
                 for event in events:
                     yield event
             for event in call.finish():
                 yield event
             call.raise_for_stop()
+        except (GeneratorExit, asyncio.CancelledError):
+            # ``aclose()`` or a cancelled task: the same letting-go as closing
+            # the sync iterator, and the same ledger line.
+            call.abandon()
+            raise
         finally:
             # Always, on every exit -- a terminal, a raise, or an ``aclose()``.
             if deadline is not None:
                 deadline.stop()
+
+    async def _aadvance(self, call: CallFold) -> tuple[list[AgentEvent], bool]:
+        """:meth:`CallFold.advance`, off the loop where it will run a subprocess.
+
+        2026-11-13. A failover's second preflight is the same blocking call
+        :meth:`_areceipt_for` exists to keep off the loop, and it ran on it:
+        every other task waited while ``claude auth status`` or a Codex
+        app-server answered. Same rule as there -- an agent target goes to a
+        thread, an API target's preflight is cheap and runs inline -- and only
+        when a failover is actually about to be prepared.
+        """
+        target = call.failover
+        if (
+            target is not None
+            and target.runtime not in API_RUNTIMES
+            and call.failover_due()
+        ):
+            return await asyncio.to_thread(call.advance)
+        return call.advance()
 
     async def _areceipt_for(self, plan: _CallPlan) -> Receipt:
         """The preflight, off the loop where it is a subprocess.
@@ -3459,6 +3534,7 @@ class Bridge:
         stream: AsyncIterator[AgentEvent] | None = None
         try:
             stream = leg.adapter.arun(leg.request)
+            call.leg_running = True
             if fold.deadline is not None:
                 fold.deadline.bind_run(run_canceller(stream, leg.adapter))
             async for event in stream:
@@ -3485,6 +3561,8 @@ class Bridge:
                 )
                 if stream is not None:
                     await close_async_run(stream, leg.adapter, cancel=cancel)
+            if fold.deadline is not None:
+                fold.deadline.release_run()
 
     def _record_run(
         self,
@@ -3601,7 +3679,16 @@ class Bridge:
         # A model name belongs to a runtime. Carrying the caller's model across a
         # runtime boundary would ask Codex for a Claude model and fail for a
         # reason that has nothing to do with the failover.
-        carried = primary.model if target.runtime is origin.runtime else target.model
+        #
+        # **Only a model the caller named on this call crosses** (2026-11-13).
+        # ``primary.model`` is also where the first connection's *configured*
+        # model lands, and that used to cross too: the target ran a model from
+        # somebody else's connection, and its receipt called it "requested for
+        # this call". The target's own model is the target's to choose.
+        caller_model = (
+            primary.model if primary.plan.model_source == _CALL_MODEL_SOURCE else None
+        )
+        carried = caller_model if target.runtime is origin.runtime else None
         # Passed as an override only when it differs from what the target would
         # have used anyway, so the second receipt attributes the model to the
         # connection when that is where it really came from.
@@ -3667,18 +3754,30 @@ class Bridge:
                 primary.written_messages or primary.messages,
                 model=model,
                 options=primary.options,
+                sampling=_sampling_for_failover(primary.sampling),
                 tools=primary.tools,
                 mcp_servers=primary.mcp_servers,
                 schema=primary.schema,
                 schema_name=primary.schema_name,
             )
-            receipt = self._with_recorded_identity(
-                target, adapter.preflight(request)
-            )
+            # The same decoration the first leg's receipt gets, so the second
+            # receipt and the second ledger line answer the same questions.
+            receipt = self._decorated_receipt(adapter, request)
             receipt.require_ok()
             receipt.require_auth_mode()
         except SubpassError as exc:
             return f"failover to {target.name!r} could not run: {exc}"
+        except Exception as exc:
+            # 2026-11-13. Anything else the target's preflight throws -- a CLI
+            # that will not start, a broken install -- is the same outcome: the
+            # second connection could not be made ready. It used to escape the
+            # call raw, taking with it a first leg that really ran, really
+            # spent, and was never written to the ledger. Named by class,
+            # because unlike the arm above this one is nobody's sentence.
+            return (
+                f"failover to {target.name!r} could not run: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
         event = FailoverEvent(
             from_connection=origin.name,

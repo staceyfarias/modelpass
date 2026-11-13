@@ -54,7 +54,7 @@ from .guards import GuardTracker
 from .preflight import Receipt
 from .prompt_cache import observed_effort_continuity
 from .reasoning import reasoning_metric
-from .retry import classify_terminal, vendor_error_facts
+from .retry import classify_terminal, rate_limit_named_a_wait, vendor_error_facts
 from .types import (
     AgentEvent,
     FailoverEvent,
@@ -461,6 +461,13 @@ class CallFold:
         self._record_run = record_run
         self._begin_failover = begin_failover
         self._failed_over_from: str | None = None
+        #: ``True`` once the current leg's adapter has been asked to run. The
+        #: pump sets it. A leg that was never started spent nothing and has no
+        #: line to write if the caller lets go.
+        self.leg_running = False
+        #: ``True`` once :meth:`finish` or :meth:`abandon` has written the final
+        #: leg's line, so no path writes it twice.
+        self._closed = False
         self.fold = self._new_fold()
 
     def _new_fold(self) -> RunFold:
@@ -517,9 +524,47 @@ class CallFold:
         if stopped.status is not TerminalStatus.QUOTA_EXHAUSTED or self.failover is None:
             return [], False
 
+        if rate_limit_named_a_wait(
+            stopped.runtime, stopped.status, stopped.status_code, stopped.retry_after
+        ):
+            # 2026-11-13. A 429 with a retry-after is a rate limit, not a spent
+            # allowance: the same connection answers again once the wait has
+            # passed. Failover exists for the allowance that ran out, and it is
+            # the only path onto a second (often metered) connection -- so a
+            # per-minute limit must not take it. The terminal reads retryable,
+            # carries the wait, and says the failover was deliberately not used.
+            # Decided from the typed facts and not from the stamped verdict,
+            # which a ``retry = "never"`` connection has already forced to NO.
+            why = stopped.reason or "rate limited"
+            self.fold.stopped = replace(
+                stopped,
+                reason=(
+                    f"{why}; the endpoint named a wait of {stopped.retry_after:g}s, "
+                    "so this is a rate limit and not a spent allowance, and the "
+                    f"failover to {self.failover.name!r} was not used"
+                ),
+            )
+            return [], False
+
+        if self._bound_fired():
+            # Before the target is asked anything: its preflight is a
+            # subprocess on the agent runtimes, and a call that is already out
+            # of time should not start one.
+            self._timed_out_between_legs(stopped)
+            return [], False
+
         switch = self._begin_failover(
             self.failover, self.leg.request, stopped, self.fold.tracker.total
         )
+        if self._bound_fired():
+            # And again after it, because the preflight is where the time goes.
+            # ``total`` is the whole call's wall clock, failover legs included,
+            # and the timer fires once: a second leg started now would have
+            # nothing bounding it (2026-11-13). Read ahead of a refusal for the
+            # reason ``EventFold.feed`` reads the bound ahead of an event -- the
+            # bound the caller set is the cause, whatever else is also true.
+            self._timed_out_between_legs(stopped)
+            return [], False
         if isinstance(switch, str):
             # The target could not be made ready. The run still stopped cleanly
             # on quota -- that part is true and is reported as such; the failure
@@ -548,8 +593,47 @@ class CallFold:
         # call crosses at most one connection boundary, so a second exhausted
         # allowance ends the call rather than starting a third leg.
         self.failover = None
+        self.leg_running = False
         self.fold = self._new_fold()
         return [event], True
+
+    def failover_due(self) -> bool:
+        """Whether :meth:`advance` is about to ask the failover target anything.
+
+        For the async pump, which has to know before it calls :meth:`advance`
+        whether that call will block on a preflight. Call it only once the leg
+        is over: it reads the leg's terminal, and decides ``ok`` where nothing
+        else has.
+        """
+        stopped = self.fold.finish()
+        return (
+            self.failover is not None
+            and stopped.status is TerminalStatus.QUOTA_EXHAUSTED
+            and not rate_limit_named_a_wait(
+                stopped.runtime, stopped.status, stopped.status_code, stopped.retry_after
+            )
+            and not self._bound_fired()
+        )
+
+    def _bound_fired(self) -> bool:
+        return self.deadline is not None and self.deadline.fired is not None
+
+    def _timed_out_between_legs(self, stopped: TerminalEvent) -> None:
+        """End the call on the bound that ran out before the second leg began.
+
+        One terminal, on the first connection, carrying what the first leg
+        spent: no second connection ran, so there is no failover to announce
+        and one line for the ledger. The reason keeps the quota stop that was
+        true a moment earlier, so neither fact hides the other.
+        """
+        assert self.deadline is not None and self.failover is not None
+        why = stopped.reason or "quota exhausted"
+        self.fold.stopped = self.fold.terminal(
+            TerminalStatus.TIMED_OUT,
+            f"{self.deadline.reason()} before the failover to "
+            f"{self.failover.name!r} could start (the first connection had "
+            f"stopped: {why})",
+        )
 
     def record(self) -> None:
         """Write this leg's line to the ledger."""
@@ -575,7 +659,41 @@ class CallFold:
             stopped = replace(stopped, failed_over_from=self._failed_over_from)
             self.fold.stopped = stopped
         self.record()
+        self._closed = True
         return [stopped]
+
+    def abandon(self) -> None:
+        """The caller let go before the terminal: write the line it never saw.
+
+        2026-11-13. Closing the iterator is the documented way to stop a run
+        early (D10), and the ledger line was only ever written on the way to
+        emitting the terminal event -- so a run stopped that way left no line
+        at all, however much usage it had already streamed. A run that was
+        paid for is a run the ledger records.
+
+        The line is ``cancelled`` with the tracker's total at the moment of
+        letting go, which is this library's last knowledge of what the run
+        cost; the vendor may have billed a little more that no event carried.
+        Where the fold had already decided a terminal the caller did not stay
+        to read -- a guard stop, a timeout -- that terminal is the truth and is
+        what is written. Nothing is written for a leg whose adapter was never
+        started, and nothing twice.
+
+        No event comes of this: there is nobody left to hand one to.
+        """
+        if self._closed or not self.leg_running:
+            return
+        self._closed = True
+        stopped = self.fold.stopped
+        if stopped is None:
+            stopped = self.fold.terminal(
+                TerminalStatus.CANCELLED,
+                "cancelled by caller: the stream was closed before the run ended",
+            )
+        if self._failed_over_from is not None:
+            stopped = replace(stopped, failed_over_from=self._failed_over_from)
+        self.fold.stopped = stopped
+        self.record()
 
     def raise_for_stop(self) -> None:
         """``raise_on_stop``'s half of the contract, read off the final terminal."""
