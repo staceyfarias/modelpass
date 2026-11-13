@@ -696,6 +696,63 @@ def test_a_child_that_ignores_terminate_is_killed():
     assert server.killed == 1
 
 
+def test_a_child_whose_stream_ended_is_still_shut_down_by_close():
+    """*The transport ended* is not *the caller closed it*.
+
+    Stdout reaching EOF used to mark the client closed, so the ``close()`` that
+    followed returned early: stdin stayed open, the process was never waited on,
+    and a child that had only closed its stdout was never stopped.
+    """
+    server = FakeAppServer(
+        responder=lambda srv, m: [{"id": m["id"], "result": {}}]
+        if m.get("method") == "initialize"
+        else []
+    )
+    client, _ = make_client(server)
+    client.start()
+
+    server.eof()  # stdout ends; the process itself has not exited
+    assert wait_until(lambda: not client.running)
+    with pytest.raises(AppServerTransportClosed):
+        client.request("thread/list")
+
+    client.close()
+    client.close()
+
+    assert server.stdin.closed is True
+    assert server.terminated == 1
+
+
+def test_a_start_whose_handshake_fails_stops_the_child_it_launched():
+    """A caller that never got a client back has nothing to close."""
+    server = FakeAppServer(responder=lambda srv, message: [])
+    client, _ = make_client(server, handshake_timeout=0.15)
+
+    with pytest.raises(AppServerTimeout):
+        client.start()
+
+    assert server.terminated == 1
+    assert server.stdin.closed is True
+
+
+def test_the_stream_ends_once_however_many_ways_it_ended():
+    """EOF and ``close()`` both end the stream; a consumer must see one ending."""
+    server = FakeAppServer(
+        responder=lambda srv, m: [{"id": m["id"], "result": {}}]
+        if m.get("method") == "initialize"
+        else []
+    )
+    client, _ = make_client(server)
+    client.start()
+    server.eof()
+    assert wait_until(lambda: not client.running)
+    client.close()
+
+    assert client.next_notification(timeout=1) is None
+    with pytest.raises(queue.Empty):
+        client.next_notification(timeout=0.05)
+
+
 def test_a_malformed_line_is_recorded_rather_than_dropped():
     server = FakeAppServer(
         responder=lambda srv, m: [{"id": m["id"], "result": {}}]

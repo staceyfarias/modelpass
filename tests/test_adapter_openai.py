@@ -1578,6 +1578,12 @@ NO_ROLLOUT_STDERR = (
 )
 
 
+OTHER_RESUME_FAILURE_STDERR = (
+    "Error: thread/resume: thread/resume failed: failed to read rollout: "
+    "permission denied (os error 13) (code -32603)\n"
+)
+
+
 def session_request(
     connection: Connection | None = None,
     *,
@@ -1841,6 +1847,18 @@ def test_a_first_turn_that_fails_is_a_terminal_not_a_missing_session():
 
     events = list(session.send("hello"))
     assert events[-1].status is TerminalStatus.ERROR
+
+
+def test_a_resume_that_failed_for_another_reason_is_a_failed_turn_not_a_missing_one():
+    """The CLI prefixes every resume failure the same way; only one means *gone*."""
+    spawn = FakeSessionSpawn(([], 1, OTHER_RESUME_FAILURE_STDERR))
+    session = session_adapter(spawn).resume_session(session_request(resume_id="abc-123"))
+
+    terminal = list(session.send("carry on"))[-1]
+
+    assert terminal.status is TerminalStatus.ERROR
+    assert "permission denied" in terminal.reason
+    assert not is_missing_thread(OTHER_RESUME_FAILURE_STDERR)
 
 
 def test_resume_session_refuses_a_system_prompt():

@@ -2237,7 +2237,13 @@ def isolation_thread_config(config_read: Any) -> dict[str, Any]:
 #: prefix->session lookup under ``chat()`` will treat as a cache
 #: miss, so reading an ordinary failure as a missing thread would quietly start
 #: a fresh conversation instead of reporting that something broke.
-_NO_THREAD_MARKERS = ("no rollout found for thread id", "thread/resume failed")
+#:
+#: **One marker, and it is the specific one** (2026-11-13). This used to also
+#: hold ``"thread/resume failed"``, which is the prefix the CLI puts on *every*
+#: resume failure -- so a rollout that could not be read, or any refusal at all,
+#: was reported as a conversation that no longer existed, which is exactly the
+#: false positive the paragraph above rules out.
+_NO_THREAD_MARKERS = ("no rollout found for thread id",)
 
 
 def is_missing_thread(stderr_text: str) -> bool:
@@ -2825,10 +2831,17 @@ class CodexAppServerSession:
         plugins, MCP servers and personality rode along on every new chat. A
         :class:`~modelpass.sessions.WorkerSession` keeps the user's setup, as it
         keeps Codex's persona and toolbelt.
+
+        **A child that died is replaced, and the replacement is told so**
+        (2026-11-13). The thread lives in Codex's rollout, not in the process
+        that last held it, and a new child has loaded nothing: see
+        :meth:`_forget_child`.
         """
         client = self._client
         if client is not None and client.running:
             return client
+        if client is not None:
+            self._forget_child(client)
         request = self._request
         client = AppServerClient(
             binary=self._binary or "",
@@ -2844,6 +2857,48 @@ class CodexAppServerSession:
         client.start()
         self._client = client
         return client
+
+    def _forget_child(self, client: AppServerClient) -> None:
+        """The session's child is gone: close it, and unlearn what it had loaded.
+
+        ``_thread_ready`` described the *child* -- "this process has the thread
+        loaded" -- and outliving the child made it a lie: the replacement was
+        sent ``initialize``, ``initialized`` and ``turn/start`` and nothing
+        else, a turn addressed to a thread it had never loaded, on a chat with
+        none of its isolation. So it is reset, and what the next
+        :meth:`_ensure_thread` does depends on what the dead child left behind:
+
+        * **a thread that took a turn is resumed.** Its rollout is on disk, so
+          ``thread/resume`` on the new child is the same call a resumed session
+          makes. If the vendor says the thread is gone, that is
+          :class:`~modelpass.errors.SessionNotFound` and not a quiet new thread:
+          turns were taken on it, and a fresh one would be a different
+          conversation wearing this session's name.
+        * **a thread no turn ever finished on is not resumed.** Codex writes a
+          thread's rollout when its first turn completes (captured live
+          2026-08-30), so resuming this id could only answer *no rollout found*
+          and the session would be unusable for good. Nothing was completed on
+          it and no id was ever published, so the next turn starts a thread the
+          way a first turn does.
+
+        **Unverified against a real Codex**: that ``thread/resume`` on a second
+        child continues a thread the first child wrote. The method is
+        schema-sourced and undriven here (:meth:`_resume_thread`).
+
+        The dead client is closed because nothing else will: its process still
+        has to be waited on and its stdin closed. And the turns this session
+        had stopped watching are forgotten with it: their notifications were
+        that child's to send, and it will send no more.
+        """
+        client.close()
+        self._client = None
+        self._thread_ready = False
+        self._stale_turns.clear()
+        if self._resume_id is None:
+            if self._turns > 0 and self._thread_id is not None:
+                self._resume_id = self._thread_id
+            else:
+                self._thread_id = None
 
     def _ensure_thread(self) -> AppServerClient:
         """Start or resume the thread this session runs on. Idempotent.
@@ -2941,7 +2996,9 @@ class CodexAppServerSession:
         the turn never started, nothing was spent, and a terminal event would
         leave the session looking usable.
 
-        Any other refusal is a vendor failure and keeps its own words.
+        Any other refusal is a vendor failure and keeps its own words. That
+        includes every other ``thread/resume failed: ...``: the prefix is on all
+        of them, and only *no rollout found* says the thread is gone.
 
         ``isolation`` goes in ``ThreadResumeParams.config``, which openai-codex
         0.154.0 types beside ``cwd`` and ``model``. The same field on

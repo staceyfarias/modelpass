@@ -808,7 +808,14 @@ class AppServerClient:
 
         self._proc: Any = None
         self._started = False
+        #: The caller closed this client. Set by :meth:`close` and nothing else.
         self._closed = False
+        #: The child's stdout reached EOF: the conversation is over, whoever
+        #: ended it. **Not the same statement as** ``_closed``, and it used to
+        #: be the same flag -- so the ``close()`` that followed a child's death
+        #: returned early, the process was never waited on and its stdin never
+        #: closed (2026-11-13). A client can be both.
+        self._transport_ended = False
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._next_id = 0
@@ -834,13 +841,18 @@ class AppServerClient:
         self.close()
 
     def __repr__(self) -> str:
-        state = "closed" if self._closed else ("running" if self._started else "unstarted")
+        if self._closed:
+            state = "closed"
+        elif self._transport_ended:
+            state = "ended"
+        else:
+            state = "running" if self._started else "unstarted"
         return f"<AppServerClient {self._binary}:{state}>"
 
     @property
     def running(self) -> bool:
         """Whether the child is up and the protocol is usable."""
-        return self._started and not self._closed
+        return self._started and not self._closed and not self._transport_ended
 
     def start(self) -> None:
         """Spawn the child, start the readers, and complete the handshake.
@@ -915,7 +927,14 @@ class AppServerClient:
                 daemon=True,
             )
             self._stderr_reader.start()
-        self._handshake()
+        try:
+            self._handshake()
+        except BaseException:
+            # A start that did not finish leaves a child its caller may never
+            # have been handed: a session stores the client only once start()
+            # returns. Stopped here, so no caller has to know that.
+            self.close()
+            raise
 
     def _handshake(self) -> None:
         """``initialize`` then ``initialized``. See :meth:`start` for the ordering."""
@@ -947,6 +966,11 @@ class AppServerClient:
         from returning. Every pending request is failed rather than left to time
         out, and the notification stream gets its end sentinel, so nothing that
         was waiting on this client stays blocked.
+
+        A child whose stream already ended is still shut down here -- its stdin
+        closed, the process waited on, anything it left running stopped. That
+        the transport ended says the conversation is over; it does not say
+        anybody cleaned up.
         """
         with self._state_lock:
             if self._closed:
@@ -1013,7 +1037,7 @@ class AppServerClient:
                 "the codex app-server client has not been started; call start() first"
             )
         with self._state_lock:
-            if self._closed:
+            if self._closed or self._transport_ended:
                 raise AppServerTransportClosed(
                     f"the codex app-server client is closed; {method!r} was not sent"
                 )
@@ -1143,9 +1167,13 @@ class AppServerClient:
         a consumer that read two sentinels would see the second as a second
         ending. One event, one ``None``.
         """
-        if not self._ended.is_set():
+        with self._state_lock:
+            # Checked and set as one step: the reader's EOF and a close() race
+            # here by design, and two sentinels is what the docstring rules out.
+            if self._ended.is_set():
+                return
             self._ended.set()
-            self.notifications.put(None)
+        self.notifications.put(None)
 
     def _dispatch(self, message: Mapping[str, Any]) -> None:
         """Route one parsed line by which of ``method`` and ``id`` it carries."""
@@ -1234,10 +1262,16 @@ class AppServerClient:
         self._stderr.append(f"[unroutable] {line[:2000]}\n")
 
     def _fail_pending(self, reason: str) -> None:
-        """Wake every blocked request with a transport-closed outcome."""
+        """Wake every blocked request with a transport-closed outcome.
+
+        Marks the transport ended under the same lock :meth:`request` registers
+        a waiter under, so no request can slip in behind this and wait on a
+        child that will never answer. It does **not** mark the client closed:
+        only :meth:`close` does, and it still has a process to shut down.
+        """
         with self._state_lock:
             pending, self._pending = self._pending, {}
-            self._closed = True
+            self._transport_ended = True
         for waiter in pending.values():
             waiter.put(("closed", reason))
 

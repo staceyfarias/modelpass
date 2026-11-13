@@ -33,6 +33,7 @@ import json
 import queue
 import subprocess
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -171,6 +172,7 @@ class _Stream:
 class _Stdin:
     def __init__(self, server: ScriptedThreadServer) -> None:
         self.server = server
+        self.closed = False
 
     def write(self, text: str) -> int:
         self.server.on_write(text)
@@ -180,7 +182,7 @@ class _Stdin:
         return None
 
     def close(self) -> None:
-        return None
+        self.closed = True
 
 
 class ScriptedThreadServer:
@@ -859,6 +861,217 @@ def test_a_resume_whose_thread_is_gone_raises_before_the_turn(tmp_path):
         list(handle.send("carry on"))
     assert "no rollout" in str(excinfo.value)
     assert server.sent("turn/start") == [], "nothing was spent finding out"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "thread/resume failed: failed to read rollout: permission denied (os error 13)",
+        "thread/resume failed: thread is archived",
+    ],
+)
+def test_a_resume_that_failed_for_another_reason_is_not_read_as_a_missing_thread(
+    tmp_path, message
+):
+    """Only the vendor's *no rollout found* means the conversation is gone.
+
+    ``SessionNotFound`` is what a caller treats as "start a fresh conversation",
+    so reading every ``thread/resume failed`` as one would drop a conversation
+    that is still there over a failure that might pass.
+    """
+    script = two_turn_script()
+    script[THREAD_RESUME_METHOD] = [
+        ({"__error__": {"code": -32600, "message": message}}, [])
+    ]
+    server = ScriptedThreadServer(script)
+    adapter, _ = adapter_for(server)
+    handle = adapter.resume_session(session_request(tmp_path, resume_id=THREAD_ID))
+
+    with pytest.raises(VendorRunFailed) as excinfo:
+        list(handle.send("carry on"))
+
+    assert not isinstance(excinfo.value, SessionNotFound)
+    assert message in str(excinfo.value)
+    assert server.sent("turn/start") == []
+
+
+# --- a child that dies under a session ------------------------------------------------
+
+
+def bounded(work, timeout: float = 10.0):
+    """Run ``work`` on a thread, so a call that never returns fails the test.
+
+    These tests are about calls that used to block for good. Run inline, a
+    regression would hang the suite instead of failing it.
+    """
+    box: list[tuple[str, Any]] = []
+
+    def run() -> None:
+        try:
+            box.append(("returned", work()))
+        except BaseException as exc:  # re-raised below, on the test's thread
+            box.append(("raised", exc))
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    assert box, f"still blocked after {timeout}s"
+    kind, value = box[0]
+    if kind == "raised":
+        raise value
+    return value
+
+
+class SpawnEach:
+    """One scripted child per launch, in order."""
+
+    def __init__(self, *servers: ScriptedThreadServer) -> None:
+        self.servers = list(servers)
+        self.calls = 0
+
+    def __call__(self, argv, env, cwd):
+        server = self.servers[self.calls]
+        self.calls += 1
+        return server
+
+
+def adapter_over(*servers: ScriptedThreadServer) -> tuple[OpenAIAdapter, SpawnEach]:
+    spawn = SpawnEach(*servers)
+    adapter = OpenAIAdapter(
+        codex_bin="C:/codex/codex.exe",
+        spawn=exploding_spawn,
+        session_spawn=exploding_spawn,
+        app_server_spawn=spawn,
+    )
+    return adapter, spawn
+
+
+def die(server: ScriptedThreadServer, handle: CodexAppServerSession) -> None:
+    """The child exits on its own, and the client has noticed."""
+    client = handle._client
+    server.returncode = 1
+    server.eof()
+    deadline = time.monotonic() + 5
+    while client.running and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not client.running
+
+
+def test_a_session_whose_child_died_resumes_its_thread_on_the_new_child(tmp_path):
+    """The thread lives in the rollout, not in the process that last held it.
+
+    The replacement child used to be sent ``initialize``, ``initialized`` and
+    ``turn/start`` and nothing else: a turn addressed to a thread that child had
+    never loaded, and a chat with none of its isolation.
+    """
+    first = ScriptedThreadServer(two_turn_script())
+    second = ScriptedThreadServer(resume_script())
+    adapter, spawn = adapter_over(first, second)
+    handle = adapter.open_session(session_request(tmp_path))
+    assert list(handle.send("hello"))[-1].status is TerminalStatus.OK
+
+    die(first, handle)
+    events = bounded(
+        lambda: list(handle.send("What was the integrated loudness again?"))
+    )
+
+    assert spawn.calls == 2
+    assert second.methods == [
+        "initialize",
+        "initialized",
+        "config/read",
+        THREAD_RESUME_METHOD,
+        "turn/start",
+    ]
+    assert second.sent(THREAD_RESUME_METHOD)[0]["threadId"] == THREAD_ID
+    assert second.sent("turn/start")[0]["threadId"] == THREAD_ID
+    assert second.sent("thread/start") == [], "the conversation must not start over"
+    assert events[-1].status is TerminalStatus.OK
+    assert handle.id == THREAD_ID
+
+
+def test_a_dead_childs_thread_that_cannot_be_resumed_is_said_not_restarted(tmp_path):
+    """Turns were taken on it, so a fresh thread would be a different conversation."""
+    first = ScriptedThreadServer(two_turn_script())
+    script = two_turn_script()
+    script[THREAD_RESUME_METHOD] = [
+        (
+            {
+                "__error__": {
+                    "code": -32600,
+                    "message": f"thread/resume failed: no rollout found for thread id {THREAD_ID}",
+                }
+            },
+            [],
+        )
+    ]
+    second = ScriptedThreadServer(script)
+    adapter, _ = adapter_over(first, second)
+    handle = adapter.open_session(session_request(tmp_path))
+    list(handle.send("hello"))
+
+    die(first, handle)
+    with pytest.raises(SessionNotFound):
+        bounded(lambda: list(handle.send("and again")))
+
+    assert second.sent("thread/start") == []
+    assert second.sent("turn/start") == []
+
+
+def test_a_child_that_died_before_any_turn_finished_gets_a_new_thread(tmp_path):
+    """Nothing was ever completed on the old thread, so there is nothing to resume.
+
+    Codex writes a thread's rollout when its first turn completes (captured live
+    2026-08-30), so a ``thread/resume`` of this id could only answer *no rollout
+    found* -- and the session would be unusable for good over a conversation
+    that never had a turn in it.
+    """
+    dying = two_turn_script()
+    dying["turn/start"] = [(captured_payload("turn1_response"), [FIRST_TURN[0], None])]
+    first = ScriptedThreadServer(dying)
+    second = ScriptedThreadServer(two_turn_script())
+    adapter, spawn = adapter_over(first, second)
+    handle = adapter.open_session(session_request(tmp_path))
+
+    with pytest.raises(VendorRunFailed):
+        bounded(lambda: list(handle.send("hello")))
+    events = bounded(lambda: list(handle.send("hello")))
+
+    assert spawn.calls == 2
+    assert second.sent(THREAD_RESUME_METHOD) == []
+    assert len(second.sent("thread/start")) == 1
+    assert events[-1].status is TerminalStatus.OK
+
+
+def test_the_dead_child_is_closed_when_it_is_replaced(tmp_path):
+    first = ScriptedThreadServer(two_turn_script())
+    second = ScriptedThreadServer(resume_script())
+    adapter, _ = adapter_over(first, second)
+    handle = adapter.open_session(session_request(tmp_path))
+    list(handle.send("hello"))
+    old = handle._client
+
+    die(first, handle)
+    bounded(lambda: list(handle.send("again")))
+
+    assert handle._client is not old
+    assert first.stdin.closed is True
+
+
+def test_a_session_child_that_fails_its_handshake_is_stopped(tmp_path):
+    """The session never held that client, so nobody else could close it."""
+    script = two_turn_script()
+    script["initialize"] = [
+        ({"__error__": {"code": -32603, "message": "unsupported client"}}, [])
+    ]
+    server = ScriptedThreadServer(script)
+    adapter, _ = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+
+    with pytest.raises(VendorRunFailed):
+        bounded(lambda: list(handle.send("hello")))
+
+    assert server.returncode is not None, "the child was left running"
 
 
 # --- history -----------------------------------------------------------------------
