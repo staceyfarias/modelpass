@@ -273,6 +273,12 @@ _SHUTDOWN_GRACE = 5.0
 #: a signal because this wait sits inside a cancel, on the watchdog's thread.
 _EOF_GRACE = 2.0
 
+#: How long a shutdown waits for a message that is being written to the child
+#: to finish before concluding the write is stuck. A message is one line and a
+#: reading child takes it at once, so half a second of holding the write lock
+#: is a child that has stopped reading its stdin.
+_STUCK_WRITE_WAIT = 0.5
+
 
 # --- errors --------------------------------------------------------------------
 #
@@ -768,6 +774,16 @@ def _default_spawn(
     )
 
 
+def _close_quietly(stream: Any) -> None:
+    """Close a child's pipe. A pipe that is already gone is not a failure."""
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except (OSError, ValueError):
+        pass
+
+
 class AppServerClient:
     """One ``codex app-server`` child and the JSON-RPC conversation with it.
 
@@ -957,7 +973,7 @@ class AppServerClient:
         )
         self.notify("initialized")
 
-    def close(self) -> None:
+    def close(self, *, force: bool = False) -> None:
         """Terminate the child politely, then kill it. Idempotent.
 
         Politely first because the app-server may be holding a thread open, and
@@ -971,6 +987,10 @@ class AppServerClient:
         closed, the process waited on, anything it left running stopped. That
         the transport ended says the conversation is over; it does not say
         anybody cleaned up.
+
+        ``force`` skips the polite half. It is for a caller that already asked
+        this server to stop and was not answered: waiting on a child that has
+        shown it is not listening only delays the kill.
         """
         with self._state_lock:
             if self._closed:
@@ -978,11 +998,11 @@ class AppServerClient:
             self._closed = True
             proc, self._proc = self._proc, None
         if proc is not None:
-            self._shutdown(proc)
+            self._shutdown(proc, force=force)
         self._fail_pending("the app-server client was closed")
         self._end_stream()
 
-    def _shutdown(self, proc: Any) -> None:
+    def _shutdown(self, proc: Any, *, force: bool = False) -> None:
         """Close stdin, ask the child to stop, then kill its whole tree. Never raises.
 
         **The whole tree**, because the process held here is the ``codex.cmd``
@@ -996,24 +1016,46 @@ class AppServerClient:
         there it is the closed stdin: the server is given
         :data:`_EOF_GRACE` to notice and leave, and only then killed. A child
         that left on its own is let go of without killing anything it started.
+
+        **A write stuck in the child's stdin skips all of that** (2026-11-13). A
+        server that has stopped reading leaves whoever was sending it a message
+        blocked inside the pipe, holding the write lock -- and holding the
+        pipe object's own lock, so closing stdin from here would block behind
+        it for as long as the child lived. That child is not going to notice
+        anything polite: it is killed first, which is also what frees the
+        writer, and its stdin is closed afterwards. ``force`` takes the same
+        short road for a caller who already knows the server is not answering.
         """
         stdin = getattr(proc, "stdin", None)
-        if stdin is not None:
-            try:
-                stdin.close()
-            except (OSError, ValueError):
-                pass
+        writable = self._write_lock.acquire(timeout=_STUCK_WRITE_WAIT)
+        polite = writable and not force
         try:
-            if proc.poll() is None:
-                asked = terminate_tree(proc)
-                try:
-                    proc.wait(timeout=_SHUTDOWN_GRACE if asked else _EOF_GRACE)
-                except subprocess.TimeoutExpired:
-                    kill_tree(proc)
-                    proc.wait(timeout=_SHUTDOWN_GRACE)
-            release_tree(proc)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            if writable:
+                _close_quietly(stdin)
+            try:
+                if proc.poll() is None:
+                    if polite:
+                        asked = terminate_tree(proc)
+                        try:
+                            proc.wait(timeout=_SHUTDOWN_GRACE if asked else _EOF_GRACE)
+                        except subprocess.TimeoutExpired:
+                            kill_tree(proc)
+                            proc.wait(timeout=_SHUTDOWN_GRACE)
+                    else:
+                        kill_tree(proc)
+                        proc.wait(timeout=_SHUTDOWN_GRACE)
+                release_tree(proc)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        finally:
+            if writable:
+                self._write_lock.release()
+        if not writable and self._write_lock.acquire(timeout=_SHUTDOWN_GRACE):
+            # The child is dead, so the stuck write has failed and let go.
+            try:
+                _close_quietly(stdin)
+            finally:
+                self._write_lock.release()
 
     # --- sending -----------------------------------------------------------------
 

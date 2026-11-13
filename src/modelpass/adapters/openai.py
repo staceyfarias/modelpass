@@ -1168,18 +1168,36 @@ def interrupt_app_server_turn(
     The short timeout is the point: an interrupt that has not been answered in
     five seconds is not the thing standing between the caller and a cancelled
     run. The kill behind it always works.
+
+    **The timeout is kept by this function, not only by the request**
+    (2026-11-13). ``request(timeout=...)`` bounds the wait for an *answer*; it
+    does not bound the write, and a server that has stopped reading its stdin
+    leaves that write -- or the wait for the write lock behind somebody else's
+    stuck write -- blocked for as long as the child lives. The caller is the
+    cancel, usually on the watchdog's thread, and the close that would free
+    everything comes *after* this returns. So the request runs on a thread of
+    its own and this function stops waiting when the time is up. The thread
+    ends when the client is closed, which is what every caller does next.
     """
     if not thread_id or not turn_id:
         return False
-    try:
-        client.request(
-            TURN_INTERRUPT_METHOD,
-            turn_interrupt_params(thread_id, turn_id),
-            timeout=timeout,
-        )
-    except (VendorRunFailed, OSError, ValueError):
-        return False
-    return True
+    accepted: list[bool] = []
+
+    def ask() -> None:
+        try:
+            client.request(
+                TURN_INTERRUPT_METHOD,
+                turn_interrupt_params(thread_id, turn_id),
+                timeout=timeout,
+            )
+        except (VendorRunFailed, OSError, ValueError):
+            return
+        accepted.append(True)
+
+    asker = threading.Thread(target=ask, name="modelpass-appserver-interrupt", daemon=True)
+    asker.start()
+    asker.join(timeout + 0.25)
+    return bool(accepted)
 
 
 def extract_error_detail(payload: Mapping[str, Any]) -> str:
@@ -2252,6 +2270,34 @@ def is_missing_thread(stderr_text: str) -> bool:
     return any(marker in lowered for marker in _NO_THREAD_MARKERS)
 
 
+class _TurnCancel:
+    """One session turn's cancel state, shared by the turn and whoever cancels it.
+
+    A session outlives its turns and takes them one at a time, so "cancel"
+    has to name a turn: the session's process or child may by now belong to the
+    *next* one, or to none. Three events say where this turn is, and they are
+    what lets a cancel from another thread (the watchdog's) do the right thing
+    at each point:
+
+    * ``requested`` -- somebody cancelled it. Kept if it arrives early: the turn
+      reads it as it starts, and again once it has something to stop.
+    * ``started`` -- the turn's generator is running. Before this a cancel only
+      sets ``requested``; the session's child is idle or busy with another turn
+      and must not be touched.
+    * ``done`` -- the turn's outcome is decided. After this a cancel is nothing.
+
+    The turn sets ``started`` and *then* reads ``requested``; the canceller sets
+    ``requested`` and *then* reads ``started``. Whichever order they interleave
+    in, at least one of them sees the other, so no cancel falls in between.
+    """
+
+    def __init__(self) -> None:
+        self.requested = threading.Event()
+        self.started = threading.Event()
+        self.done = threading.Event()
+        self.turn: AppServerTurn | None = None
+
+
 class CodexSession:
     """One Codex thread, driven one ``codex exec`` process per turn.
 
@@ -2319,12 +2365,31 @@ class CodexSession:
         ``cancel()`` reaches the stateless runs every caller on this runtime
         shares (2026-09-24). A bounded turn is cancelled this way.
         """
-        return RunStream(self._send(message, effort=effort), self._cancel_turn)
+        cancel = _TurnCancel()
+        return RunStream(
+            self._send(message, effort=effort, cancel=cancel),
+            lambda: self._cancel_turn(cancel),
+        )
 
-    def _cancel_turn(self) -> None:
-        OpenAIAdapter._terminate(self._proc)
+    def _cancel_turn(self, cancel: _TurnCancel) -> None:
+        """Cancel that turn: kept if it is early, a kill if it is running.
 
-    def _send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
+        A cancel that arrived before the process existed used to find nothing
+        to terminate and do nothing, and the turn then ran unbounded
+        (2026-11-13). It is kept on ``cancel`` instead, and the turn reads it
+        before it launches and again once it has a process.
+        """
+        cancel.requested.set()
+        if cancel.started.is_set() and not cancel.done.is_set():
+            OpenAIAdapter._terminate(self._proc)
+
+    def _send(
+        self,
+        message: str,
+        *,
+        effort: str | None = None,
+        cancel: _TurnCancel | None = None,
+    ) -> Iterator[AgentEvent]:
         """Run one turn as its own ``codex exec`` process and stream its events.
 
         The same vocabulary and failure rules as :meth:`OpenAIAdapter.run`, with
@@ -2370,7 +2435,7 @@ class CodexSession:
         )
         argv = [self._binary, *self._turn_args()]
         check_launch_args(self._adapter.runtime, argv)
-        yield from self._stream_turn(argv, resuming, prompt)
+        yield from self._stream_turn(argv, resuming, prompt, cancel or _TurnCancel())
 
     def _turn_args(self) -> list[str]:
         """The ``codex exec`` argument list for one turn. **No prompt in it.**
@@ -2446,19 +2511,32 @@ class CodexSession:
         return list(self._exclusivity)
 
     def _stream_turn(
-        self, argv: list[str], resuming: bool, prompt: str
+        self, argv: list[str], resuming: bool, prompt: str, cancel: _TurnCancel
     ) -> Iterator[AgentEvent]:
         """Launch one turn, drain it, and end with exactly one terminal event.
 
         ``prompt`` arrives separately from ``argv`` because that is where it
         travels: down the child's stdin, paired with the ``-`` the argument list
         carries in its place (:func:`_send_prompt`).
+
+        ``cancel`` is this turn's own (:class:`_TurnCancel`). A turn that was
+        cancelled ends ``cancelled`` -- the killed process exits non-zero, and
+        that exit is the cancel arriving, not a vendor failure.
         """
         request = self._request
         outcome = _TurnOutcome()
         proc: Any = None
+        cancel.started.set()
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as err:
             try:
+                if cancel.requested.is_set():
+                    yield self._terminal(
+                        TerminalStatus.CANCELLED,
+                        "turn cancelled before the codex CLI was launched; "
+                        "nothing was started",
+                        TokenUsage(),
+                    )
+                    return
                 try:
                     proc = self._adapter._session_spawn(
                         argv, dict(request.plan.env), request.project_folder, err
@@ -2468,6 +2546,10 @@ class CodexSession:
                         f"the codex CLI at {argv[0]!r} could not be launched: {exc}"
                     ) from exc
                 self._proc = proc
+                if cancel.requested.is_set():
+                    # It landed while the process was being launched, when
+                    # _cancel_turn had nothing to terminate yet.
+                    OpenAIAdapter._terminate(proc)
                 # After the handle is stored, so an abandoned turn still finds
                 # a process to terminate.
                 _send_prompt(proc, prompt)
@@ -2477,7 +2559,10 @@ class CodexSession:
                 except OSError as exc:
                     raise VendorRunFailed(f"the codex CLI stream failed: {exc}") from exc
                 status, reason = outcome.status, outcome.reason
-                if returncode != 0:
+                if cancel.requested.is_set() and returncode != 0:
+                    status = TerminalStatus.CANCELLED
+                    reason = "turn cancelled; the in-flight turn leaves no vendor-side record"
+                elif returncode != 0:
                     stderr_text = _read_back(err)
                     if resuming and is_missing_thread(stderr_text):
                         # Not a turn that failed -- a conversation that is not
@@ -2506,8 +2591,10 @@ class CodexSession:
                     # would hand over exactly the id resume rejects with "no
                     # rollout found" -- the lie rule 7 exists to prevent.
                     self._id = outcome.thread_id
+                cancel.done.set()
                 yield self._terminal(status, reason, outcome.usage)
             finally:
+                cancel.done.set()
                 OpenAIAdapter._terminate(proc)
                 self._proc = None
 
@@ -2743,8 +2830,16 @@ class CodexAppServerSession:
     transport alone.
 
     Not thread-safe: one conversation is one ordered sequence of turns, and
-    :class:`~modelpass.sessions.Session` serializes them.
+    :class:`~modelpass.sessions.Session` serializes them. The one thing that
+    may come from another thread is a turn's cancel (:meth:`_cancel_turn`).
     """
+
+    #: Seconds a turn's cancel waits for ``turn/interrupt`` to be answered.
+    INTERRUPT_ACK_TIMEOUT = 2.0
+    #: Seconds it then waits for the interrupted turn to actually end. An
+    #: answered interrupt says the server heard; only ``turn/completed`` says
+    #: the turn stopped. Past either bound the child is closed.
+    INTERRUPT_SETTLE_TIMEOUT = 3.0
 
     def __init__(
         self,
@@ -2776,7 +2871,7 @@ class CodexAppServerSession:
         #: notifications are still coming and must not be folded into the next
         #: turn's usage; see :meth:`_drain`.
         self._stale_turns: set[str] = set()
-        #: The turn being streamed right now, for :meth:`_cancel_turn`.
+        #: The turn being streamed right now.
         self._live_turn: AppServerTurn | None = None
         self._turns = 0
         #: **Always present, even with no tools**, unlike the stateless path.
@@ -2809,7 +2904,7 @@ class CodexAppServerSession:
 
     # --- the child and the thread --------------------------------------------------
 
-    def _ensure_client(self) -> AppServerClient:
+    def _ensure_client(self, cancel: _TurnCancel | None = None) -> AppServerClient:
         """The session's own app-server child, started on demand.
 
         Not started in :meth:`OpenAIAdapter.open_session`, because that is local
@@ -2836,6 +2931,15 @@ class CodexAppServerSession:
         (2026-11-13). The thread lives in Codex's rollout, not in the process
         that last held it, and a new child has loaded nothing: see
         :meth:`_forget_child`.
+
+        **The client is stored before it is started**, so that a turn's cancel
+        can reach a child that is still shaking hands: the handshake is a
+        request, and a cancel that could not find the client would leave the
+        turn waiting on it. ``cancel`` is read between the two for the other
+        ordering -- a cancel that looked for the client an instant too early
+        found none, and is acted on here instead. Either way the client is
+        closed and its ``start()`` refuses, which the turn reads as the cancel.
+        A start that fails for any reason leaves no client behind.
         """
         client = self._client
         if client is not None and client.running:
@@ -2854,8 +2958,16 @@ class CodexAppServerSession:
                 *(isolation_overrides() if self._isolated else ()),
             ),
         )
-        client.start()
         self._client = client
+        if cancel is not None and cancel.requested.is_set():
+            client.close()
+        try:
+            client.start()
+        except BaseException:
+            client.close()
+            if self._client is client:
+                self._client = None
+            raise
         return client
 
     def _forget_child(self, client: AppServerClient) -> None:
@@ -2900,14 +3012,14 @@ class CodexAppServerSession:
             else:
                 self._thread_id = None
 
-    def _ensure_thread(self) -> AppServerClient:
+    def _ensure_thread(self, cancel: _TurnCancel | None = None) -> AppServerClient:
         """Start or resume the thread this session runs on. Idempotent.
 
         Neither call runs a model turn, so both are free -- which is why a
         resume's *"this conversation is gone"* is answered before anything is
         spent, unlike on exec where the first turn is what finds out.
         """
-        client = self._ensure_client()
+        client = self._ensure_client(cancel)
         if self._thread_ready:
             return client
         isolation = self._isolation_config(client) if self._isolated else {}
@@ -3030,19 +3142,66 @@ class CodexAppServerSession:
     def send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
         """One turn, as :meth:`_send` streams it, cancellable on its own.
 
-        The turn's cancel is ``turn/interrupt`` on this session's live turn, the
-        same polite step :meth:`_abandon` takes, and never goes through the
-        adapter, whose ``cancel()`` reaches the stateless runs every caller on
-        this runtime shares (2026-09-24). A bounded turn is cancelled this way.
+        The turn's cancel is :meth:`_cancel_turn` -- ``turn/interrupt`` on this
+        turn first, the same polite step :meth:`_abandon` takes, and the child
+        closed behind it if that does not end the turn. It never goes through
+        the adapter, whose ``cancel()`` reaches the stateless runs every caller
+        on this runtime shares (2026-09-24). A bounded turn is cancelled this
+        way.
         """
-        return RunStream(self._send(message, effort=effort), self._cancel_turn)
+        cancel = _TurnCancel()
+        return RunStream(
+            self._send(message, effort=effort, cancel=cancel),
+            lambda: self._cancel_turn(cancel),
+        )
 
-    def _cancel_turn(self) -> None:
-        turn, client = self._live_turn, self._client
-        if turn is not None and client is not None:
-            interrupt_app_server_turn(client, turn.thread_id, turn.turn_id)
+    def _cancel_turn(self, cancel: _TurnCancel) -> None:
+        """End that turn: ask the server, and close the child if asking fails.
 
-    def _send(self, message: str, *, effort: str | None = None) -> Iterator[AgentEvent]:
+        Called from the watchdog's thread while the turn's consumer is blocked
+        on the server, which is the whole case a bound exists for. It used to
+        send ``turn/interrupt`` and stop there (2026-11-13): if no turn id
+        existed yet there was nothing to send, and if the server was hung there
+        was nobody to hear it, and either way the consumer stayed blocked --
+        requests on this transport wait without a bound of their own.
+
+        So the interrupt is still tried first, because a server that honours it
+        keeps the child and the thread; and then the turn has
+        :attr:`INTERRUPT_SETTLE_TIMEOUT` to actually end. If the interrupt
+        could not be sent, was not answered within
+        :attr:`INTERRUPT_ACK_TIMEOUT`, or was answered and ended nothing, the
+        child is closed. That fails whatever request the consumer is waiting on
+        and ends its notification stream, and the turn reads either as this
+        cancel. The session is left without a child, which the next turn
+        replaces (:meth:`_forget_child`).
+
+        A turn that has not started is only marked: the session's child is
+        idle, or is another turn's, and the turn will read the mark as it
+        starts. A turn that is already decided is left alone.
+        """
+        cancel.requested.set()
+        if not cancel.started.is_set() or cancel.done.is_set():
+            return
+        client, turn = self._client, cancel.turn
+        if client is None:
+            # Between children. _ensure_client reads the mark once it has one.
+            return
+        acknowledged = turn is not None and interrupt_app_server_turn(
+            client, turn.thread_id, turn.turn_id, timeout=self.INTERRUPT_ACK_TIMEOUT
+        )
+        if acknowledged and cancel.done.wait(self.INTERRUPT_SETTLE_TIMEOUT):
+            return
+        if cancel.done.is_set():
+            return
+        client.close(force=True)
+
+    def _send(
+        self,
+        message: str,
+        *,
+        effort: str | None = None,
+        cancel: _TurnCancel | None = None,
+    ) -> Iterator[AgentEvent]:
         """Run one turn on this thread and stream normalized events.
 
         ``effort`` overrides the session's standing level for this turn and,
@@ -3070,10 +3229,14 @@ class CodexAppServerSession:
             # driving the adapter directly, and the same words run() uses.
             yield self._terminal(TerminalStatus.ERROR, "codex CLI not found", TokenUsage())
             return
-        yield from self._stream_turn(message, effort=effort)
+        yield from self._stream_turn(message, effort=effort, cancel=cancel)
 
     def _stream_turn(
-        self, message: str, *, effort: str | None = None
+        self,
+        message: str,
+        *,
+        effort: str | None = None,
+        cancel: _TurnCancel | None = None,
     ) -> Iterator[AgentEvent]:
         """One ``turn/start`` and its drain, ending in exactly one terminal.
 
@@ -3086,40 +3249,79 @@ class CodexAppServerSession:
         gets D10's floor plus one politer step -- ``turn/interrupt`` -- and,
         unlike the stateless run, the child is **not** closed behind it: the turn
         ended, the conversation did not.
+
+        ``cancel`` is this turn's own (:class:`_TurnCancel`), and a cancelled
+        turn ends in one of three ways, each with its one terminal. Cancelled
+        before it started: nothing is sent. Interrupted and honoured: the
+        server's own ``turn/completed`` arrives with ``interrupted`` and is the
+        outcome, exactly as any other. Cut short: :meth:`_cancel_turn` closed
+        the child under a request or under the drain, the transport closing is
+        that cancel arriving, and it is reported as ``cancelled`` rather than as
+        the vendor failure it would otherwise be.
         """
+        cancel = cancel or _TurnCancel()
         turn = AppServerTurn()
         turn.thread_id = self._thread_id
+        cancel.turn = turn
         finished = False
         self._live_turn = turn
+        cancel.started.set()
         try:
-            client = self._ensure_thread()
-            while self._pending_events:
-                yield self._pending_events.pop(0)
-            thread_id = self._thread_id
-            if not thread_id:
-                raise VendorRunFailed(
-                    "codex app-server started a thread without an id, so there is "
-                    "nothing to run this turn on"
+            if cancel.requested.is_set():
+                finished = True
+                yield self._terminal(
+                    TerminalStatus.CANCELLED,
+                    "turn cancelled before it started; nothing was sent",
+                    TokenUsage(),
                 )
-            turn.thread_id = thread_id
-            started = client.request(
-                "turn/start",
-                _session_turn_start_params(
-                    self._request,
-                    thread_id,
-                    message,
-                    first_turn=self._turns == 0,
-                    effort=effort,
-                ),
-            )
-            turn.turn_id = _started_turn_id(started) or turn.turn_id
-            # The adapter's own drain, not a second one: see
-            # :meth:`OpenAIAdapter._drain_app_server` for why one turn loop
-            # serves both callers and what the two arguments below change.
-            yield from self._adapter._drain_app_server(
-                client, turn, self._dispatcher, stale_turns=self._stale_turns
-            )
+                return
+            try:
+                client = self._ensure_thread(cancel)
+                while self._pending_events:
+                    yield self._pending_events.pop(0)
+                thread_id = self._thread_id
+                if not thread_id:
+                    raise VendorRunFailed(
+                        "codex app-server started a thread without an id, so there "
+                        "is nothing to run this turn on"
+                    )
+                turn.thread_id = thread_id
+                started = client.request(
+                    "turn/start",
+                    _session_turn_start_params(
+                        self._request,
+                        thread_id,
+                        message,
+                        first_turn=self._turns == 0,
+                        effort=effort,
+                    ),
+                )
+                turn.turn_id = _started_turn_id(started) or turn.turn_id
+                # The adapter's own drain, not a second one: see
+                # :meth:`OpenAIAdapter._drain_app_server` for why one turn loop
+                # serves both callers and what the two arguments below change.
+                yield from self._adapter._drain_app_server(
+                    client, turn, self._dispatcher, stale_turns=self._stale_turns
+                )
+            except AppServerTransportClosed:
+                if not cancel.requested.is_set():
+                    raise
+                # Cut short. The child is closed, so there is nothing left to
+                # interrupt and nothing of this turn left to arrive.
+                finished = True
+                cancel.done.set()
+                yield self._terminal(
+                    TerminalStatus.CANCELLED,
+                    "turn cancelled; turn/interrupt did not end it in time, so the "
+                    "session's app-server child was closed. The next turn starts a "
+                    "new child",
+                    turn.usage,
+                )
+                return
             finished = True
+            # Decided: a cancel from here on has nothing to stop, and must not
+            # close a child that has just finished its turn.
+            cancel.done.set()
             self._turns += 1
             if self._id is None and turn.status is TerminalStatus.OK:
                 # Only on a turn that actually finished: see the class docstring
@@ -3129,6 +3331,7 @@ class CodexAppServerSession:
             yield self._terminal(turn.status, turn.reason, turn.usage)
         finally:
             self._live_turn = None
+            cancel.done.set()
             if not finished:
                 self._abandon(turn)
 
@@ -3154,13 +3357,23 @@ class CodexAppServerSession:
         meets it as a stale notification rather than as this turn's outcome. And
         whether an interrupted turn is billed is unknown. The capability registry
         claims nothing until those are answered.
+
+        **An interrupt that is not accepted closes the child** (2026-11-13).
+        Nobody is watching this turn, so a server that will not stop it would
+        go on running it, and spending, with nothing left to notice. The next
+        turn then starts a new child (:meth:`_forget_child`).
         """
         turn_id = turn.turn_id
         if turn_id:
             self._stale_turns.add(turn_id)
         client = self._client
-        if client is not None:
-            interrupt_app_server_turn(client, turn.thread_id, turn_id)
+        if client is None or not turn_id:
+            # No id means turn/start was never answered: nothing is running.
+            return
+        if not interrupt_app_server_turn(
+            client, turn.thread_id, turn_id, timeout=self.INTERRUPT_ACK_TIMEOUT
+        ):
+            client.close(force=True)
 
     def _terminal(
         self, status: TerminalStatus, reason: str | None, usage: TokenUsage

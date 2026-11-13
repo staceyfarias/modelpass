@@ -74,6 +74,7 @@ from modelpass.types import (
     TerminalEvent,
     TerminalStatus,
     TextDeltaEvent,
+    Timeout,
     ToolResultEvent,
     VendorEvent,
 )
@@ -1342,6 +1343,291 @@ def test_closing_the_session_closes_the_child(tmp_path):
     handle.close()
     handle.close()  # idempotent
 
+    assert server.returncode is not None
+
+
+# --- a cancel the server does not honour -------------------------------------------
+#
+# A bounded turn is cancelled from the watchdog's thread while the consumer is
+# blocked on the server. ``turn/interrupt`` is a request to that same server, so
+# a cancel that is only an interrupt ends nothing when the server is the thing
+# that is stuck. Each test below blocks a real consumer thread first and cancels
+# second, because that order is the defect: a fake that had already queued the
+# turn's lines would let the consumer finish on its own.
+
+
+class HungServer(ScriptedThreadServer):
+    """A child that receives some methods and never answers them."""
+
+    def __init__(self, script, *silent: str) -> None:
+        super().__init__(script)
+        self.silent = set(silent)
+        self.heard: dict[str, threading.Event] = {
+            method: threading.Event() for method in silent
+        }
+
+    def on_write(self, text: str) -> None:
+        message = json.loads(text)
+        method = message.get("method")
+        if method in self.silent and "id" in message:
+            self.received.append(message)
+            self.heard[method].set()
+            return
+        super().on_write(text)
+
+
+@pytest.fixture
+def short_bounds(monkeypatch):
+    """The session's two cancel bounds, shortened so a test waits on neither."""
+    monkeypatch.setattr(CodexAppServerSession, "INTERRUPT_ACK_TIMEOUT", 0.2)
+    monkeypatch.setattr(CodexAppServerSession, "INTERRUPT_SETTLE_TIMEOUT", 0.2)
+
+
+def started_only_script() -> dict[str, list[tuple[Any, list[Any]]]]:
+    """A turn that starts and then says nothing more: the server is stuck in it."""
+    script = two_turn_script()
+    script["turn/start"] = [(captured_payload("turn1_response"), [FIRST_TURN[0]])]
+    return script
+
+
+def consume_in_background(stream) -> tuple[threading.Thread, list]:
+    outcome: list = []
+
+    def consume() -> None:
+        try:
+            outcome.append(list(stream))
+        except BaseException as exc:  # recording it is the assertion
+            outcome.append(exc)
+
+    worker = threading.Thread(target=consume, daemon=True)
+    worker.start()
+    return worker, outcome
+
+
+def cancelled_terminal(worker: threading.Thread, outcome: list) -> TerminalEvent:
+    """The turn ended, once, as cancelled -- and within the test's patience."""
+    worker.join(timeout=8)
+    assert not worker.is_alive(), "the cancel did not end the turn"
+    assert isinstance(outcome[0], list), f"the turn raised {outcome[0]!r}"
+    terminals = [e for e in outcome[0] if isinstance(e, TerminalEvent)]
+    assert [t.status for t in terminals] == [TerminalStatus.CANCELLED]
+    return terminals[0]
+
+
+def wait_for(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+def test_a_cancel_the_server_never_acknowledges_closes_the_child(tmp_path, short_bounds):
+    """The interrupt is tried; when nothing answers it, the floor is the close."""
+    server = HungServer(started_only_script(), TURN_INTERRUPT_METHOD)
+    adapter, _ = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+    stream = handle.send("hello")
+    worker, outcome = consume_in_background(stream)
+    try:
+        assert wait_for(lambda: server.sent("turn/start"))
+        stream.cancel()
+
+        terminal = cancelled_terminal(worker, outcome)
+    finally:
+        server.eof()
+
+    assert server.heard[TURN_INTERRUPT_METHOD].is_set(), "the polite step comes first"
+    assert server.returncode is not None, "the child that would not stop is closed"
+    assert "closed" in (terminal.reason or "")
+    assert not handle._closed, "the turn ended; the session did not"
+
+
+def test_an_acknowledged_interrupt_that_ends_nothing_still_closes_the_child(
+    tmp_path, short_bounds
+):
+    """``{}`` is an answer to the request, not the end of the turn."""
+    server = ScriptedThreadServer(started_only_script())
+    adapter, _ = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+    stream = handle.send("hello")
+    worker, outcome = consume_in_background(stream)
+    try:
+        assert wait_for(lambda: server.sent("turn/start"))
+        stream.cancel()
+
+        cancelled_terminal(worker, outcome)
+    finally:
+        server.eof()
+
+    assert len(server.sent(TURN_INTERRUPT_METHOD)) == 1
+    assert server.returncode is not None
+
+
+@pytest.mark.parametrize("silent", ["initialize", "config/read", "thread/start", "turn/start"])
+def test_a_cancel_before_the_turn_has_an_id_closes_the_child(
+    tmp_path, short_bounds, silent
+):
+    """No turn id, so no interrupt can be sent -- and requests wait without a bound."""
+    server = HungServer(two_turn_script(), silent)
+    adapter, _ = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+    stream = handle.send("hello")
+    worker, outcome = consume_in_background(stream)
+    try:
+        assert server.heard[silent].wait(timeout=5)
+        stream.cancel()
+
+        cancelled_terminal(worker, outcome)
+    finally:
+        server.eof()
+
+    assert server.sent(TURN_INTERRUPT_METHOD) == []
+    assert server.returncode is not None
+
+
+def test_an_interrupt_the_server_honours_ends_the_turn_and_keeps_the_child(
+    tmp_path, short_bounds
+):
+    """The graceful path is still the first one: nothing is closed that stopped."""
+    script = started_only_script()
+    interrupted = json.loads(json.dumps(FIRST_TURN[-1]))
+    interrupted["params"]["turn"]["status"] = "interrupted"
+    script[TURN_INTERRUPT_METHOD] = [({}, [interrupted])]
+    script["turn/start"].append((captured_payload("turn2_response"), SECOND_TURN))
+    server = ScriptedThreadServer(script)
+    adapter, spawn = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+    stream = handle.send("hello")
+    worker, outcome = consume_in_background(stream)
+
+    assert wait_for(lambda: server.sent("turn/start"))
+    stream.cancel()
+    cancelled_terminal(worker, outcome)
+
+    assert server.returncode is None, "a child that stopped the turn is not closed"
+    events = bounded(lambda: list(handle.send("and again")))
+    assert events[-1].status is TerminalStatus.OK
+    assert spawn.calls == 1 and len(server.sent("thread/start")) == 1
+
+
+def test_a_turn_cancelled_before_it_starts_sends_nothing(tmp_path, short_bounds):
+    """A bound can fire before the first ``next()``; the turn must not then run."""
+    server = ScriptedThreadServer(two_turn_script())
+    adapter, spawn = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+
+    stream = handle.send("hello")
+    stream.cancel()
+    events = bounded(lambda: list(stream))
+
+    assert spawn.calls == 0
+    assert [e.status for e in events if isinstance(e, TerminalEvent)] == [
+        TerminalStatus.CANCELLED
+    ]
+
+
+def test_cancelling_a_turn_that_has_not_started_leaves_a_healthy_child_alone(
+    tmp_path, short_bounds
+):
+    """The session's child is between turns, not in this one: it is not closed."""
+    server = ScriptedThreadServer(two_turn_script())
+    adapter, spawn = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+    assert list(handle.send("hello"))[-1].status is TerminalStatus.OK
+
+    stream = handle.send("never sent")
+    stream.cancel()
+    assert bounded(lambda: list(stream))[-1].status is TerminalStatus.CANCELLED
+
+    assert server.returncode is None
+    assert len(server.sent("turn/start")) == 1
+    assert bounded(lambda: list(handle.send("again")))[-1].status is TerminalStatus.OK
+    assert spawn.calls == 1
+
+
+def test_cancelling_a_turn_that_already_finished_touches_nothing(tmp_path, short_bounds):
+    server = ScriptedThreadServer(two_turn_script())
+    adapter, _ = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+    stream = handle.send("hello")
+    assert list(stream)[-1].status is TerminalStatus.OK
+
+    stream.cancel()
+
+    assert server.sent(TURN_INTERRUPT_METHOD) == []
+    assert server.returncode is None
+
+
+def test_the_session_takes_its_next_turn_after_a_cancel_closed_its_child(
+    tmp_path, short_bounds
+):
+    """Well-defined afterwards: a new child, and the thread that had turns resumed."""
+    script = two_turn_script()
+    script["turn/start"] = [
+        (captured_payload("turn1_response"), FIRST_TURN),
+        (captured_payload("turn2_response"), [SECOND_TURN[0]]),
+    ]
+    first = HungServer(script, TURN_INTERRUPT_METHOD)
+    second = ScriptedThreadServer(resume_script())
+    adapter, spawn = adapter_over(first, second)
+    handle = adapter.open_session(session_request(tmp_path))
+    assert list(handle.send("hello"))[-1].status is TerminalStatus.OK
+
+    stream = handle.send("this one hangs")
+    worker, outcome = consume_in_background(stream)
+    try:
+        assert wait_for(lambda: len(first.sent("turn/start")) == 2)
+        stream.cancel()
+        cancelled_terminal(worker, outcome)
+    finally:
+        first.eof()
+
+    events = bounded(lambda: list(handle.send("and again")))
+
+    assert spawn.calls == 2
+    assert second.sent(THREAD_RESUME_METHOD)[0]["threadId"] == THREAD_ID
+    assert events[-1].status is TerminalStatus.OK
+
+
+def test_a_bounded_session_turn_on_a_hung_server_times_out(tmp_path, short_bounds):
+    """The whole path a caller has: ``send(timeout=...)`` on a real session.
+
+    The watchdog fires while the pump is blocked in ``next()``. Before, the
+    interrupt was the entire cancel and this call never returned.
+    """
+    server = HungServer(started_only_script(), TURN_INTERRUPT_METHOD)
+    adapter, _ = adapter_for(server)
+    bridge = bridge_over(adapter, tmp_path)
+    session = bridge.new_chat(
+        connection="codex-sub", options={"transport": TRANSPORT_APP_SERVER}
+    )
+    try:
+        events = bounded(
+            lambda: list(session.send("hello", timeout=Timeout(total=0.3))), timeout=8
+        )
+    finally:
+        server.eof()
+
+    assert events[-1].status is TerminalStatus.TIMED_OUT
+    assert server.returncode is not None
+    assert not session.closed
+
+
+def test_an_abandoned_turn_the_server_will_not_interrupt_is_not_left_running(
+    tmp_path, short_bounds
+):
+    """Nobody is watching it and it would not stop: the child is closed."""
+    server = HungServer(two_turn_script(), TURN_INTERRUPT_METHOD)
+    adapter, _ = adapter_for(server)
+    handle = adapter.open_session(session_request(tmp_path))
+
+    stream = handle.send("hello")
+    next(stream)
+    bounded(stream.close)
+
+    assert server.heard[TURN_INTERRUPT_METHOD].is_set()
     assert server.returncode is not None
 
 

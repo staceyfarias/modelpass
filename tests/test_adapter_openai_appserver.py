@@ -21,6 +21,7 @@ import json
 import queue
 import subprocess
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar
@@ -1118,6 +1119,30 @@ def test_a_cancel_while_the_server_is_not_answering_ends_the_run_cancelled(silen
     terminals = [e for e in outcome[0] if e.type == "terminal"]
     assert [t.status for t in terminals] == [TerminalStatus.CANCELLED]
     assert server.terminated == 1
+
+
+def test_an_interrupt_that_cannot_even_be_written_gives_up_on_time():
+    """The bound is the function's own, because the write has none.
+
+    ``request(timeout=...)`` limits the wait for an answer. A server that has
+    stopped reading leaves the *write* blocked, and the caller here is the
+    cancel -- whose next step, the close, is what would free it.
+    """
+    release = threading.Event()
+
+    class Stuck:
+        def request(self, method, params=None, *, timeout=None):
+            release.wait(30)
+            return {}
+
+    started = time.monotonic()
+    try:
+        accepted = interrupt_app_server_turn(Stuck(), "thread1", "turn1", timeout=0.2)
+    finally:
+        release.set()
+
+    assert accepted is False
+    assert time.monotonic() - started < 5
 
 
 def test_interrupt_needs_both_ids_and_never_raises():

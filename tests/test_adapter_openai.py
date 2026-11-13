@@ -1861,6 +1861,39 @@ def test_a_resume_that_failed_for_another_reason_is_a_failed_turn_not_a_missing_
     assert not is_missing_thread(OTHER_RESUME_FAILURE_STDERR)
 
 
+def test_an_exec_session_turn_cancelled_before_it_starts_launches_nothing():
+    """The turn's cancel used to find no process and do nothing at all.
+
+    A bound that fired ahead of the first ``next()`` was spent on that, and the
+    turn then ran with nothing left to stop it.
+    """
+    spawn = FakeSessionSpawn(SUCCESS_STREAM)
+    session = session_adapter(spawn).open_session(session_request())
+
+    stream = session.send("hello")
+    stream.cancel()
+    events = list(stream)
+
+    assert spawn.calls == []
+    assert [e.type for e in events] == ["terminal"]
+    assert events[0].status is TerminalStatus.CANCELLED
+
+
+def test_a_cancelled_exec_session_turn_ends_cancelled_not_as_a_failed_exit():
+    """A killed process exits non-zero; that is the cancel, not a vendor error."""
+    spawn = FakeSessionSpawn(([THREAD_STARTED, TURN_STARTED], 1, ""))
+    session = session_adapter(spawn).open_session(session_request())
+
+    stream = session.send("hello")
+    next(stream)
+    stream.cancel()
+    terminal = list(stream)[-1]
+
+    assert spawn.procs[0].killed
+    assert terminal.status is TerminalStatus.CANCELLED
+    assert session.id is None
+
+
 def test_resume_session_refuses_a_system_prompt():
     adapter = session_adapter(FakeSessionSpawn())
     with pytest.raises(InvalidSession) as excinfo:

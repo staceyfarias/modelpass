@@ -33,7 +33,7 @@ import pytest
 
 from modelpass import _background
 from modelpass.adapters.base import RunRequest, SessionRequest
-from modelpass.adapters.codex_appserver import AppServerClient
+from modelpass.adapters.codex_appserver import AppServerClient, AppServerTransportClosed
 from modelpass.adapters.openai import OpenAIAdapter
 from modelpass.connections import Connection, CredentialRef
 from modelpass.preflight import plan_launch
@@ -62,6 +62,8 @@ def answer():
         if isinstance(message, dict) and "id" in message and "method" in message:
             sys.stdout.write(json.dumps({"id": message["id"], "result": {}}) + "\n")
             sys.stdout.flush()
+        if "deaf=1" in sys.argv and message.get("method") == "initialized":
+            return  # hung: the handshake is done and stdin is never read again
 
 threading.Thread(target=answer, daemon=True).start()
 if exec_mode:
@@ -300,6 +302,52 @@ def test_closing_an_app_server_client_stops_a_child_that_ignores_stdin_eof(
         assert chain.stopped(), "the app-server kept running after close()"
     finally:
         client.close()
+
+
+def test_closing_a_client_frees_a_writer_stuck_on_a_server_that_stopped_reading(
+    chain, tmp_path
+):
+    """A hung server does not read its stdin, so a message to it never finishes.
+
+    The writer is blocked inside the pipe holding the pipe's own lock, which is
+    the lock ``stdin.close()`` needs: a close that began by closing stdin
+    waited behind the very write it was there to end. The child is killed
+    first instead, and that is what lets the writer go.
+    """
+    client = AppServerClient(
+        binary=chain.binary,
+        env=child_env(),
+        cwd=str(tmp_path),
+        config_overrides=("-c", "deaf=1"),
+    )
+    failure: list[BaseException] = []
+
+    def send() -> None:
+        try:
+            # Far more than a pipe holds, so the write cannot complete.
+            client.request("turn/start", {"input": "x" * 4_000_000})
+        except BaseException as exc:  # recording it is the assertion
+            failure.append(exc)
+
+    try:
+        client.start()
+        chain.wait_until_beating()
+        writer = threading.Thread(target=send, daemon=True)
+        writer.start()
+        writer.join(1.0)
+        assert writer.is_alive(), "the write finished, so this is not the stuck case"
+
+        closer = threading.Thread(target=client.close, daemon=True)
+        closer.start()
+        closer.join(20)
+        assert not closer.is_alive(), "close() is stuck behind the write it should end"
+
+        writer.join(10)
+        assert not writer.is_alive(), "the writer was never released"
+        assert failure and isinstance(failure[0], AppServerTransportClosed)
+        assert chain.stopped()
+    finally:
+        chain.destroy()  # before close(): a regression here is a close that hangs
 
 
 # --- the short queries -------------------------------------------------------------
