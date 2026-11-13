@@ -259,23 +259,25 @@ child actually receives.
 **On macOS**, Claude Code prefers the login Keychain, and [the Keychain entry is keyed
 to `CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/team#credential-management), so
 a session with a different directory reads a different entry — directory isolation
-works there as it does elsewhere. When the Keychain refuses a write (locked, an SSH
-session, a password out of sync) Claude Code falls back to a plaintext
-`.credentials.json` under the same directory, and modelpass reads that file exactly as it
-does on Linux. modelpass never inspects Keychain contents; when there is no file, the
-receipt says so, and `modelpass check` / `verify` (setup time) use the token-free
-`claude auth status` probe — run inside the selected directory — to answer *which account
-is logged in*.
+works there as it does elsewhere.
+
+**modelpass never opens Claude Code's credential store** — not `.credentials.json`, not
+the Keychain, on any platform. What it knows about a Claude login is what the documented,
+token-free `claude auth status` command prints when run inside the connection's config
+directory: logged in or not, the plan, and on recent CLIs a plan tier and a login expiry
+date. It cannot see when the access token lapses. If the login has lapsed, the run ends
+with an error telling you to re-run `claude /login`; it does not fall back to an API key.
 
 **Identity is verified at setup, not on each run.** Which login belongs to which
 connection is decided once, by `modelpass connect`, `verify`, `check` and the bench page,
 which read and pin the account (email, organization, plan). A run — plain, async, session
-or failover — treats a subscription login like an API key: it reads the connection's own
-credential file (no subprocess, no network), runs if there is a valid access token or an
-expired one with a refresh token, and otherwise fails with an error naming the connection
-and the `claude /login` (or `codex login`) command for that config directory. It never
-asks the vendor who is logged in and never falls back to another connection. Run receipts
-still show the pinned account, labelled `(recorded at verify, not re-checked at run time)`.
+or failover — checks only that a login is there. On `anthropic-sdk` that is the
+`claude auth status` answer, cached for a minute, so the first call in a minute waits a
+few seconds for it; on `openai-sdk` it is Codex's `auth.json`, with no subprocess. With
+no login the run fails with an error naming the connection and the `claude /login` (or
+`codex login`) command for that config directory. A run never compares the account with
+the pin and never falls back to another connection. Run receipts still show the pinned
+account, labelled `(recorded at verify, not re-checked at run time)`.
 
 Codex uses the same abstraction with `CODEX_HOME`. OpenAI documents that all Codex
 state lives beneath this root, including `config.toml` and `auth.json`. The one-time
@@ -312,8 +314,8 @@ a receipt note rather than requiring one. The default account continues to use C
 normal default storage.
 
 > **No part of modelpass has been run on a Mac.** The macOS behaviour described here and
-> above — the account profiles, the Keychain reading, the fallback to `.credentials.json` —
-> is implemented from Claude Code's documentation and Codex's published source, and is
+> above — the account profiles, the per-directory Keychain and keyring entries — is
+> implemented from Claude Code's documentation and Codex's published source, and is
 > covered by unit tests that simulate the platform. Nobody has yet driven `modelpass
 > connect`, a preflight or a chat on real hardware. If something reads wrong on a real
 > Mac, that is a bug worth reporting rather than a documented limitation.
@@ -911,8 +913,8 @@ passed as `CLAUDE_CONFIG_DIR`; on `openai-sdk` it is passed as `CODEX_HOME`. Omi
 uses the vendor default. An unconfigured ambient root is scrubbed. Both vendors key
 their OS credential store to this directory — Claude Code's Keychain entry and Codex's
 keyring entry are per-directory — so isolation holds on every platform, and no
-credential-store setting is required of you. Keychain contents are never inspected by
-modelpass; on macOS `claude auth status` supplies the identity instead.
+credential-store setting is required of you. modelpass never opens Claude Code's
+credential store; `claude auth status` supplies the login state and the identity.
 
 **`enabled`** — default `true`. A disabled connection is still listed and still
 preflights; what it refuses is runs, with a clear `ConnectionDisabled` error raised
@@ -1063,8 +1065,8 @@ $ modelpass connect anthropic
 claude-sub
   runtime      anthropic-sdk
   auth mode    subscription
-  credential   Claude Code login (~/.claude/.credentials.json)
-  plan         Max 5x
+  credential   Claude Code login (claude auth status, default config directory)
+  plan         max
   scrubbed     ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, CLAUDE_CODE_USE_BEDROCK
   guards       no spend guards configured: nothing bounds what one run may spend...
   status       OK

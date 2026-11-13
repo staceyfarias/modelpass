@@ -117,12 +117,10 @@ import os
 import queue
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -285,157 +283,63 @@ _ALLOWANCE_NOTE = (
 )
 
 
-# --- credential detection ------------------------------------------------------
+# --- login evidence ------------------------------------------------------------
+#
+# modelpass never opens Claude Code's credential store -- not the
+# ``.credentials.json`` file under the config directory and not the macOS
+# Keychain (owner decision, 2026-11-13). The store is an undocumented internal
+# format that already differs by platform, and "never opens it" is a guarantee a
+# reader can check by searching this package for the file's name. The documented
+# ``claude auth status`` command, run under the connection's own environment, is
+# the only thing a preflight knows about the login, on every platform.
+#
+# What that costs, stated on the receipt rather than implied: the access token's
+# expiry and whether it can be refreshed are not known before a run. A login
+# that has lapsed is found by the run itself, which ends as an authentication
+# error naming ``claude /login`` (:func:`_terminal_status`).
+
+#: On every subscription receipt that passes, for the reason above.
+_CREDENTIAL_STORE_NOTE = (
+    "login state is what 'claude auth status' reports; modelpass does not open "
+    "Claude Code's credential store (file or Keychain), so access-token expiry "
+    "and refresh are not checked before a run -- a lapsed login ends the run as "
+    "an authentication error naming 'claude /login'"
+)
+
+#: Pauses before asking ``claude auth status`` again when it printed nothing
+#: readable. One empty answer among concurrent probes is what refused 97 of 100
+#: calls on 2026-10-01, and a run now depends on this answer.
+_AUTH_STATUS_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+
+#: How long a run may go on an earlier good ``claude auth status`` answer when
+#: the probe returns nothing now. Setup-time checks never use it.
+_LOGIN_EVIDENCE_GRACE_SECONDS = 900.0
+
+#: Appended to an HTTP 401 on a subscription run. Preflight cannot see a lapsed
+#: token, so this is where the instruction has to be.
+_RELOGIN_HINT = (
+    " -- the Claude Code login is expired or invalid: re-run 'claude /login' "
+    "(with CLAUDE_CONFIG_DIR set to the connection's config directory, if it "
+    "names one)"
+)
 
 
-@dataclass(frozen=True, slots=True)
-class CredentialStatus:
-    """What the Claude Code login store looks like -- metadata only.
+def _login_expiry(raw: Any) -> Any:
+    """``loginExpiresAt`` from ``claude auth status`` as an aware datetime.
 
-    This type deliberately has no field that can hold a token. The detector
-    reads the credential file for *expiry and plan* and nothing else, so a
-    receipt can say "your login expired in March" without a secret ever entering
-    a log, an event, or this process's memory beyond the parse.
+    An ISO 8601 string on Claude Code 2.1.322 (read 2026-11-13); older builds
+    do not report it. ``None`` for anything else: an unread field loses a
+    receipt line and decides nothing.
     """
-
-    source: str
-    present: bool = False
-    expires_at: float | None = None
-    expired: bool = False
-    #: A refresh token is present *and* not known to have expired. Claude Code
-    #: refreshes an expired access token on its first real use with this.
-    refreshable: bool = True
-    #: ``refreshTokenExpiresAt`` when the file records it (newer Claude Code
-    #: writes it beside ``expiresAt``); ``None`` where it is absent.
-    refresh_expires_at: float | None = None
-    #: The refresh token is present but its recorded expiry has passed, so no
-    #: refresh can succeed. Kept apart from "no refresh token at all" because
-    #: the two want different sentences, not a different instruction.
-    refresh_expired: bool = False
-    subscription_type: str | None = None
-    rate_limit_tier: str | None = None
-    detail: str | None = None
-    #: True only on macOS when no ``.credentials.json`` exists and the answer
-    #: therefore rests on the login Keychain, which modelpass does not open. The
-    #: subscription receipt reads this to decide whether ``claude auth status``
-    #: is the only evidence it has about which account a config directory holds.
-    keychain_only: bool = False
-    #: True when the credential file exists and parses but its token fields are
-    #: blank -- what Claude Code leaves behind when the CLI is logged out: the
-    #: plan metadata (``subscriptionType``, ``rateLimitTier``, ``scopes``) stays
-    #: and the secrets are emptied. Indistinguishable from a missing file by
-    #: :attr:`present` alone, and the two want the same instruction but not the
-    #: same diagnosis -- a reader who sees a populated plan in the file and is
-    #: told "no login found" reasonably concludes the token must live somewhere
-    #: else, which on this platform it does not.
-    logged_out: bool = False
-
-    @property
-    def usable(self) -> bool:
-        """Whether this credential can plausibly authenticate a child process."""
-        if not self.present:
-            return False
-        return not (self.expired and not self.refreshable)
-
-
-def credentials_path(env: Mapping[str, str] | None = None) -> Path:
-    """Where Claude Code keeps its login on this OS.
-
-    ``CLAUDE_CONFIG_DIR`` relocates the whole config directory; honour it so a
-    user with a non-default layout gets a truthful receipt.
-    """
-    source = os.environ if env is None else env
-    configured = source.get("CLAUDE_CONFIG_DIR")
-    root = Path(configured) if configured else Path.home() / ".claude"
-    return root / ".credentials.json"
-
-
-def read_credential_status(env: Mapping[str, str] | None = None) -> CredentialStatus:
-    """Detect the Claude Code login without reading any secret value.
-
-    The file is checked **first on every platform**, macOS included. Claude Code
-    prefers the login Keychain there, but it falls back to the same plaintext
-    ``<CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json`` whenever the Keychain
-    refuses the write -- a locked keychain, an SSH session, a password out of
-    sync (documented under "Authentication issues" in Claude Code's install
-    troubleshooting). So on macOS the file may or may not exist, and when it
-    does it is the same layout Linux writes and carries the same expiry.
-
-    Only when there is no file does macOS fall back to the blind answer: the
-    credential is present, and the Keychain entry it lives in is keyed to
-    ``CLAUDE_CONFIG_DIR``, so a different directory is a different entry. modelpass
-    does not open the Keychain, so it says that rather than claiming more.
-    """
-    path = credentials_path(env)
-    source = f"Claude Code login ({path})"
-    if not path.is_file():
-        if sys.platform == "darwin":
-            configured = (os.environ if env is None else env).get("CLAUDE_CONFIG_DIR")
-            where = f", keyed to {configured}" if configured else ""
-            return CredentialStatus(
-                source=f"Claude Code login (macOS Keychain{where})",
-                present=True,
-                detail="keychain contents not inspected",
-                keychain_only=True,
-            )
-        return CredentialStatus(source=source, present=False, detail="no credential file")
+    if not isinstance(raw, str) or not raw:
+        return None
+    import datetime as _dt
 
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return CredentialStatus(
-            source=source, present=True, detail=f"credential file unreadable ({type(exc).__name__})"
-        )
-
-    oauth = raw.get("claudeAiOauth") if isinstance(raw, Mapping) else None
-    if not isinstance(oauth, Mapping):
-        return CredentialStatus(
-            source=source, present=True, detail="no claudeAiOauth entry in credential file"
-        )
-
-    expires_at = _epoch_seconds(oauth.get("expiresAt"))
-    # A zero or negative expiry is not a date. Claude Code writes ``0`` into
-    # this field when it blanks the tokens, so reading it as a timestamp puts
-    # the expiry at the epoch and every check downstream reports a login that
-    # "expired in 1970" -- an artefact of the field being cleared, stated as a
-    # fact about a token that was never there. No expiry recorded is `None`.
-    # (``_epoch_seconds`` returns ``None`` for it.)
-    refresh_expires_at = _epoch_seconds(oauth.get("refreshTokenExpiresAt"))
-
-    now = time.time()
-    # Presence/length only -- the value itself is never read out of this scope.
-    has_refresh_token = bool(str(oauth.get("refreshToken") or ""))
-    refresh_expired = (
-        has_refresh_token and refresh_expires_at is not None and refresh_expires_at <= now
-    )
-    refreshable = has_refresh_token and not refresh_expired
-    expired = expires_at is not None and expires_at <= now
-    present = bool(str(oauth.get("accessToken") or ""))
-
-    return CredentialStatus(
-        source=source,
-        present=present,
-        expires_at=expires_at,
-        expired=expired,
-        refreshable=refreshable,
-        refresh_expires_at=refresh_expires_at,
-        refresh_expired=refresh_expired,
-        subscription_type=_as_str(oauth.get("subscriptionType")),
-        rate_limit_tier=_as_str(oauth.get("rateLimitTier")),
-        detail=None if present else "credential file holds no access token",
-        logged_out=not present,
-    )
-
-
-def _epoch_seconds(raw: Any) -> float | None:
-    """A credential-file timestamp as epoch seconds; ``None`` if it is not a date.
-
-    The file stores milliseconds; seconds from an older layout are tolerated.
-    Zero, negative, boolean and non-numeric values are not dates.
-    """
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        parsed = _dt.datetime.fromisoformat(raw)
+    except ValueError:
         return None
-    return float(raw) / 1000.0 if raw > 1e11 else float(raw)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=_dt.UTC)
 
 
 def _as_str(value: Any) -> str | None:
@@ -644,12 +548,17 @@ def token_usage(usage: Mapping[str, Any] | None) -> TokenUsage:
     )
 
 
-def _terminal_status(result: Any) -> tuple[TerminalStatus, str | None]:
+def _terminal_status(
+    result: Any, auth_mode: AuthMode | None = None
+) -> tuple[TerminalStatus, str | None]:
     """Map a ``ResultMessage`` onto a terminal status and reason.
 
     ``subtype`` alone is not trustworthy: a 401 arrives as
     ``subtype='success'`` with ``is_error=True`` and ``api_error_status=401``,
     so ``is_error`` is checked before the subtype is believed.
+
+    A 401 on a subscription run also says what to do about it. Preflight no
+    longer reads the token's expiry, so a lapsed login is first seen here.
     """
     subtype = getattr(result, "subtype", "") or ""
     terminal_reason = getattr(result, "terminal_reason", None)
@@ -669,6 +578,8 @@ def _terminal_status(result: Any) -> tuple[TerminalStatus, str | None]:
         detail = getattr(result, "result", None) or subtype or "unknown error"
         if api_status:
             detail = f"HTTP {api_status}: {detail}"
+        if api_status == 401 and auth_mode is AuthMode.SUBSCRIPTION:
+            return TerminalStatus.ERROR, str(detail)[:300] + _RELOGIN_HINT
         return TerminalStatus.ERROR, str(detail)[:500]
 
     return TerminalStatus.OK, terminal_reason
@@ -766,6 +677,7 @@ def map_message(
     tool_names: MutableMapping[str, str] | None = None,
     schema: Mapping[str, Any] | None = None,
     schema_name: str = "",
+    auth_mode: AuthMode | None = None,
 ) -> list[AgentEvent]:
     """Map one SDK message onto zero or more normalized events.
 
@@ -790,6 +702,9 @@ def map_message(
     becomes ``vendor_event`` instead of ``tool_call`` / ``tool_result``, and the
     ``ResultMessage`` grows a ``structured_output`` event ahead of its terminal
     -- with the terminal turned into an ``error`` when no usable answer arrived.
+
+    ``auth_mode`` is the connection's. It adds the ``claude /login`` instruction
+    to an HTTP 401 on a subscription run and changes nothing else.
     """
     runtime = Runtime.ANTHROPIC_SDK
     name = type(message).__name__
@@ -900,7 +815,7 @@ def map_message(
                 },
             )
         )
-        status, reason = _terminal_status(message)
+        status, reason = _terminal_status(message, auth_mode)
         if schema is not None:
             # The answer, then the outcome. One event, immediately before the
             # terminal, so a caller draining the stream has the structured
@@ -1459,24 +1374,37 @@ AuthStatusFn = Callable[[str, Mapping[str, str]], "Mapping[str, Any] | None"]
 def _default_auth_status(
     binary: str, env: Mapping[str, str]
 ) -> Mapping[str, Any] | None:
-    """Run the documented ``claude auth status`` JSON probe. Costs no tokens."""
+    """Run the documented ``claude auth status`` JSON probe. Costs no tokens.
+
+    Output that is not a JSON object is asked for again after a short pause
+    (:data:`_AUTH_STATUS_RETRY_DELAYS`). A binary that will not start or does
+    not answer in time is not retried.
+    """
     if not os.path.isfile(binary):
         return None
-    try:
-        result = subprocess.run(
-            [binary, "auth", "status"],
-            env=dict(env),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=20,
-            **process_options(),
-        )
-        parsed = json.loads(result.stdout or "{}")
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return None
-    return parsed if isinstance(parsed, Mapping) else None
+    for delay in (0.0, *_AUTH_STATUS_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            result = subprocess.run(
+                [binary, "auth", "status"],
+                env=dict(env),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                **process_options(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        try:
+            parsed = json.loads(result.stdout or "")
+        except ValueError:
+            continue
+        if isinstance(parsed, Mapping) and parsed:
+            return parsed
+    return None
 
 
 def _account_profile_from_auth_status(
@@ -1934,6 +1862,7 @@ class AnthropicSessionHandle:
                     tool_names=tool_names,
                     schema=self._request.schema,
                     schema_name=self._request.schema_name,
+                    auth_mode=self._request.connection.auth_mode,
                 ):
                     items.put(event)
         except BaseException as exc:
@@ -2167,6 +2096,23 @@ class AnthropicAdapter(Adapter):
         self, binary: str, env: Mapping[str, str]
     ) -> Mapping[str, Any] | None:
         """``claude auth status`` for one (binary, config directory), briefly cached."""
+        return self._login_evidence(binary, env, allow_stale=False)[0]
+
+    def _login_evidence(
+        self, binary: str, env: Mapping[str, str], *, allow_stale: bool
+    ) -> tuple[Mapping[str, Any] | None, float | None]:
+        """The ``claude auth status`` answer, and its age when it is an old one.
+
+        The second value is ``None`` for an answer inside the cache window.
+        With ``allow_stale`` -- the run path -- a probe that returns nothing
+        falls back to the last good answer for this key, up to
+        :data:`_LOGIN_EVIDENCE_GRACE_SECONDS` old, and the age is returned so
+        the receipt can say so. One empty probe must not refuse a batch of runs
+        on a login that was confirmed minutes ago (2026-10-01); the init
+        message's ``apiKeySource`` check and the run's own authentication still
+        stand behind it. Setup-time checks pass ``False``: pinning an account
+        from an old answer would be recording something nobody just read.
+        """
         key = (binary, env.get("CLAUDE_CONFIG_DIR"))
         # One probe at a time per key, so concurrent callers share one answer
         # instead of each spawning their own; and an empty answer is never
@@ -2175,11 +2121,18 @@ class AnthropicAdapter(Adapter):
             now = time.monotonic()
             hit = self._identity_cache.get(key)
             if hit is not None and now - hit[0] < _IDENTITY_CACHE_TTL_SECONDS:
-                return hit[1]
+                return hit[1], None
             answer = self._auth_status(binary, env)
             if answer:
                 self._identity_cache[key] = (now, answer)
-            return answer
+                return answer, None
+            if (
+                allow_stale
+                and hit is not None
+                and now - hit[0] < _LOGIN_EVIDENCE_GRACE_SECONDS
+            ):
+                return hit[1], now - hit[0]
+            return None, None
 
     def _identity_lock(self, key: tuple[str, str | None]) -> threading.Lock:
         with self._identity_locks_guard:
@@ -2212,18 +2165,25 @@ class AnthropicAdapter(Adapter):
     def preflight(self, request: RunRequest) -> Receipt:
         """Report which auth mode this run would actually use, and why.
 
-        The run-time check (owner decision, 2026-10-01): it reads the
-        connection's own credential store and nothing else -- no ``claude auth
-        status`` subprocess, no account comparison. Which login belongs to which
-        connection is decided at setup; a run treats a subscription login like
-        an API key. :meth:`identity_preflight` is the setup-time variant.
+        The run-time check. It asks ``claude auth status`` whether this
+        connection's config directory holds a login (cached, see
+        :meth:`_login_evidence`) and compares no account: which login belongs
+        to which connection is decided at setup (owner decision, 2026-10-01),
+        and the receipt carries no ``account_profile``.
+        :meth:`identity_preflight` is the setup-time variant.
+
+        Until 2026-11-13 this read Claude Code's credential file instead and
+        ran no subprocess. modelpass no longer opens that file, so the probe is
+        the only evidence there is.
         """
         return self._preflight(request, probe_identity=False)
 
     def identity_preflight(self, request: RunRequest) -> Receipt:
-        """:meth:`preflight` plus the live ``claude auth status`` account read.
+        """:meth:`preflight` plus who ``claude auth status`` says is logged in.
 
         For ``modelpass connect`` / ``verify`` / ``check`` and the bench only.
+        Same probe as a run; this one reports the account on the receipt and
+        never accepts an answer older than the cache window.
         """
         return self._preflight(request, probe_identity=True)
 
@@ -2267,15 +2227,17 @@ class AnthropicAdapter(Adapter):
 
         if connection.auth_mode is AuthMode.API_KEY:
             return self._api_key_receipt(request, notes)
-        profile = (
-            _account_profile_from_auth_status(
-                self._cached_auth_status(cli_path, plan.env)
-            )
-            if probe_identity
-            else None
+        login, age = self._login_evidence(
+            cli_path, plan.env, allow_stale=not probe_identity
         )
         return self._subscription_receipt(
-            request, notes, account_profile=profile, probed=probe_identity
+            request,
+            notes,
+            login=login,
+            evidence_age=age,
+            account_profile=(
+                _account_profile_from_auth_status(login) if probe_identity else None
+            ),
         )
 
     def _api_key_receipt(self, request: RunRequest, notes: list[str]) -> Receipt:
@@ -2303,158 +2265,97 @@ class AnthropicAdapter(Adapter):
         request: RunRequest,
         notes: list[str],
         *,
+        login: Mapping[str, Any] | None,
+        evidence_age: float | None = None,
         account_profile: AccountProfile | None = None,
-        probed: bool = True,
     ) -> Receipt:
-        """Confirm a usable subscription login, or fail closed.
+        """Confirm a subscription login from ``claude auth status``, or fail closed.
 
         A subscription connection that cannot prove subscription auth must never
         silently proceed: the runtime would fall back down its precedence list
         and bill the user by the token. Reporting ``ok=False`` makes the bridge
         raise before the first token is spent.
+
+        ``login`` is the probe's answer, already run with this connection's
+        ``CLAUDE_CONFIG_DIR`` and scrubbed environment. Only ``loggedIn:
+        true`` passes. No answer and ``loggedIn: false`` both refuse, each with
+        its own diagnosis. Four fields are read and nothing else is kept:
+        ``loggedIn``, ``subscriptionType``, ``planTier``, ``loginExpiresAt``.
         """
         plan = request.plan
-        status = read_credential_status(plan.env)
+        # A connection that named a directory gets told which one, and that the
+        # login has to be run with the variable set. `claude /login` with no
+        # CLAUDE_CONFIG_DIR authenticates the *default* account, so the bare
+        # instruction against a profile connection logs in the wrong account
+        # and leaves this one failing.
+        profile_dir = request.connection.config_dir
+        at = f" for {profile_dir}" if profile_dir else ""
+        how = " with CLAUDE_CONFIG_DIR set to that directory" if profile_dir else ""
+        source = (
+            "Claude Code login (claude auth status, "
+            f"{profile_dir or 'default config directory'})"
+        )
 
-        if status.keychain_only:
-            # No file to read, so ``claude auth status`` -- already run with this
-            # connection's CLAUDE_CONFIG_DIR in its environment, and keyed to the
-            # same directory the Keychain entry is keyed to -- is the only
-            # evidence available about which account this directory selects.
-            where = request.connection.config_dir or "the default Claude config directory"
-            if account_profile is not None and account_profile.logged_in is False:
-                return Receipt.from_plan(
-                    plan,
-                    detected_auth_mode=None,
-                    credential_source=status.source,
-                    account_profile=account_profile,
-                    ok=False,
-                    problem=(
-                        f"claude auth status reports no login for {where}; run "
-                        "'claude /login' with CLAUDE_CONFIG_DIR set to that directory "
-                        "before using this subscription connection"
-                    ),
-                    notes=tuple(notes),
-                )
-            if probed and account_profile is None:
-                notes.append(
-                    "identity could not be confirmed: 'claude auth status' returned "
-                    "nothing and modelpass does not inspect Keychain contents"
-                )
-
-        if not status.present:
-            # Same instruction either way, different diagnosis. "No login
-            # found" against a file that plainly holds a plan reads as modelpass
-            # looking in the wrong place, and sends the reader hunting for an
-            # external credential store instead of logging in.
-            # A connection that named a directory gets told which one, and that
-            # the login has to be run with the variable set. `claude /login`
-            # with no CLAUDE_CONFIG_DIR authenticates the *default* account, so
-            # the bare instruction against a profile connection logs in the
-            # wrong account and leaves this one failing. A connection on the
-            # default directory keeps the wording it has always had.
-            profile = request.connection.config_dir
-            at = f" for {profile}" if profile else ""
-            how = " with CLAUDE_CONFIG_DIR set to that directory" if profile else ""
-            if status.logged_out:
+        logged_in = login.get("loggedIn") if login is not None else None
+        if login is None or logged_in is not True:
+            if logged_in is False:
                 problem = (
-                    f"the Claude Code credential file{at} holds no access token -- "
-                    "the CLI is logged out (the plan metadata it keeps is not a "
-                    f"login); run 'claude /login'{how} before using a "
-                    "subscription connection"
+                    f"no Claude Code login found{at}: claude auth status reports "
+                    f"no login; run 'claude /login'{how} (or 'claude setup-token' "
+                    "for headless use) before using a subscription connection"
                 )
             else:
                 problem = (
-                    f"no Claude Code login found{at}; run 'claude /login'{how} (or "
-                    "'claude setup-token' for headless use) before using a "
-                    "subscription connection"
+                    f"could not confirm a Claude Code login{at}: 'claude auth "
+                    "status' returned nothing readable, and it is the only "
+                    "evidence modelpass has (it does not open Claude Code's "
+                    f"credential store). Run 'claude auth status'{how} to see "
+                    f"why, and 'claude /login'{how} if it reports no login"
                 )
             return Receipt.from_plan(
                 plan,
                 detected_auth_mode=None,
-                credential_source=status.source,
+                credential_source=source,
+                account_profile=account_profile,
                 ok=False,
                 problem=problem,
                 notes=tuple(notes),
             )
 
-        if not status.usable:
-            when = _format_expiry(status.expires_at)
-            return Receipt.from_plan(
-                plan,
-                detected_auth_mode=None,
-                credential_source=status.source,
-                account=account_profile.email if account_profile else None,
-                plan_name=(
-                    account_profile.subscription_type
-                    if account_profile and account_profile.subscription_type
-                    else status.subscription_type
-                ),
-                account_profile=account_profile,
-                ok=False,
-                problem=(
-                    (
-                        f"the Claude Code login's access token expired {when} and could "
-                        "not be refreshed: its refresh token expired "
-                        f"{_format_expiry(status.refresh_expires_at)}. Re-run "
-                        "'claude /login' (or 'claude setup-token') to log in again"
-                    )
-                    if status.refresh_expired
-                    else (
-                        f"the Claude Code login expired {when} and carries no refresh "
-                        "token, so a modelpass-spawned runtime cannot authenticate. "
-                        "Re-run 'claude /login' (or 'claude setup-token') to refresh it"
-                    )
-                ),
-                notes=tuple(notes),
-            )
-
-        if status.expired:
-            # usable is True here, so a refresh token is present and not known
-            # to have expired. Preflight does not try to refresh it: ``claude
-            # auth status`` does not refresh (observed 2026-09-30: repeated runs
-            # past ``expiresAt`` reported loggedIn and never rewrote the file),
-            # while a real model call does, at once -- and the run about to
-            # start is exactly such a call, under the same config directory and
-            # the same scrubbed environment. A refresh that fails there leaves
-            # the runtime without a valid token, and an authentication failure
-            # ends the run as an error, never OK: the 401 result shape observed
-            # live maps to ``TerminalStatus.ERROR`` (``_terminal_status``), and a
-            # CLI that exits instead fails the run the same way. (Not yet
-            # observed live: what a *failed* refresh looks like.) The
-            # init-message ``apiKeySource`` check still refuses any fallback to
-            # a metered key, so proceeding cannot turn into a silent success or
-            # a billed one.
-            when = _format_expiry(status.expires_at)
+        if evidence_age is not None:
             notes.append(
-                f"access token is past its expiry ({when}); Claude Code refreshes it "
-                "with the stored refresh token on first use -- a failed refresh ends "
-                "the run as an authentication error"
+                "'claude auth status' returned nothing just now; this receipt "
+                f"rests on its answer from {int(evidence_age)}s ago"
             )
-        if status.detail:
-            notes.append(status.detail)
-        if status.rate_limit_tier:
-            notes.append(f"rate limit tier: {status.rate_limit_tier}")
+        tier = _as_str(login.get("planTier"))
+        if tier:
+            notes.append(f"plan tier: {tier}")
+        expiry = _login_expiry(login.get("loginExpiresAt"))
+        if expiry is not None:
+            import datetime as _dt
+
+            when = expiry.astimezone(_dt.UTC).strftime("%Y-%m-%d")
+            if expiry > _dt.datetime.now(_dt.UTC):
+                notes.append(f"login expires on {when} (claude auth status)")
+            else:
+                notes.append(
+                    f"claude auth status dates this login's expiry {when}, which "
+                    "has passed; if Claude Code cannot renew it the run ends as "
+                    "an authentication error"
+                )
+        notes.append(_CREDENTIAL_STORE_NOTE)
         notes.append(_ALLOWANCE_NOTE)
 
         return Receipt.from_plan(
             plan,
             detected_auth_mode=AuthMode.SUBSCRIPTION,
-            credential_source=status.source,
+            credential_source=source,
             account=(
-                account_profile.email
-                if account_profile and account_profile.email
-                else (
-                    account_profile.organization_name
-                    if account_profile
-                    else None
-                )
+                (account_profile.email or account_profile.organization_name)
+                if account_profile
+                else None
             ),
-            plan_name=(
-                account_profile.subscription_type
-                if account_profile and account_profile.subscription_type
-                else status.subscription_type
-            ),
+            plan_name=_as_str(login.get("subscriptionType")),
             account_profile=account_profile,
             notes=tuple(notes),
         )
@@ -2702,6 +2603,7 @@ class AnthropicAdapter(Adapter):
                         tool_names=tool_names,
                         schema=request.schema,
                         schema_name=request.schema_name,
+                        auth_mode=request.connection.auth_mode,
                     ):
                         items.put(event)
             finally:
@@ -2969,14 +2871,6 @@ def _run_coroutine_threadsafe(
     except BaseException:
         coroutine.close()
         raise
-
-
-def _format_expiry(expires_at: float | None) -> str:
-    if expires_at is None:
-        return "at an unknown time"
-    import datetime as _dt
-
-    return _dt.datetime.fromtimestamp(expires_at, _dt.UTC).strftime("on %Y-%m-%d")
 
 
 def _format_timestamp(value: float) -> str:
