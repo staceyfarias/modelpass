@@ -126,6 +126,7 @@ class FakeDelta:
     content: str | None = None
     role: str | None = None
     tool_calls: list[FakeToolCallDelta] | None = None
+    refusal: str | None = None
 
 
 @dataclass

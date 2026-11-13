@@ -637,6 +637,27 @@ def response_text(response: Any) -> str:
     return "".join(parts)
 
 
+def response_refusal(response: Any) -> str:
+    """The model's refusal, if the finished response carries one, else ``""``.
+
+    A refusal on this API is in-band: a ``message`` item whose content is a
+    ``refusal`` part (``ResponseOutputRefusal`` -- ``type`` and ``refusal``;
+    openai 2.32.0, read 2026-11-13), on a response whose ``status`` is still
+    ``completed``. Nothing else on the response says the model declined.
+    """
+    parts: list[str] = []
+    for item in getattr(response, "output", None) or ():
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", None) or ():
+            if getattr(part, "type", None) == "refusal":
+                text = getattr(part, "refusal", "")
+                parts.append(text if isinstance(text, str) else "")
+    if not parts:
+        return ""
+    return "".join(parts).strip() or "(no reason given)"
+
+
 def function_calls(response: Any) -> list[Any]:
     """The ``function_call`` items a finished response asked for."""
     return [
@@ -654,6 +675,11 @@ def terminal_status(response: Any, *, unanswered_call: bool) -> tuple[TerminalSt
     on a terminal does not have to learn two sets of rules:
 
     * ``completed`` is ``ok``.
+    * **A refusal is ``error``, carrying the model's own words**, and it too is
+      checked before ``status``: a refused request is ``completed`` as far as
+      the vendor is concerned, with a ``refusal`` part where the answer would
+      be (:func:`response_refusal`). The same verdict 1.6 gives
+      ``stop_reason == "refusal"``.
     * **A tool call on a run that declared no tools is ``error``**, and this is
       checked before ``status`` because such a response is ``completed`` as far
       as the vendor is concerned. The answer is unfinished, and calling it ``ok``
@@ -688,6 +714,9 @@ def terminal_status(response: Any, *, unanswered_call: bool) -> tuple[TerminalSt
             "the model asked for a tool this run did not declare, so the answer "
             "is unfinished",
         )
+    refusal = response_refusal(response)
+    if refusal:
+        return TerminalStatus.ERROR, f"the model refused this request: {refusal}"
     status = getattr(response, "status", None)
     if status in (None, "completed"):
         return TerminalStatus.OK, status
@@ -1419,7 +1448,9 @@ class OpenAIAPIAdapter(Adapter):
     ) -> Iterator[AgentEvent]:
         """The structured answer, if one was asked for, and then the terminal."""
         status, reason = terminal_status(response, unanswered_call=unanswered_call)
-        if request.schema is not None:
+        # A refusal is the whole outcome: there is no answer to hold against
+        # the schema, and "no structured answer" would misreport why.
+        if request.schema is not None and not response_refusal(response):
             event, failure = build_structured_event(
                 request.schema,
                 raw=final_text,

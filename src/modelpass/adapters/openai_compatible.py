@@ -407,8 +407,9 @@ def chunk_events(chunk: Any, runtime: Runtime) -> list[AgentEvent]:
     only ever be invented -- the same sentence ticket 1.9 wrote when it chose the
     other transport, read from the other side.
 
-    Tool-call deltas and the usage chunk are *not* vendor events: both are
-    reported another way (as ``tool_call`` once assembled, and as ``usage``), and
+    Tool-call deltas, refusal deltas and the usage chunk are *not* vendor
+    events: each is reported another way (as ``tool_call`` once assembled, as
+    the terminal's reason, and as ``usage``), and
     passing them through as well would report the same thing twice. Anything else
     with a shape this adapter does not read becomes ``vendor_event`` named
     ``chunk.<n>`` (rule 3) -- a server's own extension fields reach a caller
@@ -421,7 +422,12 @@ def chunk_events(chunk: Any, runtime: Runtime) -> list[AgentEvent]:
     content = _field(delta, "content")
     if isinstance(content, str) and content:
         return [TextDeltaEvent(content)]
-    if _field(delta, "tool_calls") or _field(delta, "role") or content is not None:
+    if (
+        _field(delta, "tool_calls")
+        or _field(delta, "role")
+        or _field(delta, "refusal")
+        or content is not None
+    ):
         return []
     if _field(choice, "finish_reason") is not None:
         return []
@@ -443,9 +449,18 @@ class _CallBuffer:
 
     def __init__(self) -> None:
         self._by_index: dict[int, dict[str, Any]] = {}
+        #: The model's refusal, which this transport streams in ``delta.refusal``
+        #: the way it streams text in ``delta.content`` (``ChoiceDelta``, openai
+        #: 2.32.0, read 2026-11-13) -- on a turn whose ``finish_reason`` is still
+        #: ``stop``. Kept here because it is the other thing a turn assembles
+        #: from fragments instead of answering.
+        self.refusal = ""
 
     def absorb(self, chunk: Any) -> None:
         delta = _delta(_choice(chunk))
+        refusal = _field(delta, "refusal")
+        if isinstance(refusal, str):
+            self.refusal += refusal
         for fragment in _field(delta, "tool_calls") or ():
             index = _field(fragment, "index")
             index = index if isinstance(index, int) else len(self._by_index)
@@ -490,7 +505,11 @@ def call_arguments(raw: str) -> dict[str, Any]:
 
 
 def terminal_status(
-    finish_reason: str | None, *, unanswered_call: bool, answered: bool
+    finish_reason: str | None,
+    *,
+    unanswered_call: bool,
+    answered: bool,
+    refusal: str = "",
 ) -> tuple[TerminalStatus, str | None]:
     """Map ``finish_reason`` onto a terminal status.
 
@@ -499,6 +518,9 @@ def terminal_status(
     of rules:
 
     * ``stop`` is ``ok``.
+    * **A refusal is ``error``, carrying the model's own words.** The server
+      calls such a turn ``stop``; the words arrived in ``delta.refusal`` instead
+      of ``delta.content``. Same verdict as 1.6's ``refusal`` and 1.9's.
     * **A tool call on a run that declared no tools is ``error``**, checked first
       because such a response is ``tool_calls`` as far as the server is
       concerned and the answer is unfinished either way. Same sentence as 1.6's
@@ -526,6 +548,11 @@ def terminal_status(
             TerminalStatus.ERROR,
             "the model asked for a tool this run did not declare, so the answer "
             "is unfinished",
+        )
+    if refusal.strip():
+        return (
+            TerminalStatus.ERROR,
+            f"the model refused this request: {refusal.strip()}",
         )
     if finish_reason in (None, ""):
         if answered:
@@ -961,7 +988,7 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
             # bill on it.
             if not (request.tools and calls):
                 yield from self._finish_chat(
-                    request, finish_reason, final_text, bool(calls)
+                    request, finish_reason, final_text, bool(calls), buffer.refusal
                 )
                 return
 
@@ -1139,7 +1166,7 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
             calls = buffer.assembled()
             if not (request.tools and calls):
                 for out in self._finish_chat(
-                    request, finish_reason, final_text, bool(calls)
+                    request, finish_reason, final_text, bool(calls), buffer.refusal
                 ):
                     yield out
                 return
@@ -1200,14 +1227,18 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
         finish_reason: str | None,
         final_text: str,
         unanswered_call: bool,
+        refusal: str = "",
     ) -> Iterator[AgentEvent]:
         """The structured answer, if one was asked for, and then the terminal."""
         status, reason = terminal_status(
             finish_reason,
             unanswered_call=unanswered_call,
             answered=bool(final_text),
+            refusal=refusal,
         )
-        if request.schema is not None:
+        # A refusal is the whole outcome: there is no answer to hold against
+        # the schema, and "no structured answer" would misreport why.
+        if request.schema is not None and not refusal.strip():
             event, failure = build_structured_event(
                 request.schema,
                 raw=final_text,
