@@ -126,6 +126,12 @@ global Claude Code had it, which is what this entry exists to catch.
 | `anthropic` | `>=0.40,<1` | 0.97.0 | 2.7.0 |
 | `openai` | `>=2,<3` | 2.32.0 | 3.49.0 |
 | `google-genai` | `>=1,<2` | 1.73.1 | 3.0.0 |
+
+**Declared changed (2026-11-13):** the two agent-runtime packages now carry caps, so
+both "Declared" cells above are out of date. `claude-agent-sdk` is `>=0.2.159,<0.3`,
+verified against 0.2.180. `openai-codex` (pip) is `>=0.154,<1`, and only 0.154.0 is
+verified: the package numbers every Codex release as a 0.x minor, so that cap admits
+releases nobody here has read. Nothing was upgraded and "Latest" was not re-measured.
 | `langchain-core` | `>=1,<2` | 1.3.2 | 1.7.7 |
 
 **What is known about `anthropic`, from reading the packages and Anthropic's
