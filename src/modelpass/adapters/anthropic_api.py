@@ -1231,6 +1231,11 @@ def _client_kwargs(sdk: Any, *, api_key: str, base_url: str | None) -> dict[str,
     return {
         "api_key": api_key,
         "base_url": base_url or _DEFAULT_BASE_URL,
+        # modelpass never retries, and the layer under it must not either:
+        # the SDK's default of two retries on 429/5xx/timeouts would hold a
+        # quota failover behind two backoffs, ignore ``retry = "never"``, and
+        # re-send a request the vendor may already have billed.
+        "max_retries": 0,
         "default_headers": {"Authorization": sdk.Omit()},
     }
 

@@ -1461,7 +1461,14 @@ def _client_kwargs(*, api_key: str, base_url: str | None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "api_key": api_key,
         "vertexai": False,
-        "http_options": {"base_url": base_url or _DEFAULT_BASE_URL},
+        "http_options": {
+            "base_url": base_url or _DEFAULT_BASE_URL,
+            # modelpass never retries, and the layer under it must not either.
+            # One attempt is this SDK's default today (``retry_args(None)``,
+            # google-genai 1.73.1); saying it keeps a later default from
+            # re-sending a request the vendor may already have billed.
+            "retry_options": {"attempts": 1},
+        },
     }
     debug_config = getattr(importlib.import_module(f"{_MODULE}.client"), "DebugConfig", None)
     if debug_config is not None:
