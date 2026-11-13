@@ -38,7 +38,7 @@ from modelpass.adapters.anthropic import (
 )
 from modelpass.adapters.anthropic import _scrubbed_process_env as scrubbed_process_env
 from modelpass.adapters.base import RunRequest, SessionRequest
-from modelpass.connections import Guards
+from modelpass.connections import CredentialRef, Guards
 from modelpass.errors import (
     AuthModeMismatch,
     CapabilityNotSupported,
@@ -1703,6 +1703,88 @@ def test_scrub_catches_a_variable_the_plan_never_saw(monkeypatch, subscription_c
 
     with scrubbed_process_env(plan):
         assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+def test_modelpass_reads_the_whole_environment_while_a_spawn_is_scrubbing(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """A subscription spawn must not cost a concurrent API call its key.
+
+    The scrub takes ``ANTHROPIC_API_KEY`` out of ``os.environ`` so the child
+    cannot inherit it. ``Bridge.env`` was the live ``os.environ``, so an
+    ``anthropic-api`` call resolving ``env:ANTHROPIC_API_KEY`` on another thread
+    during that spawn found no key and failed as if none were configured
+    (2026-11-13).
+    """
+    import threading
+
+    from modelpass.adapters import anthropic as module
+    from modelpass.bridge import Bridge
+    from modelpass.capabilities import CapabilityRegistry
+    from modelpass.store import ConnectionStore
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-for-the-api-connection")
+    bridge = Bridge(
+        store=ConnectionStore(tmp_path / "home"), registry=CapabilityRegistry(), adapters={}
+    )
+    plan = plan_launch(subscription_connection, {})
+    assert bridge.env is os.environ, "outside a spawn the live mapping is the answer"
+
+    seen: dict[str, Any] = {}
+
+    def another_call():
+        # No waiting on the spawn: this must answer while the scrub is held.
+        seen["key"] = bridge.env.get("ANTHROPIC_API_KEY")
+        seen["credential_present"] = plan_launch(
+            replace(
+                subscription_connection,
+                name="claude-api",
+                runtime=Runtime.ANTHROPIC_API,
+                auth_mode=AuthMode.API_KEY,
+                credential_ref=CredentialRef.parse("env:ANTHROPIC_API_KEY"),
+            ),
+            bridge.env,
+        ).credential_present
+
+    with scrubbed_process_env(plan):
+        assert "ANTHROPIC_API_KEY" not in os.environ  # what the child inherits
+        thread = threading.Thread(target=another_call)
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive(), "a reader must never queue behind a spawn"
+        assert module.process_env()["PATH"] == os.environ["PATH"]
+
+    assert seen == {"key": "sk-ant-for-the-api-connection", "credential_present": True}
+    assert bridge.env is os.environ
+    assert module._SCRUBBED_NOW == {}
+
+
+def test_a_scrub_that_raises_leaves_nothing_recorded(monkeypatch, subscription_connection):
+    from modelpass.adapters import anthropic as module
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+    plan = plan_launch(subscription_connection, {})
+    with pytest.raises(RuntimeError):
+        with scrubbed_process_env(plan):
+            assert module._SCRUBBED_NOW["ANTHROPIC_API_KEY"] == "sk-ant-x"
+            raise RuntimeError("boom")
+    assert module._SCRUBBED_NOW == {}
+    assert module.process_env() is os.environ
+
+
+def test_an_injected_environment_is_never_replaced_by_the_process_one(tmp_path):
+    from modelpass.bridge import Bridge
+    from modelpass.capabilities import CapabilityRegistry
+    from modelpass.store import ConnectionStore
+
+    injected = {"ONLY": "this"}
+    bridge = Bridge(
+        store=ConnectionStore(tmp_path / "home"),
+        registry=CapabilityRegistry(),
+        adapters={},
+        env=injected,
+    )
+    assert bridge.env is injected
 
 
 # --- the allowance question the receipt cannot answer ---------------------------

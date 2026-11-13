@@ -17,7 +17,11 @@ Three things in here are load-bearing and worth reading before changing:
    *last* in Claude Code's precedence, silently win and move the run onto
    metered billing. :func:`_scrubbed_process_env` therefore removes the planned
    names from ``os.environ`` for the duration of the spawn, under a lock, and
-   restores them afterwards. See the deviation note in that function.
+   restores them afterwards. See the deviation note in that function. Since
+   2026-11-13 "the spawn" means the transport's own ``connect()`` and not the
+   client's, which also covered the initialize handshake
+   (:func:`_planned_env_transport`), and modelpass's own readers go through
+   :func:`process_env`, which never shows them the gap.
 2. **Subscription connections fail closed.** If the preflight cannot confirm a
    usable subscription credential, it reports ``ok=False`` and the bridge raises
    rather than letting the runtime fall through to an API key.
@@ -184,8 +188,19 @@ _MODULE = "claude_agent_sdk"
 _EXTRA = "anthropic"
 _PACKAGE = "claude-agent-sdk"
 
-#: Serializes the ``os.environ`` mutation in :func:`_scrubbed_process_env`.
+#: Serializes the spawns that scrub: one at a time holds ``os.environ`` in the
+#: shape its plan describes (:func:`_scrubbed_process_env`). Held for as long as
+#: a spawn takes, so nothing but another spawn may wait on it.
 _ENV_LOCK = threading.RLock()
+
+#: Guards the two things a scrub changes together -- ``os.environ`` and
+#: :data:`_SCRUBBED_NOW` -- for the instant it changes them. Never held across
+#: a spawn, which is what lets :func:`process_env` take it on every call.
+_ENV_STATE_LOCK = threading.Lock()
+
+#: What the spawn in progress has taken out of ``os.environ``, name to value.
+#: Empty whenever no spawn is in progress.
+_SCRUBBED_NOW: dict[str, str] = {}
 
 #: How long a ``claude auth status`` answer is reused for, in seconds.
 #:
@@ -408,25 +423,160 @@ def _scrubbed_process_env(plan: PreflightPlan) -> Iterator[tuple[str, ...]]:
       still a race we cannot close from here; it is documented rather than
       hidden.
 
+    **What is still exposed while this is held** (2026-11-13), stated because it
+    cannot be closed from here: anything in the process that is *not* modelpass
+    and reads ``os.environ``, or starts a child that inherits it, does not see
+    the removed names until the spawn returns. modelpass's own readers are not
+    exposed: they ask :func:`process_env`, which puts the names back in the
+    answer. The removed values are recorded for that purpose before they leave
+    ``os.environ`` and forgotten only after they are back.
+
     Yields the names actually removed, so a caller (or a test) can assert on the
     guarantee rather than take it on trust.
     """
     with _ENV_LOCK:
-        # Decided under the lock (2026-09-28): computed before it, a run waiting
-        # on another run's spawn read that run's already-scrubbed environment,
-        # found nothing to remove, and spawned after the key was restored.
-        live_names = env_names_to_scrub(plan.runtime, os.environ, preserve=plan.kept)
-        remove = sorted(set(live_names) | set(plan.scrubbed))
         saved: dict[str, str] = {}
         try:
-            for name in remove:
-                if name in os.environ:
-                    saved[name] = os.environ[name]
+            with _ENV_STATE_LOCK:
+                # Decided under the lock (2026-09-28): computed before it, a run
+                # waiting on another run's spawn read that run's
+                # already-scrubbed environment, found nothing to remove, and
+                # spawned after the key was restored.
+                live_names = env_names_to_scrub(
+                    plan.runtime, os.environ, preserve=plan.kept
+                )
+                for name in sorted(set(live_names) | set(plan.scrubbed)):
+                    if name in os.environ:
+                        saved[name] = os.environ[name]
+                _SCRUBBED_NOW.update(saved)
+                for name in saved:
                     del os.environ[name]
             yield tuple(saved)
         finally:
-            for name, value in saved.items():
-                os.environ[name] = value
+            with _ENV_STATE_LOCK:
+                for name, value in saved.items():
+                    os.environ[name] = value
+                    _SCRUBBED_NOW.pop(name, None)
+
+
+def process_env() -> Mapping[str, str]:
+    """The process environment as it stands outside any spawn's scrub.
+
+    ``os.environ`` itself whenever no ``anthropic-sdk`` spawn is in progress,
+    which is nearly always, so nothing about a live mapping changes for a
+    reader. While one is, a copy with the names that spawn removed put back:
+    a subscription spawn takes ``ANTHROPIC_API_KEY`` out of ``os.environ``, and
+    an ``anthropic-api`` call resolving ``env:ANTHROPIC_API_KEY`` on another
+    thread at that moment used to find it missing (2026-11-13).
+
+    :attr:`modelpass.Bridge.env` answers with this once this module has been
+    imported. It never waits on a spawn: the lock it takes is held only while a
+    scrub edits ``os.environ``.
+    """
+    with _ENV_STATE_LOCK:
+        if not _SCRUBBED_NOW:
+            return os.environ
+        env = dict(os.environ)
+        for name, value in _SCRUBBED_NOW.items():
+            # ``os.environ`` upper-cases names on Windows; a plain dict does not.
+            env.setdefault(name.upper() if os.name == "nt" else name, value)
+        return env
+
+
+async def _no_prompt() -> Any:
+    """The empty input stream ``ClaudeSDKClient.connect`` gives its own transport."""
+    return
+    yield {}  # pragma: no cover - makes this an async generator
+
+
+#: ``SubprocessCLITransport`` -> the subclass of it built below, so the class is
+#: made once per SDK class rather than once per spawn.
+_PLANNED_TRANSPORTS: dict[type, type] = {}
+
+
+def _planned_env_transport(sdk: Any, options: Any, plan: PreflightPlan) -> Any:
+    """The SDK's own subprocess transport, scrubbing across its own spawn only.
+
+    **Why this exists** (2026-11-13). The scrub has to cover the instant the
+    transport reads ``os.environ`` and starts the child, and nothing else. It
+    used to wrap ``ClaudeSDKClient.connect()``, which goes on to the initialize
+    handshake -- up to a minute, on a runtime that is slow to come up -- so the
+    key stayed out of the process environment, and every other ``anthropic-sdk``
+    spawn stayed queued, for the whole of it. ``ClaudeSDKClient`` takes a
+    ``transport``; this is the SDK's ``SubprocessCLITransport`` with ``connect``
+    wrapped in the scrub and nothing else changed, so the command line, the
+    environment additions and the process handling are still the vendor's.
+
+    The environment is still not passed explicitly, because it cannot be: the
+    transport composes ``{**os.environ, **options.env}`` inside ``connect()``
+    (re-read on 0.2.180, and held by ``tests/test_anthropic_sdk_seams.py``).
+
+    Returns ``None`` where the narrow path is not available, and the caller
+    falls back to scrubbing across the whole ``connect()`` as before:
+
+    * ``sdk`` is not the vendor module (the stand-ins the suite runs on take
+      ``options`` and nothing else);
+    * the options carry ``can_use_tool`` or ``session_store``, which the client
+      configures on the transport it builds itself and skips for one it is
+      handed -- modelpass sets neither, so this is a caller's passthrough;
+    * the installed SDK no longer has the class or the parameter. That is a
+      fallback rather than an error because the wide scrub is still correct,
+      only wider.
+    """
+    if getattr(sdk, "__name__", None) != _MODULE:
+        return None
+    if getattr(options, "can_use_tool", None) is not None:
+        return None
+    if getattr(options, "session_store", None) is not None:
+        return None
+    try:
+        from claude_agent_sdk._internal.transport.subprocess_cli import (
+            SubprocessCLITransport,
+        )
+
+        if "transport" not in inspect.signature(sdk.ClaudeSDKClient.__init__).parameters:
+            return None
+        cls = _PLANNED_TRANSPORTS.get(SubprocessCLITransport)
+        if cls is None:
+
+            class _PlannedEnvTransport(SubprocessCLITransport):  # type: ignore[misc, valid-type]
+                modelpass_plan: PreflightPlan
+
+                async def connect(self) -> None:
+                    with _scrubbed_process_env(self.modelpass_plan):
+                        await super().connect()
+
+            cls = _PLANNED_TRANSPORTS[SubprocessCLITransport] = _PlannedEnvTransport
+        transport = cls(prompt=_no_prompt(), options=options)
+        transport.modelpass_plan = plan
+        return transport
+    except Exception:
+        return None
+
+
+def _planned_client(sdk: Any, options: Any, plan: PreflightPlan) -> tuple[Any, bool]:
+    """A ``ClaudeSDKClient`` for these options, and whether its spawn scrubs itself.
+
+    ``True`` means the client was given :func:`_planned_env_transport` and
+    :func:`_connect_planned` must not scrub again around it.
+    """
+    transport = _planned_env_transport(sdk, options, plan)
+    if transport is None:
+        return sdk.ClaudeSDKClient(options=options), False
+    return sdk.ClaudeSDKClient(options=options, transport=transport), True
+
+
+async def _connect_planned(
+    client: Any, spawn_scrubbed: bool, plan: PreflightPlan, prompt: str | None
+) -> None:
+    """Connect ``client`` with ``os.environ`` matching ``plan`` at the spawn."""
+    if spawn_scrubbed:
+        await client.connect(prompt)
+        return
+    # The whole of connect(), because there is no narrower place to stand: the
+    # transport snapshots os.environ somewhere inside it.
+    with _scrubbed_process_env(plan):
+        await client.connect(prompt)
 
 
 def _contributed_args(request: RunRequest | SessionRequest) -> tuple[str, ...]:
@@ -1946,18 +2096,17 @@ class AnthropicSessionHandle:
 
         ``connect(None)`` is the SDK's streaming mode with no initial prompt --
         the subprocess comes up and waits, and the first turn arrives through
-        ``query()`` like every turn after it. The scrub wraps only the connect,
-        because that is where the transport snapshots ``os.environ``; by the
-        second turn the child is already running with the environment the plan
-        described.
+        ``query()`` like every turn after it. The scrub covers only the spawn
+        (:func:`_planned_client`), because that is where the transport
+        snapshots ``os.environ``; by the second turn the child is already
+        running with the environment the plan described.
         """
         if self._client is not None:
             return self._client
         options = self._sdk.ClaudeAgentOptions(
             **_with_runnable_cli(self._sdk, self._options_kwargs))
-        client = self._sdk.ClaudeSDKClient(options=options)
-        with _scrubbed_process_env(self._request.plan):
-            await client.connect(None)
+        client, spawn_scrubbed = _planned_client(self._sdk, options, self._request.plan)
+        await _connect_planned(client, spawn_scrubbed, self._request.plan, None)
         self._client = client
         return client
 
@@ -2662,14 +2811,16 @@ class AnthropicAdapter(Adapter):
         self._runs.add(run)
 
         async def drive() -> None:
-            client = sdk.ClaudeSDKClient(options=sdk.ClaudeAgentOptions(
-                **_with_runnable_cli(sdk, options_kwargs)))
+            client, spawn_scrubbed = _planned_client(
+                sdk,
+                sdk.ClaudeAgentOptions(**_with_runnable_cli(sdk, options_kwargs)),
+                request.plan,
+            )
             run.attach(asyncio.get_running_loop(), client)
             try:
                 # The scrub is only needed while the child is being spawned: the
                 # transport snapshots os.environ inside connect().
-                with _scrubbed_process_env(request.plan):
-                    await client.connect(prompt)
+                await _connect_planned(client, spawn_scrubbed, request.plan, prompt)
                 async for message in client.receive_response():
                     assert_expected_auth_mode(message, request.connection.auth_mode)
                     for event in map_message(
