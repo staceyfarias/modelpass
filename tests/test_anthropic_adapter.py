@@ -9,8 +9,10 @@ is what the mapper dispatches on).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -2554,6 +2556,188 @@ def test_a_closed_session_refuses_another_turn(monkeypatch, session_request):
     handle.close()
     with pytest.raises(VendorRunFailed, match="closed"):
         handle.send("hello")
+
+
+# --- a turn cancelled while connecting, and a turn that fails midway (2026-11-13) --
+
+
+class HangingConnectClient(SessionClient):
+    """A client whose first connect never returns: a hung initialize handshake."""
+
+    hang = True
+
+    def __init__(self, options, sdk):
+        super().__init__(options, sdk)
+        self.connect_cancelled = False
+
+    async def connect(self, prompt=None):
+        self.connects += 1
+        if type(self).hang:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.connect_cancelled = True
+                raise
+
+
+def _drain_in_a_thread(stream, seconds=5.0):
+    """Consume ``stream`` off-thread, so a turn that never ends fails the test."""
+    import threading
+
+    out: dict[str, Any] = {"events": []}
+
+    def consume():
+        try:
+            for event in stream:
+                out["events"].append(event)
+        except BaseException as exc:
+            out["error"] = exc
+
+    thread = threading.Thread(target=consume, daemon=True)
+    thread.start()
+    return thread, out, seconds
+
+
+def test_a_turn_can_be_cancelled_while_the_client_is_still_connecting(
+    monkeypatch, session_request
+):
+    """The turn's cancel was a no-op until ``connect()`` had returned.
+
+    A bound fires once. On a hung spawn or handshake it reached a handle with
+    no client yet, did nothing, and the consumer stayed blocked for as long as
+    the runtime did -- then the turn ran anyway, with nobody reading it.
+    """
+
+    class Client(HangingConnectClient):
+        hang = True
+
+    sdk = SessionSdk()
+    sdk.client_cls = Client
+    handle = session_adapter(monkeypatch, sdk).open_session(session_request())
+
+    stream = handle.send("one")
+    thread, out, seconds = _drain_in_a_thread(stream)
+    deadline = time.monotonic() + 2
+    while not sdk.clients and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    stream.cancel()  # what the timeout watchdog calls, from its own thread
+    thread.join(seconds)
+    assert not thread.is_alive(), "the cancelled turn never ended"
+
+    assert "error" not in out
+    assert [e.status for e in out["events"]] == [TerminalStatus.CANCELLED]
+    client = sdk.clients[0]
+    assert client.connect_cancelled is True
+    assert client.queries == [], "nothing was sent to a runtime that never came up"
+
+    # Nothing ran, so nothing is out of step: the next turn connects afresh.
+    assert handle._broken is None
+    Client.hang = False
+    events = list(handle.send("two"))
+    assert events[-1].status is TerminalStatus.OK
+    assert len(sdk.clients) == 2
+    assert sdk.clients[1].queries == ["two"]
+    handle.close()
+
+
+class FailsMidTurnClient(SessionClient):
+    """Streams part of an answer, then the stream raises: the turn is still running."""
+
+    async def receive_response(self):
+        yield StreamEvent(
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "part"}}
+        )
+        raise VendorException("stream decode failed")
+
+
+def test_a_turn_that_fails_before_its_result_stops_the_runtime_and_ends_the_session(
+    monkeypatch, session_request
+):
+    """The vendor turn was left running and the next send read its leftovers."""
+    sdk = SessionSdk()
+    sdk.client_cls = FailsMidTurnClient
+    handle = session_adapter(monkeypatch, sdk).open_session(session_request())
+
+    with pytest.raises(VendorRunFailed, match="stream decode failed"):
+        list(handle.send("one"))
+
+    client = sdk.clients[0]
+    assert client.interrupts == 1
+    assert client.disconnects == 1
+    with pytest.raises(VendorRunFailed, match="failed before the runtime reported"):
+        handle.send("two")
+    assert client.queries == ["one"]
+    handle.close()
+    assert client.disconnects == 1, "close() does not disconnect a second time"
+
+
+def test_an_auth_mode_mismatch_stops_the_turn_it_was_found_in(
+    monkeypatch, session_request
+):
+    """The refusal raised, and the metered turn it refused kept running."""
+    sdk = SessionSdk(
+        turns=[[SystemMessage("init", {"apiKeySource": "ANTHROPIC_API_KEY"}), ResultMessage()]]
+    )
+    handle = session_adapter(monkeypatch, sdk).open_session(session_request())
+
+    with pytest.raises(AuthModeMismatch):
+        list(handle.send("one"))
+
+    client = sdk.clients[0]
+    assert client.interrupts == 1
+    assert client.disconnects == 1
+    with pytest.raises(VendorRunFailed, match="AuthModeMismatch"):
+        handle.send("two")
+    handle.close()
+
+
+class RaisesAfterResultClient(SessionClient):
+    """The SDK's habit: an error ``ResultMessage``, then an exception about it."""
+
+    async def receive_response(self):
+        if len(self.queries) == 1:
+            yield ResultMessage(
+                session_id="sess-1", is_error=True, subtype="error_during_execution"
+            )
+            raise VendorException("the CLI reported an error result")
+        yield ResultMessage(session_id="sess-1")
+
+
+def test_a_failure_after_the_result_leaves_the_session_usable(monkeypatch, session_request):
+    """The turn is over on the vendor's side, so there is nothing to stop."""
+    sdk = SessionSdk()
+    sdk.client_cls = RaisesAfterResultClient
+    handle = session_adapter(monkeypatch, sdk).open_session(session_request())
+
+    with contextlib.suppress(VendorRunFailed):
+        list(handle.send("one"))
+
+    client = sdk.clients[0]
+    assert handle._broken is None
+    assert client.interrupts == 0 and client.disconnects == 0
+    assert list(handle.send("two"))[-1].status is TerminalStatus.OK
+    handle.close()
+
+
+class FailsToConnectClient(SessionClient):
+    async def connect(self, prompt=None):
+        self.connects += 1
+        raise VendorException("Failed to start Claude Code")
+
+
+def test_a_failed_connect_is_reported_and_the_next_turn_tries_again(
+    monkeypatch, session_request
+):
+    sdk = SessionSdk()
+    sdk.client_cls = FailsToConnectClient
+    handle = session_adapter(monkeypatch, sdk).open_session(session_request())
+    with pytest.raises(VendorRunFailed, match="Failed to start"):
+        list(handle.send("one"))
+    assert handle._broken is None
+    sdk.client_cls = SessionClient
+    assert list(handle.send("two"))[-1].status is TerminalStatus.OK
+    handle.close()
 
 
 # --- history -------------------------------------------------------------------

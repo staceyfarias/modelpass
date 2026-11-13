@@ -1751,6 +1751,11 @@ class AnthropicSessionHandle:
         self._closed = False
         self._streaming = False
         self._broken: str | None = None
+        #: The turn now running, as the future its coroutine was scheduled on,
+        #: and whether its cancel arrived before there was a client to
+        #: interrupt. Both belong to one turn and are reset by the next.
+        self._turn: Any = None
+        self._cancelled_connecting = False
 
     # --- identity ----------------------------------------------------------------
 
@@ -1809,7 +1814,9 @@ class AnthropicSessionHandle:
         # events are bounded by the turn itself; a deadlocked session is not.
         items: queue.Queue[Any] = queue.Queue()
         loop = self._ensure_loop()
+        self._cancelled_connecting = False
         future = asyncio.run_coroutine_threadsafe(self._drive_turn(message, items), loop)
+        self._turn = future
         self._streaming = True
         # The turn's own cancel is this session's interrupt. A bounded turn is
         # cancelled through it, never through the adapter, which every session
@@ -1824,6 +1831,13 @@ class AnthropicSessionHandle:
                 if item is _TURN_DONE:
                     completed = True
                     break
+                if isinstance(item, asyncio.CancelledError) and self._cancelled_connecting:
+                    # The turn was cancelled before the client had connected
+                    # (:meth:`_interrupt`). Nothing was sent, so there is no
+                    # vendor result to wait for: the cancel is the outcome, said
+                    # the way the run path says it.
+                    yield _bare_terminal(TerminalStatus.CANCELLED, "cancelled by caller")
+                    continue
                 if isinstance(item, BaseException):
                     # Same rule as the run path: an exception whose type belongs
                     # to the vendor package is the vendor reporting a failed
@@ -1850,10 +1864,17 @@ class AnthropicSessionHandle:
         # result inside one exchange, and a table that outlived the turn would
         # only accumulate.
         tool_names: dict[str, str] = {}
+        # Whether the turn reached the runtime, and whether the runtime said it
+        # was over. Between the two, a failure leaves a vendor turn running.
+        asked = False
+        result_seen = False
         try:
             client = await self._ensure_client()
+            asked = True
             await client.query(message)
             async for vendor_message in client.receive_response():
+                if type(vendor_message).__name__ == "ResultMessage":
+                    result_seen = True
                 assert_expected_auth_mode(vendor_message, self._request.connection.auth_mode)
                 self._remember_session_id(vendor_message)
                 for event in map_message(
@@ -1866,12 +1887,45 @@ class AnthropicSessionHandle:
                 ):
                     items.put(event)
         except BaseException as exc:
+            if asked and not result_seen:
+                await self._stop_failed_turn(exc)
             # Handed to the consumer to classify, not swallowed: the drain
             # decides whether this was the vendor reporting a failed turn or a
             # bug of ours, and either way it reaches the caller.
             items.put(exc)
         finally:
             items.put(_TURN_DONE)
+
+    async def _stop_failed_turn(self, exc: BaseException) -> None:
+        """A turn ended in an exception before the runtime reported its result.
+
+        modelpass has stopped reading and the runtime has not stopped working:
+        the vendor turn is still running -- on a metered key, if the exception
+        is :class:`~modelpass.errors.AuthModeMismatch` -- and whatever it goes
+        on to say would be the first thing the next ``send`` read (2026-11-13).
+        So the turn is interrupted, the client is disconnected, which is the
+        floor that ends the child process whether or not the interrupt landed,
+        and the session says it is over rather than pretending to know where
+        the conversation stands. A persisted session is still on disk and can
+        be resumed by id.
+
+        Every step is bounded and none may raise: this runs on the way to
+        reporting ``exc``, and that report must arrive.
+        """
+        self._broken = (
+            "the previous turn on this session failed before the runtime reported "
+            f"its result ({type(exc).__name__}: {exc}), so the runtime and "
+            "modelpass no longer agree on where the conversation is. Close this "
+            "session and open a new one, or resume it by id if it was persisted"
+        )
+        client, self._client = self._client, None
+        if client is None:
+            return
+        for step, seconds in ((client.interrupt, 5.0), (client.disconnect, 10.0)):
+            try:
+                await asyncio.wait_for(step(), timeout=seconds)
+            except BaseException:
+                continue
 
     def _remember_session_id(self, message: Any) -> None:
         """Take the id from the runtime's own ``ResultMessage``, every turn.
@@ -1936,8 +1990,29 @@ class AnthropicSessionHandle:
         )
 
     def _interrupt(self) -> None:
+        """This turn's cancel: the watchdog's, and an abandoned iterator's.
+
+        With a client, the runtime's own graceful interrupt -- the turn ends
+        with a result and the session carries on.
+
+        **Without one, the turn is still connecting, and its coroutine is
+        cancelled instead** (2026-11-13). This was a no-op until ``connect()``
+        had returned, and a bound fires once: on a hung spawn or initialize
+        handshake the cancel was spent on nothing, the consumer stayed blocked
+        for as long as the runtime did, and the turn then ran unread. The SDK's
+        ``connect()`` disconnects itself on the way out of a cancellation, so
+        the half-started child goes with it. No message was sent, so the
+        session is not out of step with anything and the next turn connects
+        afresh.
+        """
         loop, client = self._loop, self._client
-        if loop is None or client is None or loop.is_closed():
+        if loop is None or loop.is_closed():
+            return
+        if client is None:
+            turn = self._turn
+            if turn is not None and not turn.done():
+                self._cancelled_connecting = True
+                turn.cancel()
             return
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(client.interrupt(), loop).result(timeout=5)
