@@ -556,6 +556,31 @@ def test_a_hand_edited_utilization_is_repaired_like_the_token_counts_are(tmp_pat
     assert record["allowance_status"] is None
 
 
+def test_an_infinite_count_is_repaired_and_does_not_stop_the_read(tmp_path):
+    """``json`` reads a bare ``Infinity``, and ``int()`` of it is an OverflowError.
+
+    One such line made ``read()`` raise for the whole log, which is the opposite
+    of what the repair beside it is for.
+    """
+    log = RunLog(tmp_path)
+    log.path.parent.mkdir(parents=True, exist_ok=True)
+    line = (
+        '{"timestamp": "2026-08-30T00:00:00+00:00", "connection": "claude-sub", '
+        '"runtime": "anthropic-sdk", "auth_mode": "subscription", "status": "ok", '
+        '"input_tokens": Infinity, "output_tokens": -Infinity, "total_tokens": NaN, '
+        '"allowance_utilization": Infinity}'
+    )
+    good = json.dumps({"connection": "after", "input_tokens": 7})
+    log.path.write_text(line + "\n" + good + "\n", encoding="utf-8")
+    second, first = log.read()  # newest first
+    assert first["connection"] == "claude-sub"
+    assert first["input_tokens"] == 0
+    assert first["output_tokens"] == 0
+    assert first["total_tokens"] == 0
+    assert first["allowance_utilization"] is None
+    assert second["input_tokens"] == 7
+
+
 def test_an_unreadable_epoch_costs_the_field_and_not_the_record():
     record = RunRecord.from_terminal(
         TerminalEvent(

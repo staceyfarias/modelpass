@@ -677,7 +677,18 @@ class Bridge:
 
     @property
     def env(self) -> Mapping[str, str]:
-        return os.environ if self._env is None else self._env
+        if self._env is not None:
+            return self._env
+        # An ``anthropic-sdk`` spawn takes credential variables out of
+        # ``os.environ`` for the instant the child starts. A call on another
+        # thread must not resolve its own credential against that gap
+        # (2026-11-13), so the adapter that makes it answers for the
+        # environment. Read from ``sys.modules`` rather than imported: if the
+        # module was never loaded, no spawn of its kind can be in progress.
+        import sys
+
+        scrubbing = sys.modules.get("modelpass.adapters.anthropic")
+        return os.environ if scrubbing is None else scrubbing.process_env()
 
     def connections(self) -> tuple[Connection, ...]:
         """Every configured connection. Empty on a fresh install, by design (D2)."""

@@ -17,13 +17,14 @@ import sqlite3
 import threading
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from .capabilities import Capability
+from .connections import Guards, QuotaPolicy
 from .errors import ConversationBusy, ConversationError, ConversationNotFound
 from .runtimes import Runtime
 from .tools import ToolDef, normalize_tools
@@ -620,7 +621,7 @@ class Conversation:
                 "Conversation binding/history cannot be overridden on send: "
                 + ", ".join(sorted(forbidden))
             )
-        return {
+        request = {
             "connection": data["connection"],
             "model": data["model"],
             "message": message,
@@ -630,6 +631,17 @@ class Conversation:
             "allow_failover": False,
             **controls,
         }
+        guards = request.get("guards")
+        if isinstance(guards, Guards):
+            # ``allow_failover`` is one of the bridge's guard shorthands, and it
+            # refuses ``guards=`` beside any of them -- so a whole Guards object
+            # on a managed send always raised InvalidGuards (2026-11-13). The
+            # rule the shorthand stood for is written onto the caller's object
+            # instead: a managed conversation is bound to one connection and
+            # never fails over.
+            del request["allow_failover"]
+            request["guards"] = replace(guards, on_quota_exhausted=QuotaPolicy())
+        return request
 
     def send(self, message: str, **controls: Any) -> Iterator[AgentEvent]:
         _text(message, "message")

@@ -334,3 +334,70 @@ def test_passing_both_forms_is_refused_rather_than_resolved(
             stop_at_tokens=20,
         )
     assert fake.preflights == []
+
+
+# --- a session's ceiling counts every turn (2026-11-13) ---------------------------
+
+
+def test_a_run_total_is_added_on_top_of_the_turns_before_it():
+    """``run_total`` is the total of *this run*, and a session is many runs.
+
+    The tracker used to take the maximum of the session's figure and each
+    turn's own total, so three turns of 1000 tokens read 1000.
+    """
+    tracker = GuardTracker(Guards(stop_at_tokens=1_500), "c")
+    tracker.begin_turn()
+    assert tracker.observe(TokenUsage(input_tokens=1_000), UsageScope.RUN_TOTAL) == []
+    tracker.begin_turn()
+    events = tracker.observe(TokenUsage(input_tokens=1_000), UsageScope.RUN_TOTAL)
+    assert tracker.total.total_tokens == 2_000
+    assert [e.type for e in events] == ["guard_stop"]
+
+
+def test_interim_deltas_and_the_final_total_of_one_turn_are_still_counted_once():
+    """The rule ``at_least`` exists for, held per turn rather than per session."""
+    tracker = GuardTracker(Guards(), "c")
+    tracker.begin_turn()
+    tracker.observe(TokenUsage(input_tokens=500), UsageScope.RUN_TOTAL)
+    tracker.begin_turn()
+    tracker.observe(TokenUsage(input_tokens=300), UsageScope.DELTA)
+    tracker.observe(TokenUsage(input_tokens=400), UsageScope.DELTA)
+    tracker.observe(TokenUsage(input_tokens=700), UsageScope.RUN_TOTAL)
+    assert tracker.total.total_tokens == 1_200
+
+
+def test_a_session_stops_when_its_turns_together_cross_the_ceiling(tmp_path):
+    """Three turns of 1000 tokens against ``stop_at_tokens=1500`` never stopped."""
+    from modelpass.connections import Connection, CredentialRef
+    from modelpass.errors import GuardStop
+    from modelpass.runtimes import Runtime
+    from modelpass.testing import fake_session_bridge
+    from modelpass.types import AuthMode, UsageEvent
+
+    connection = Connection(
+        name="claude-sub",
+        runtime=Runtime.ANTHROPIC_SDK,
+        auth_mode=AuthMode.SUBSCRIPTION,
+        credential_ref=CredentialRef.native_login(),
+        guards=Guards(stop_at_tokens=1_500),
+    )
+    bridge, _, _ = fake_session_bridge(
+        connections=[connection],
+        script=[
+            UsageEvent(usage=TokenUsage(input_tokens=1_000), scope=UsageScope.RUN_TOTAL)
+        ],
+        home=tmp_path / "modelpass",
+    )
+    session = bridge.new_chat(connection="claude-sub", persist=False)
+    try:
+        first = list(session.send("one"))
+        assert first[-1].status is TerminalStatus.OK
+        second = list(session.send("two"))
+        assert second[-1].status is TerminalStatus.GUARD_STOP
+        # The terminal still carries this turn's own spend, not the session's.
+        assert second[-1].usage.total_tokens == 1_000
+        assert session.usage.total_tokens == 2_000
+        with pytest.raises(GuardStop):
+            session.send("three")
+    finally:
+        session.close()
