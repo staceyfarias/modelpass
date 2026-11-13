@@ -944,6 +944,41 @@ def test_loading_a_page_with_check_in_the_url_starts_no_vendor_probe(bench):
 # --- 3. playground ----------------------------------------------------------------
 
 
+def test_loading_the_playground_starts_nothing(bench, monkeypatch, tmp_path):
+    """GET /playground is a page load: no process, no preflight, no vendor.
+
+    The model picker is filled from the Codex CLI's own cache file and a static
+    alias table. If that ever becomes a live lookup it has to move behind a
+    POST and the token, like Check did.
+    """
+    import subprocess
+
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"a page load started a process: {args!r}")
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    fake = FakeAdapter()
+    api = FakeAdapter(runtime=Runtime.ANTHROPIC_API)
+    compat = FakeAdapter(runtime=Runtime.OPENAI_COMPATIBLE)
+    openai_fake = FakeAdapter(runtime=Runtime.OPENAI_SDK)
+    _, client, _, _ = bench(
+        [anthropic(), openai(), compatible(), anthropic_api()],
+        env={"ANTHROPIC_API_KEY": "sk-not-a-real-key"},
+        adapters={
+            Runtime.ANTHROPIC_SDK: fake,
+            Runtime.OPENAI_SDK: openai_fake,
+            Runtime.ANTHROPIC_API: api,
+            Runtime.OPENAI_COMPATIBLE: compat,
+        },
+        codex_root=tmp_path / "no-codex-here",
+    )
+    assert client.get("/playground").status_code == 200
+    for adapter in (fake, openai_fake, api, compat):
+        assert adapter.preflights == []
+        assert adapter.requests == []
+
+
 def test_the_playground_says_it_spends_real_allowance(bench):
     _, client, _, _ = bench([anthropic()])
     body = client.get("/playground").get_data(as_text=True)

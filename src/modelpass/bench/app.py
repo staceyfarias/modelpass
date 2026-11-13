@@ -6,11 +6,18 @@ because a live event log is the one thing HTML cannot do on its own.
 
 Three rules this module holds to, each tested:
 
-1. **No secret is displayed or accepted.** The connection forms take
-   *pointers* -- an environment variable name -- and a pasted ``sk-...`` is
-   refused by the same :class:`CredentialRefIsSecret` validation the store uses.
-   The ambient-environment audit shows variable **names** only; no value read
-   from the environment reaches a template.
+1. **No secret is ever displayed, and one is accepted in exactly one field.**
+   The connection form takes *pointers* -- the runtime's own login, the name of
+   an environment variable, or nothing -- and a ``sk-...`` typed where a
+   variable name belongs is refused by the same :class:`CredentialRefIsSecret`
+   validation the store uses. The one exception is the pasted-key field
+   (ticket 1.14): a key typed there is read off the request once, handed to
+   the connection manager, written to ``secrets.toml`` and nowhere else, and
+   the connection keeps only a ``secret:<entry>`` pointer to it. It never
+   enters the form state a failed save re-renders, so it is never echoed back,
+   and no page shows a stored value. The ambient-environment audit shows
+   variable **names** only; no value read from the environment reaches a
+   template.
 2. **Every mutation is a POST, and so is anything that starts a vendor
    process.** A page on the internet can reach ``127.0.0.1`` in your browser,
    and the thing behind this one edits your connection file. So every request
@@ -944,6 +951,13 @@ def create_app(
 
     @app.route("/playground")
     def playground():
+        # A plain page load, and audited as one (2026-11-13): `models_for`
+        # reads the Codex CLI's own models_cache.json or a static alias table,
+        # and the verified list comes off the stored connection. No subprocess
+        # is started and no vendor is asked anything -- which is what lets this
+        # stay a GET. The live models endpoint (`Bridge.models(refresh=True)`)
+        # is deliberately not called from here; `test_loading_the_playground_
+        # starts_nothing` holds that.
         rows = []
         for connection in active.connections():
             runtime = connection.runtime
