@@ -410,6 +410,49 @@ def test_guard_stop_preserves_typed_terminal_and_is_not_a_successful_reply(setup
     assert not chat.history()
 
 
+def test_a_history_send_takes_a_whole_guards_object_and_still_never_fails_over(setup):
+    """``guards=`` used to meet the injected ``allow_failover=False`` and always raise.
+
+    The bridge refuses ``guards=`` beside any shorthand, and a managed send adds
+    the ``allow_failover`` shorthand itself -- so the one spelling that carries
+    a whole policy was unusable here. The conversation's rule (no failover: the
+    history is bound to one connection) is now written onto the caller's object.
+    """
+    from modelpass import GuardStop
+    from modelpass.connections import Guards, QuotaAction, QuotaPolicy
+
+    bridge, configs, _, store, connection = setup
+    configs.add(replace(connection, name="two"))
+    chat = store.create(connection="one")
+    asked_of_the_bridge = []
+    real_chat = bridge.chat
+
+    def spy(**kwargs):
+        asked_of_the_bridge.append(kwargs)
+        return real_chat(**kwargs)
+
+    bridge.chat = spy
+    events = list(chat.send("first", guards=Guards(warn_at_tokens=5)))
+    assert [e.type for e in events if e.type.startswith("guard")] == ["guard_warning"]
+
+    asked = Guards(
+        stop_at_tokens=1,
+        on_quota_exhausted=QuotaPolicy(action=QuotaAction.FAILOVER, failover="two"),
+    )
+    with pytest.raises(GuardStop):
+        list(chat.send("bounded", guards=asked, raise_on_stop=True))
+    assert chat.turns()[-1].status == "guard_stop"
+    ran = asked_of_the_bridge[-1]
+    assert "allow_failover" not in ran
+    assert ran["guards"].stop_at_tokens == 1
+    assert ran["guards"].on_quota_exhausted == QuotaPolicy()
+    # The caller's own object is not edited.
+    assert asked.on_quota_exhausted.action is QuotaAction.FAILOVER
+    # A send that passes no Guards object keeps the shorthand it always had.
+    list(chat.send("third"))
+    assert asked_of_the_bridge[-1]["allow_failover"] is False
+
+
 def test_error_reply_and_context_remain_inspectable_but_are_not_replayed(setup):
     from modelpass.testing import vendor_failure
 
