@@ -137,11 +137,11 @@ from .base import (
 from .openai_api import (
     OpenAIAPIAdapter,
     _bare_terminal,
-    _missing_tool,
     _vendor_failure,
     _vendor_payload,
     flatten,
     invoke_handler,
+    unrunnable,
 )
 
 __all__ = [
@@ -486,12 +486,13 @@ class _CallBuffer:
 def call_arguments(raw: str) -> dict[str, Any]:
     """A tool call's arguments, which arrive here as a JSON *string* in pieces.
 
-    The same two rules ``openai_api._call_arguments`` states, against a value
-    this transport assembles rather than delivers: unparseable JSON becomes
-    ``{}`` rather than an exception, so the handler sees an empty mapping and can
-    say so -- a failed tool result the model can act on instead of a dead run.
-    That failure mode is *more* likely here than on Responses, because the string
-    was concatenated from stream fragments and a truncated turn can end mid-JSON.
+    The same rule ``openai_api._call_arguments`` states, against a value this
+    transport assembles rather than delivers: unparseable JSON becomes ``{}``
+    rather than an exception, **for the ``tool_call`` event only**. No handler
+    is run with it -- the loop asks ``openai_api.unrunnable`` first, and a call
+    whose arguments did not parse is answered with a failed result. That matters
+    more here than on Responses, because the string was concatenated from stream
+    fragments and a truncated turn ends mid-JSON.
     """
     if isinstance(raw, Mapping):
         return dict(raw)
@@ -502,6 +503,22 @@ def call_arguments(raw: str) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _unfinished(finish_reason: str | None, buffer: _CallBuffer) -> bool:
+    """Whether this turn ended any way but well -- in which case no tool runs.
+
+    The verdict :func:`terminal_status` would give the turn if it were the last:
+    ``length``, ``content_filter``, or a refusal. Deliberately **not** "the
+    finish reason is ``tool_calls``": servers that end a tool-calling turn with
+    ``stop``, or with no finish reason at all, are real, and the calls they send
+    are whole. What must not run is a call beside an ending that says the turn
+    was cut.
+    """
+    status, _ = terminal_status(
+        finish_reason, unanswered_call=False, answered=True, refusal=buffer.refusal
+    )
+    return status is not TerminalStatus.OK
 
 
 def terminal_status(
@@ -986,9 +1003,16 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
             # A run that declared no tools has nothing to answer with, and
             # replying "not declared" round after round would be a loop with a
             # bill on it.
-            if not (request.tools and calls):
+            if not (request.tools and calls) or _unfinished(finish_reason, buffer):
+            # ... and a turn that was cut short has nothing to answer either:
+            # a call beside a truncated, filtered or failed ending is a call the
+            # model did not finish making, and a handler has side effects.
                 yield from self._finish_chat(
-                    request, finish_reason, final_text, bool(calls), buffer.refusal
+                    request,
+                    finish_reason,
+                    final_text,
+                    bool(calls) and not request.tools,
+                    buffer.refusal,
                 )
                 return
 
@@ -1033,11 +1057,9 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
                     )
                     return
                 tool = by_name.get(name)
-                payload = (
-                    invoke_handler(tool, arguments)
-                    if tool is not None
-                    else _missing_tool(name)
-                )
+                payload = unrunnable(name, tool, call["arguments"])
+                if payload is None:
+                    payload = invoke_handler(tool, arguments)
                 content = flatten_mcp_result(payload)
                 yield ToolResultEvent(
                     id=call_id,
@@ -1164,9 +1186,13 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
                 final_text = text
 
             calls = buffer.assembled()
-            if not (request.tools and calls):
+            if not (request.tools and calls) or _unfinished(finish_reason, buffer):
                 for out in self._finish_chat(
-                    request, finish_reason, final_text, bool(calls), buffer.refusal
+                    request,
+                    finish_reason,
+                    final_text,
+                    bool(calls) and not request.tools,
+                    buffer.refusal,
                 ):
                     yield out
                 return
@@ -1204,12 +1230,10 @@ class OpenAICompatibleAdapter(OpenAIAPIAdapter):
                     )
                     return
                 tool = by_name.get(name)
-                # The caller's own coroutine, awaited on the caller's own loop.
-                payload = (
-                    await ainvoke_handler(tool, arguments)
-                    if tool is not None
-                    else _missing_tool(name)
-                )
+                payload = unrunnable(name, tool, call["arguments"])
+                if payload is None:
+                    # The caller's own coroutine, awaited on the caller's own loop.
+                    payload = await ainvoke_handler(tool, arguments)
                 content = flatten_mcp_result(payload)
                 yield ToolResultEvent(
                     id=call_id,

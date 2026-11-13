@@ -617,6 +617,20 @@ def terminal_status(
     return TerminalStatus.OK, reason
 
 
+def _unfinished(finish_reason: Any, blocked: str | None) -> bool:
+    """Whether this turn ended any way but well -- in which case no tool runs.
+
+    The verdict :func:`terminal_status` would give the turn if it were the last:
+    ``MAX_TOKENS``, a blocked or broken finish reason
+    (``MALFORMED_FUNCTION_CALL`` among them), or a blocked prompt. A function
+    call beside one of those is a call the model did not finish making.
+    """
+    status, _ = terminal_status(
+        finish_reason, unanswered_call=False, blocked=blocked, answered=True
+    )
+    return status is not TerminalStatus.OK
+
+
 def _bare_terminal(
     status: TerminalStatus,
     reason: str | None,
@@ -1152,12 +1166,15 @@ class GoogleAPIAdapter(Adapter):
             # replying "not declared" round after round would be a loop with a
             # bill on it. The model should never ask -- it was sent no tools --
             # so if it does, the run ends and terminal_status() says why.
-            if not (request.tools and calls):
+            if not (request.tools and calls) or _unfinished(finish_reason, blocked):
+            # ... and a turn that was cut short has nothing to answer either:
+            # a call beside a truncated, filtered or failed ending is a call the
+            # model did not finish making, and a handler has side effects.
                 yield from self._finish(
                     request,
                     final_text,
                     finish_reason=finish_reason,
-                    unanswered_call=bool(calls),
+                    unanswered_call=bool(calls) and not request.tools,
                     blocked=blocked,
                     answered=answered,
                 )
@@ -1330,12 +1347,12 @@ class GoogleAPIAdapter(Adapter):
             if text:
                 final_text = text
 
-            if not (request.tools and calls):
+            if not (request.tools and calls) or _unfinished(finish_reason, blocked):
                 for out in self._finish(
                     request,
                     final_text,
                     finish_reason=finish_reason,
-                    unanswered_call=bool(calls),
+                    unanswered_call=bool(calls) and not request.tools,
                     blocked=blocked,
                     answered=answered,
                 ):

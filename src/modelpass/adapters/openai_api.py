@@ -637,6 +637,16 @@ def response_text(response: Any) -> str:
     return "".join(parts)
 
 
+def _unfinished(response: Any) -> bool:
+    """Whether this turn ended any way but well -- in which case no tool runs.
+
+    The verdict :func:`terminal_status` would give the turn if it were the last:
+    ``incomplete`` (the token ceiling, the content filter), ``failed``,
+    ``cancelled``, a refusal, or no response at all.
+    """
+    return terminal_status(response, unanswered_call=False)[0] is not TerminalStatus.OK
+
+
 def response_refusal(response: Any) -> str:
     """The model's refusal, if the finished response carries one, else ``""``.
 
@@ -850,14 +860,62 @@ def _missing_tool(name: str) -> dict[str, Any]:
     }
 
 
+def arguments_are_whole(raw: Any) -> bool:
+    """Whether a call's raw arguments are something a handler may be run with.
+
+    ``True`` for a mapping, for a string that parses as a JSON **object**, and
+    for no arguments at all -- ``None`` or ``""`` is how a model calls a tool
+    that takes none. ``False`` for anything else: a fragment cut off mid-string,
+    prose, a JSON list or scalar. Those used to become ``{}`` and reach the
+    handler, which is a caller's function run with arguments nobody sent.
+    """
+    if raw is None or isinstance(raw, Mapping):
+        return True
+    if not isinstance(raw, str):
+        return False
+    if not raw.strip():
+        return True
+    try:
+        return isinstance(json.loads(raw), dict)
+    except (TypeError, ValueError):
+        return False
+
+
+def unrunnable(name: str, tool: ToolDef | None, raw: Any) -> dict[str, Any] | None:
+    """The failed result for a call that must not reach a handler, else ``None``.
+
+    Two reasons, both answered to the model rather than ending the run: the
+    tool was never declared, or its arguments are not whole
+    (:func:`arguments_are_whole`). The model can ask again; the handler is not
+    called on a guess.
+    """
+    if tool is None:
+        return _missing_tool(name)
+    if not arguments_are_whole(raw):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"tool {name!r} was not run: its arguments were not a "
+                        "complete JSON object"
+                    ),
+                }
+            ],
+            "is_error": True,
+        }
+    return None
+
+
 def _call_arguments(call: Any) -> dict[str, Any]:
     """A function call's arguments, which arrive as a JSON *string* here.
 
     The other difference from Anthropic worth a function: ``tool_use.input`` is
     already a parsed object there, while ``ResponseFunctionToolCall.arguments``
-    is typed ``str``. Unparseable JSON becomes ``{}`` rather than an exception --
-    the handler then sees an empty mapping and can say so, which is a failed tool
-    result the model can act on instead of a dead run.
+    is typed ``str``. Unparseable JSON becomes ``{}`` rather than an exception,
+    and that ``{}`` is for the ``tool_call`` event only: the loop asks
+    :func:`unrunnable` before any handler runs, and a call whose arguments did
+    not parse is answered with a failed result instead.
     """
     raw = getattr(call, "arguments", None)
     if isinstance(raw, Mapping):
@@ -1251,8 +1309,13 @@ class OpenAIAPIAdapter(Adapter):
             # replying "not declared" round after round would be a loop with a
             # bill on it. The model should never ask -- it was sent no tools --
             # so if it does, the run ends and terminal_status() says why.
-            if not (request.tools and calls):
-                yield from self._finish(request, response, final_text, bool(calls))
+            if not (request.tools and calls) or _unfinished(response):
+            # ... and a turn that was cut short has nothing to answer either:
+            # a call beside a truncated, filtered or failed ending is a call the
+            # model did not finish making, and a handler has side effects.
+                yield from self._finish(
+                    request, response, final_text, bool(calls) and not request.tools
+                )
                 return
 
             # The whole assistant turn goes back verbatim -- reasoning items
@@ -1279,9 +1342,9 @@ class OpenAIAPIAdapter(Adapter):
                     )
                     return
                 tool = by_name.get(name)
-                payload = (
-                    invoke_handler(tool, arguments) if tool is not None else _missing_tool(name)
-                )
+                payload = unrunnable(name, tool, getattr(call, "arguments", None))
+                if payload is None:
+                    payload = invoke_handler(tool, arguments)
                 is_error = bool(payload.get("is_error"))
                 content = flatten_mcp_result(payload)
                 yield ToolResultEvent(
@@ -1397,8 +1460,10 @@ class OpenAIAPIAdapter(Adapter):
                 final_text = text
 
             calls = function_calls(response)
-            if not (request.tools and calls):
-                for out in self._finish(request, response, final_text, bool(calls)):
+            if not (request.tools and calls) or _unfinished(response):
+                for out in self._finish(
+                    request, response, final_text, bool(calls) and not request.tools
+                ):
                     yield out
                 return
 
@@ -1421,12 +1486,10 @@ class OpenAIAPIAdapter(Adapter):
                     )
                     return
                 tool = by_name.get(name)
-                # The caller's own coroutine, awaited on the caller's own loop.
-                payload = (
-                    await ainvoke_handler(tool, arguments)
-                    if tool is not None
-                    else _missing_tool(name)
-                )
+                payload = unrunnable(name, tool, getattr(call, "arguments", None))
+                if payload is None:
+                    # The caller's own coroutine, awaited on the caller's own loop.
+                    payload = await ainvoke_handler(tool, arguments)
                 is_error = bool(payload.get("is_error"))
                 content = flatten_mcp_result(payload)
                 yield ToolResultEvent(
