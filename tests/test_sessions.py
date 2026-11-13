@@ -953,6 +953,27 @@ def test_a_decided_terminal_is_logged_as_itself_when_the_caller_walks_away(sessi
     session.close()
 
 
+def test_a_turn_let_go_of_after_its_bound_fired_is_logged_as_timed_out(sessions):
+    """The same rule as the stateless call: ``EventFold.abandoned``."""
+    import time
+
+    bridge, _ = _abandon_bridge(
+        sessions, script=[usage(input_tokens=5), TextDeltaEvent(text="rest")]
+    )
+    session = bridge.new_chat(connection="claude-sub")
+    stream = session.send("one", timeout=0.05)
+    for event in stream:
+        if isinstance(event, UsageEvent):
+            break
+    time.sleep(0.4)  # the bound fires while the caller is holding the event
+    stream.close()
+
+    (record,) = bridge.run_log.read()
+    assert record["status"] == "timed_out"
+    assert record["input_tokens"] == 5
+    session.close()
+
+
 def test_a_turn_whose_stream_never_started_writes_nothing(sessions):
     bridge, made = _abandon_bridge(sessions, script=[TextDeltaEvent(text="hi")])
     session = bridge.new_chat(connection="claude-sub")

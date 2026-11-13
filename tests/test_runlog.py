@@ -922,6 +922,30 @@ def test_closing_after_the_terminal_was_decided_keeps_that_terminal(tmp_path):
     assert line["total_tokens"] == 7000
 
 
+def test_a_bound_that_fired_before_the_caller_let_go_is_written_as_the_timeout(tmp_path):
+    """The caller held an event past the bound and then closed: that is a timeout.
+
+    The fold had not been asked for another event, so it had decided nothing,
+    and the line read ``cancelled`` here while a session turn left the same way
+    read ``timed_out``. One rule now, ``EventFold.abandoned`` (2026-11-13).
+    """
+    import time
+
+    from modelpass.types import UsageEvent
+
+    bridge, _ = _abandonable(tmp_path, _long_script())
+    stream = bridge.chat(connection="claude-sub", message="hi", timeout=0.05)
+    for event in stream:
+        if isinstance(event, UsageEvent):
+            break
+    time.sleep(0.4)  # the bound fires while the caller is holding the event
+    stream.close()
+
+    (line,) = bridge.run_log.read()
+    assert line["status"] == "timed_out"
+    assert line["total_tokens"] == 7000
+
+
 def test_a_call_let_go_of_before_its_run_started_writes_nothing(tmp_path):
     """The receipt was read and the iterator closed: no run, so no line."""
     bridge, adapter = _abandonable(tmp_path, _long_script())

@@ -67,7 +67,21 @@ from .types import (
     VendorEvent,
 )
 
-__all__ = ["CallFold", "EventFold", "Leg", "RunFold", "TurnFold", "raise_for"]
+__all__ = [
+    "ABANDONED_REASON",
+    "CallFold",
+    "EventFold",
+    "Leg",
+    "RunFold",
+    "TurnFold",
+    "raise_for",
+]
+
+#: The reason on the ``cancelled`` terminal written for a run, or a session
+#: turn, whose iterator the caller closed before its terminal. Longer than an
+#: adapter's own ``cancelled by caller`` so a ledger reader can tell a run that
+#: was let go of from one whose ``cancel()`` was called and read to its end.
+ABANDONED_REASON = "cancelled by caller: the stream was closed before the run ended"
 
 
 class EventFold:
@@ -237,6 +251,23 @@ class EventFold:
         """The terminal this run ended with; ``ok`` where nothing else decided."""
         if self.stopped is None:
             self.stopped = self.terminal(TerminalStatus.OK, None)
+        return self.stopped
+
+    def abandoned(self) -> TerminalEvent:
+        """The terminal to record for a run whose caller let go before reading one.
+
+        One statement of it for the stateless call (:meth:`CallFold.abandon`)
+        and the session turn (``Session._finish_abandoned``), which were written
+        apart and differed (2026-11-13): a terminal already decided is kept as
+        itself, a bound that had fired and that nobody stayed to hear about is
+        the timeout it was, and anything else is ``cancelled`` with
+        :data:`ABANDONED_REASON` and the usage seen so far.
+        """
+        if self.stopped is None:
+            if self.deadline is not None and self.deadline.fired is not None:
+                self.stopped = self.timed_out()
+            else:
+                self.stopped = self.terminal(TerminalStatus.CANCELLED, ABANDONED_REASON)
         return self.stopped
 
     # --- the stamp --------------------------------------------------------------
@@ -676,7 +707,9 @@ class CallFold:
         cost; the vendor may have billed a little more that no event carried.
         Where the fold had already decided a terminal the caller did not stay
         to read -- a guard stop, a timeout -- that terminal is the truth and is
-        what is written. Nothing is written for a leg whose adapter was never
+        what is written, and a bound that fired while the caller was holding an
+        event is written as the timeout too (:meth:`EventFold.abandoned`, the
+        rule the session turn shares). Nothing is written for a leg whose adapter was never
         started, and nothing twice.
 
         No event comes of this: there is nobody left to hand one to.
@@ -684,12 +717,7 @@ class CallFold:
         if self._closed or not self.leg_running:
             return
         self._closed = True
-        stopped = self.fold.stopped
-        if stopped is None:
-            stopped = self.fold.terminal(
-                TerminalStatus.CANCELLED,
-                "cancelled by caller: the stream was closed before the run ended",
-            )
+        stopped = self.fold.abandoned()
         if self._failed_over_from is not None:
             stopped = replace(stopped, failed_over_from=self._failed_over_from)
         self.fold.stopped = stopped

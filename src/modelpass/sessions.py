@@ -763,19 +763,14 @@ class Session:
         built only to be recorded: the one the fold had already decided where
         there is one (a guard stop the caller did not stay for is still a guard
         stop, and still ends the session), the timeout where the bound is what
-        fired, and otherwise ``cancelled`` carrying this turn's usage so far.
+        fired, and otherwise ``cancelled`` carrying this turn's usage so far
+        (:meth:`EventFold.abandoned`, one rule and one reason string with the
+        stateless call).
         Called only for a turn whose stream was started, so a turn the runtime
         was never asked for writes nothing. The id is not read: a turn that did
         not finish names no session (:attr:`id`).
         """
-        if fold.stopped is None:
-            if fold.deadline is not None and fold.deadline.fired is not None:
-                fold.stopped = fold.timed_out()
-            else:
-                fold.stopped = fold.terminal(
-                    TerminalStatus.CANCELLED, "cancelled by caller"
-                )
-        self._finish_turn(fold.stopped, fold, abandoned=True)
+        self._finish_turn(fold.abandoned(), fold, abandoned=True)
 
     def _turn(
         self,
