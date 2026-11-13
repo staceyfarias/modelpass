@@ -935,10 +935,12 @@ class Bridge:
         """Run the full preflight and return the receipt, without starting a run.
 
         ``verify_identity`` is the setup-time switch (owner decision, 2026-10-01).
-        Off, which is what every run does, the receipt is built from the
-        connection's own credential store only: no vendor identity probe, no
-        comparison with the pinned account, and the account line reports what
-        was recorded at ``verify``. On -- ``modelpass check`` / ``verify`` /
+        Off, which is what every run does, the adapter checks that a login is
+        there and no more: no comparison with the pinned account, and the
+        account line reports what was recorded at ``verify``. (How it checks is
+        the adapter's: Codex reads ``auth.json``; ``anthropic-sdk`` asks
+        ``claude auth status`` and never opens Claude Code's credential
+        store.) On -- ``modelpass check`` / ``verify`` /
         ``connect`` and the bench -- the vendor is asked who is logged in and a
         mismatch with the pin fails the receipt.
 

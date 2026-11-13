@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -26,10 +25,8 @@ from modelpass.adapters.anthropic import (
     _tool_options,
     assert_expected_auth_mode,
     build_caller_tool_server,
-    credentials_path,
     map_message,
     parse_cli_version,
-    read_credential_status,
     session_info_from_sdk,
     session_messages_to_history,
     split_messages,
@@ -1140,183 +1137,32 @@ def test_non_init_messages_are_ignored_by_the_cross_check():
     assert_expected_auth_mode(AssistantMessage(), AuthMode.SUBSCRIPTION)
 
 
-# --- credential detection ------------------------------------------------------
-
-
-def _write_credentials(
-    tmp_path, *, expires_at: float, refresh: str, refresh_expires_at: float | None = None
-) -> dict[str, str]:
-    oauth: dict[str, Any] = {
-        "accessToken": "not-a-real-token",
-        "refreshToken": refresh,
-        "expiresAt": int(expires_at * 1000),
-        "subscriptionType": "pro",
-        "rateLimitTier": "default_claude_ai",
-    }
-    if refresh_expires_at is not None:
-        # Newer Claude Code writes this beside expiresAt, also in milliseconds.
-        oauth["refreshTokenExpiresAt"] = int(refresh_expires_at * 1000)
-    (tmp_path / ".credentials.json").write_text(
-        json.dumps({"claudeAiOauth": oauth}), encoding="utf-8"
-    )
-    return {"CLAUDE_CONFIG_DIR": str(tmp_path)}
-
-
-def test_credentials_path_honours_claude_config_dir(tmp_path):
-    env = {"CLAUDE_CONFIG_DIR": str(tmp_path)}
-    assert credentials_path(env) == tmp_path / ".credentials.json"
-
-
-@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
-def test_a_live_login_is_reported_usable(tmp_path):
-    env = _write_credentials(tmp_path, expires_at=time.time() + 3600, refresh="r")
-    status = read_credential_status(env)
-    assert status.present and status.usable and not status.expired
-    assert status.subscription_type == "pro"
-
-
-@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
-def test_an_expired_login_without_refresh_is_not_usable(tmp_path):
-    """The exact shape found on the dev machine: expired, no refresh token."""
-    env = _write_credentials(tmp_path, expires_at=time.time() - 3600, refresh="")
-    status = read_credential_status(env)
-    assert status.present and status.expired and not status.refreshable
-    assert not status.usable
-
-
-@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
-def test_an_expired_but_refreshable_login_stays_usable(tmp_path):
-    env = _write_credentials(tmp_path, expires_at=time.time() - 3600, refresh="r")
-    assert read_credential_status(env).usable
-
-
-@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
-def test_a_missing_login_is_reported_absent(tmp_path):
-    status = read_credential_status({"CLAUDE_CONFIG_DIR": str(tmp_path)})
-    assert not status.present and not status.usable
-
-
-def _write_logged_out_credentials(tmp_path) -> dict[str, str]:
-    """The shape Claude Code leaves on Windows when the CLI is logged out.
-
-    Observed on a real machine (2026-09-21): the secrets are blanked in place
-    and everything else stays, so the file still describes a plan in detail
-    while holding nothing that can authenticate.
-    """
-    (tmp_path / ".credentials.json").write_text(
-        json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "",
-                    "refreshToken": "",
-                    "expiresAt": 0,
-                    "subscriptionType": "max",
-                    "rateLimitTier": "default_claude_max_20x",
-                    "scopes": ["user:inference", "user:profile"],
-                },
-                "organizationUuid": "not-a-real-uuid",
-            }
-        ),
-        encoding="utf-8",
-    )
-    return {"CLAUDE_CONFIG_DIR": str(tmp_path)}
-
-
-@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
-def test_a_blanked_expiry_is_no_expiry_rather_than_the_epoch(tmp_path):
-    """``expiresAt: 0`` is a cleared field, not a token that lapsed in 1970.
-
-    Read as a timestamp it is always in the past, so `expired` came back True
-    for a login that never existed -- a fact stated about nothing.
-    """
-    status = read_credential_status(_write_logged_out_credentials(tmp_path))
-    assert status.expires_at is None
-    assert not status.expired
-
-
-@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
-def test_a_logged_out_file_is_told_apart_from_a_missing_one(tmp_path, tmp_path_factory):
-    """Both are `present=False` and both want `claude /login`; only one of them
-    also explains why a populated plan is sitting in the file."""
-    logged_out = read_credential_status(_write_logged_out_credentials(tmp_path))
-    missing = read_credential_status(
-        {"CLAUDE_CONFIG_DIR": str(tmp_path_factory.mktemp("empty"))}
-    )
-
-    assert not logged_out.present and not logged_out.usable
-    assert not missing.present and not missing.usable
-    assert logged_out.logged_out and not missing.logged_out
-    # The plan metadata is still readable, which is exactly what makes the
-    # "no login found" wording misleading without the flag.
-    assert logged_out.subscription_type == "max"
-
-
-def test_a_logged_out_cli_is_not_reported_as_no_login_at_all(
-    monkeypatch, subscription_connection
-):
-    """The receipt has to say the file was found and is empty.
-
-    Told only "no Claude Code login found" against a file that plainly holds a
-    plan, a reader concludes modelpass looked in the wrong place and goes
-    hunting for an external credential store. There is none on this platform:
-    the CLI is simply logged out.
-    """
-    adapter, module = _preflight_adapter(
-        monkeypatch, auth_status=lambda binary, env: {"loggedIn": False}
-    )
-    monkeypatch.setattr(
-        module,
-        "read_credential_status",
-        lambda env=None: module.CredentialStatus(
-            source="test", present=False, logged_out=True, subscription_type="max"
-        ),
-    )
-
-    plan = plan_launch(subscription_connection, {})
-    receipt = adapter.preflight(
-        RunRequest(connection=subscription_connection, messages=(), plan=plan)
-    )
-
-    assert not receipt.ok
-    assert "logged out" in receipt.problem
-    assert "claude /login" in receipt.problem
-
-
-def test_a_genuinely_missing_file_keeps_the_wording_it_always_had(
-    monkeypatch, subscription_connection
-):
-    adapter, module = _preflight_adapter(
-        monkeypatch, auth_status=lambda binary, env: {"loggedIn": False}
-    )
-    monkeypatch.setattr(
-        module,
-        "read_credential_status",
-        lambda env=None: module.CredentialStatus(source="test", present=False),
-    )
-
-    plan = plan_launch(subscription_connection, {})
-    receipt = adapter.preflight(
-        RunRequest(connection=subscription_connection, messages=(), plan=plan)
-    )
-
-    assert not receipt.ok
-    assert "no Claude Code login found" in receipt.problem
-
-
-# --- expired-but-refreshable: the runtime refreshes on use ---------------------
+# --- login evidence: `claude auth status`, and never the credential store -------
 #
-# Evidence (2026-09-30, Windows, Claude Code 2.1.x): with ``expiresAt`` in the
-# past, repeated ``claude auth status`` runs reported ``loggedIn: true`` and never
-# rewrote ``.credentials.json``; a one-shot ``claude -p`` model call refreshed it
-# at once (new ``expiresAt`` eight hours out, new mtime). So ``auth status`` is
-# not a refresh trigger, and a token still expired after it is not evidence of a
-# dead refresh token -- refusing on that basis refused every run whose access
-# token had simply lapsed.
+# Owner decision, 2026-11-13: modelpass does not open Claude Code's credential
+# store on any platform. Until then a fake ``.credentials.json`` stood behind
+# most of these tests; each one now states the same expectation against the
+# probe's answer, and says so where the expectation itself had to change.
+
+#: A token-shaped string for a credential file nobody may read.
+_POISON = "sk-ant-oat01-POISON-must-never-be-read"
+
+_LOGGED_IN = {
+    "loggedIn": True,
+    "authMethod": "claude.ai",
+    "apiProvider": "firstParty",
+    "email": "person@example.com",
+    "orgId": "org-123",
+    "orgName": "Example Co",
+    "subscriptionType": "max",
+    "planTier": "max_5x",
+    "loginExpiresAt": "2099-01-02T03:04:05.678Z",
+}
 
 
 def _preflight_adapter(monkeypatch, *, auth_status):
-    """A subscription adapter wired to a fake CLI, for the refresh tests below.
-    No subprocess ever runs: both probes are injected."""
+    """A subscription adapter wired to a fake CLI. No subprocess ever runs:
+    both probes are injected."""
     from modelpass.adapters import anthropic as module
 
     adapter = module.AnthropicAdapter(
@@ -1338,264 +1184,462 @@ def _profile_request(subscription_connection, root):
     return RunRequest(connection=connection, messages=(), plan=plan_launch(connection, {}))
 
 
-def test_an_expired_access_token_with_a_refresh_token_proceeds(
+def _default_request(subscription_connection):
+    return RunRequest(
+        connection=subscription_connection,
+        messages=(),
+        plan=plan_launch(subscription_connection, {}),
+    )
+
+
+def _poison_credential_file(root) -> Path:
+    """What Claude Code keeps under a config directory, unreadable on purpose:
+    not JSON, and holding a token-shaped string that must turn up nowhere."""
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / ".credentials.json"
+    path.write_text('{"claudeAiOauth": {"accessToken": "' + _POISON, encoding="utf-8")
+    return path
+
+
+def _forbid_the_credential_file(monkeypatch) -> list[str]:
+    """Fail the test the moment anything opens, reads or even looks for it."""
+    import builtins
+    import io
+
+    touched: list[str] = []
+
+    def guard(original):
+        def wrapper(target, *args, **kwargs):
+            if ".credentials.json" in str(target):
+                touched.append(str(target))
+                raise AssertionError(f"the credential file was touched: {target}")
+            return original(target, *args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(builtins, "open", guard(builtins.open))
+    monkeypatch.setattr(io, "open", guard(io.open))
+    monkeypatch.setattr(os, "open", guard(os.open))
+    monkeypatch.setattr(os, "stat", guard(os.stat))
+    for name in ("open", "read_text", "read_bytes", "is_file", "exists", "stat"):
+        monkeypatch.setattr(Path, name, guard(getattr(Path, name)))
+    return touched
+
+
+def test_a_reported_login_is_a_subscription_receipt(
     monkeypatch, subscription_connection, tmp_path
 ):
-    """Expired access token, refresh token present: the run goes ahead.
-
-    The receipt is subscription (billing unchanged), says the token is past its
-    expiry and that the runtime refreshes it on first use, and preflight never
-    re-runs ``auth status`` hoping for a refresh it does not perform. The
-    credential file is left exactly as it was -- preflight claims no refresh.
-    """
-    calls: list[str] = []
+    """Was: a live credential file is reported usable, with its plan."""
+    calls: list[str | None] = []
 
     def auth_status(binary, env):
         calls.append(env.get("CLAUDE_CONFIG_DIR"))
-        return {"loggedIn": True, "subscriptionType": "max"}
+        return dict(_LOGGED_IN)
 
     adapter, _ = _preflight_adapter(monkeypatch, auth_status=auth_status)
-    _write_credentials(tmp_path, expires_at=time.time() - 600, refresh="r")
-    before = (tmp_path / ".credentials.json").read_bytes()
-
     receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
 
     assert receipt.ok, receipt.problem
     assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
+    assert receipt.plan_name == "max"
+    # The probe ran inside the connection's own config directory.
+    assert calls == [str(tmp_path)]
+    assert "claude auth status" in receipt.credential_source
+    assert str(tmp_path) in receipt.credential_source
+    assert ".credentials.json" not in receipt.credential_source
     joined = " ".join(receipt.notes)
-    assert "past its expiry" in joined
-    assert "refresh" in joined and "first use" in joined
-    assert "was refreshed during preflight" not in joined
-    assert calls == []  # a run never asks `claude auth status` (2026-10-01)
-    assert (tmp_path / ".credentials.json").read_bytes() == before
+    assert "plan tier: max_5x" in joined
+    assert "login expires on 2099-01-02 (claude auth status)" in joined
 
 
-def test_an_expired_access_token_with_a_live_dated_refresh_token_proceeds(
-    monkeypatch, subscription_connection, tmp_path
-):
-    """The shape of the real file: refreshTokenExpiresAt recorded and in the future."""
-    adapter, _ = _preflight_adapter(
-        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
-    )
-    _write_credentials(
-        tmp_path,
-        expires_at=time.time() - 600,
-        refresh="r",
-        refresh_expires_at=time.time() + 30 * 86400,
-    )
-
-    status = read_credential_status({"CLAUDE_CONFIG_DIR": str(tmp_path)})
-    assert status.expired and status.refreshable and not status.refresh_expired
-    assert status.usable
-
-    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
+def test_the_default_directory_is_named_as_the_default(monkeypatch, subscription_connection):
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: dict(_LOGGED_IN))
+    receipt = adapter.preflight(_default_request(subscription_connection))
     assert receipt.ok, receipt.problem
-    assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
+    assert "default config directory" in receipt.credential_source
 
 
-def test_an_expired_access_token_whose_refresh_token_also_expired_is_refused(
+def test_the_receipt_says_what_it_can_no_longer_know_before_a_run(
+    monkeypatch, subscription_connection
+):
+    """Was: an expired access token with a refresh token proceeds, with a note
+    dating the expiry. The token's expiry lived in the credential file, so the
+    receipt now says it was not checked rather than staying silent about it."""
+    adapter, _ = _preflight_adapter(
+        monkeypatch, auth_status=lambda b, e: {"loggedIn": True}
+    )
+    receipt = adapter.preflight(_default_request(subscription_connection))
+
+    assert receipt.ok, receipt.problem
+    joined = " ".join(receipt.notes)
+    assert "does not open Claude Code's credential store" in joined
+    assert "access-token expiry and refresh are not checked before a run" in joined
+    assert "claude /login" in joined
+    # Nothing reported, nothing claimed.
+    assert "login expires" not in joined
+    assert "plan tier" not in joined
+    assert "rate limit tier" not in joined
+    assert "past its expiry" not in joined
+    assert receipt.plan_name is None
+
+
+def test_a_reported_expiry_that_has_passed_is_stated_and_does_not_refuse(
+    monkeypatch, subscription_connection
+):
+    """What ``loginExpiresAt`` measures is the vendor's to define, so a date in
+    the past is reported and the run is left to find out."""
+    adapter, _ = _preflight_adapter(
+        monkeypatch,
+        auth_status=lambda b, e: {"loggedIn": True, "loginExpiresAt": "2020-03-04T00:00:00Z"},
+    )
+    receipt = adapter.preflight(_default_request(subscription_connection))
+    assert receipt.ok, receipt.problem
+    joined = " ".join(receipt.notes)
+    assert "2020-03-04" in joined and "has passed" in joined
+    assert "authentication error" in joined
+
+
+@pytest.mark.parametrize("raw", [0, 1767225600000, "soon", "", None, True, ["2099-01-01"]])
+def test_an_expiry_that_is_not_a_date_is_no_expiry(monkeypatch, subscription_connection, raw):
+    """Was: a blanked ``expiresAt`` is no expiry rather than the epoch."""
+    adapter, _ = _preflight_adapter(
+        monkeypatch, auth_status=lambda b, e: {"loggedIn": True, "loginExpiresAt": raw}
+    )
+    receipt = adapter.preflight(_default_request(subscription_connection))
+    assert receipt.ok, receipt.problem
+    joined = " ".join(receipt.notes)
+    assert "login expires" not in joined and "has passed" not in joined
+    assert "1970" not in joined
+
+
+def test_a_logged_out_cli_is_refused_with_the_directory_and_the_fix(
     monkeypatch, subscription_connection, tmp_path
 ):
-    """No refresh can succeed, so the run must not start: refuse and say to log in.
-
-    The refusal names the refresh token's expiry rather than claiming there is
-    no refresh token -- the file plainly holds one.
-    """
+    """Was: a missing login, and a blanked file, are refused with `claude /login`."""
     adapter, _ = _preflight_adapter(
-        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
+        monkeypatch,
+        # Logged out, with the plan the account last had still reported.
+        auth_status=lambda b, e: {"loggedIn": False, "subscriptionType": "max"},
     )
-    _write_credentials(
-        tmp_path,
-        expires_at=time.time() - 600,
-        refresh="r",
-        refresh_expires_at=time.time() - 60,
-    )
-
-    status = read_credential_status({"CLAUDE_CONFIG_DIR": str(tmp_path)})
-    assert status.refresh_expired and not status.refreshable and not status.usable
-
     receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
-    assert not receipt.ok
+
+    assert receipt.ok is False
     assert receipt.detected_auth_mode is None
-    assert "could not be refreshed" in receipt.problem
-    assert "refresh token expired" in receipt.problem
-    assert "no refresh token" not in receipt.problem
+    assert receipt.plan_name is None
+    assert "no Claude Code login found" in receipt.problem
+    assert "claude auth status reports no login" in receipt.problem
     assert "claude /login" in receipt.problem
+    assert "CLAUDE_CONFIG_DIR set to that directory" in receipt.problem
+    assert str(tmp_path) in receipt.problem
+    with pytest.raises(SubpassError) as raised:
+        receipt.require_ok()
+    assert subscription_connection.name in str(raised.value)
 
 
-def test_an_expired_refresh_token_does_not_block_a_still_valid_access_token(
+def test_a_logged_out_default_directory_keeps_the_bare_instruction(
+    monkeypatch, subscription_connection
+):
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: {"loggedIn": False})
+    receipt = adapter.preflight(_default_request(subscription_connection))
+    assert not receipt.ok
+    assert "no Claude Code login found" in receipt.problem
+    assert "run 'claude /login' (or 'claude setup-token'" in receipt.problem
+    assert "CLAUDE_CONFIG_DIR" not in receipt.problem
+
+
+def test_a_probe_that_returns_nothing_fails_closed(
     monkeypatch, subscription_connection, tmp_path
 ):
-    """The access token authenticates on its own until it lapses; nothing to refresh yet."""
-    adapter, _ = _preflight_adapter(
-        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
+    """No evidence is not a login. It has its own diagnosis, because "log in"
+    is the wrong first instruction for a CLI that printed nothing."""
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: None)
+    for check in (adapter.preflight, adapter.identity_preflight):
+        receipt = check(_profile_request(subscription_connection, tmp_path))
+        assert receipt.ok is False
+        assert receipt.detected_auth_mode is None
+        assert "could not confirm a Claude Code login" in receipt.problem
+        assert "claude auth status" in receipt.problem
+        assert "claude /login" in receipt.problem
+        assert str(tmp_path) in receipt.problem
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"email": "person@example.com", "subscriptionType": "max"},
+        {"loggedIn": None},
+        {"loggedIn": "true"},
+        {"loggedIn": 1},
+    ],
+)
+def test_only_an_explicit_logged_in_true_passes(monkeypatch, subscription_connection, answer):
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: dict(answer))
+    receipt = adapter.preflight(_default_request(subscription_connection))
+    assert receipt.ok is False
+    assert receipt.detected_auth_mode is None
+    assert "could not confirm" in receipt.problem
+
+
+def test_the_adapter_never_opens_the_credential_file(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """The guarantee itself. A credential file sits in both places Claude Code
+    would keep one, unparseable and holding a token-shaped string; every way of
+    opening or looking for it raises; and the verdict follows the probe alone,
+    in both directions, on the run check and the setup check."""
+    profile = tmp_path / "claude-work"
+    home = tmp_path / "home"
+    _poison_credential_file(profile)
+    _poison_credential_file(home / ".claude")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    touched = _forbid_the_credential_file(monkeypatch)
+
+    requests = (
+        _profile_request(subscription_connection, profile),
+        _default_request(subscription_connection),
     )
-    _write_credentials(
-        tmp_path,
-        expires_at=time.time() + 3600,
-        refresh="r",
-        refresh_expires_at=time.time() - 60,
+    for answer, expected in ((dict(_LOGGED_IN), True), ({"loggedIn": False}, False)):
+        adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e, a=answer: a)
+        for request in requests:
+            for check in (adapter.preflight, adapter.identity_preflight):
+                receipt = check(request)
+                assert receipt.ok is expected, receipt.problem
+                assert _POISON not in repr(receipt)
+
+    assert touched == []
+
+
+def test_no_module_names_the_credential_file_in_code():
+    """The same guarantee, read off the source: the file's name appears in no
+    string in the package, so nothing can build a path to it. Comments may say
+    what is not done."""
+    import tokenize
+
+    import modelpass
+
+    offenders = []
+    for path in Path(modelpass.__file__).parent.rglob("*.py"):
+        with tokenize.open(path) as handle:
+            for token in tokenize.generate_tokens(handle.readline):
+                if token.type == tokenize.STRING and "credentials.json" in token.string:
+                    offenders.append(f"{path.name}:{token.start[0]}")
+    assert offenders == []
+
+
+def test_nothing_the_probe_says_beyond_the_allow_list_reaches_a_receipt(
+    monkeypatch, subscription_connection
+):
+    """Was: the credential status type has no field that can hold a token."""
+    answer = {**_LOGGED_IN, "oauthToken": _POISON, "accessToken": _POISON}
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: answer)
+    for check in (adapter.preflight, adapter.identity_preflight):
+        receipt = check(_default_request(subscription_connection))
+        assert receipt.ok
+        assert _POISON not in repr(receipt)
+
+
+# --- a lapsed login is found by the run, and the run says what to do ------------
+#
+# Evidence (2026-09-30, Windows, Claude Code 2.1.x): with the access token past
+# its expiry, repeated ``claude auth status`` runs reported ``loggedIn: true``; a
+# one-shot ``claude -p`` model call refreshed it at once. So a lapsed access
+# token never did refuse a run, and it cannot now: preflight does not see it.
+
+
+def _unauthorized(text="Failed to authenticate. API Error: 401 OAuth token has expired."):
+    return ResultMessage(
+        subtype="success", is_error=True, api_error_status=401, result=text
     )
-    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
-    assert receipt.ok, receipt.problem
 
 
 def test_a_failed_refresh_during_the_run_ends_it_as_an_error_not_a_success():
-    """Preflight lets an expired-but-refreshable token through, so a refresh that
-    then fails must surface as a run failure. What reaches the stream is an
-    authentication failure; the 401 shape observed live maps to ERROR even
-    though its subtype says 'success'."""
-    msg = ResultMessage(
-        subtype="success",
-        is_error=True,
-        api_error_status=401,
-        result="Failed to authenticate. API Error: 401 OAuth token has expired.",
-    )
-    terminal = map_message(msg)[-1]
+    """The 401 shape observed live maps to ERROR even though its subtype says
+    'success'."""
+    terminal = map_message(_unauthorized())[-1]
     assert terminal.status is TerminalStatus.ERROR
     assert "401" in terminal.reason
 
 
-def test_a_login_that_has_not_expired_is_unchanged(
-    monkeypatch, subscription_connection, tmp_path
-):
-    """Not expired: ok, no expiry note, and no auth-status probe on the run path."""
-    calls: list[str] = []
+def test_a_401_on_a_subscription_run_names_the_relogin_command():
+    """Preflight used to refuse a login whose refresh token had expired, with
+    `claude /login` in the message. That case now reaches the run, so the
+    instruction has to be on the run's terminal."""
+    terminal = map_message(_unauthorized(), auth_mode=AuthMode.SUBSCRIPTION)[-1]
+    assert terminal.status is TerminalStatus.ERROR
+    assert "HTTP 401" in terminal.reason
+    assert "OAuth token has expired" in terminal.reason
+    assert "re-run 'claude /login'" in terminal.reason
+    assert "CLAUDE_CONFIG_DIR" in terminal.reason
 
-    def auth_status(binary, env):
-        calls.append(env.get("CLAUDE_CONFIG_DIR"))
-        return {"loggedIn": True}
 
-    adapter, _ = _preflight_adapter(monkeypatch, auth_status=auth_status)
-    _write_credentials(
-        tmp_path,
-        expires_at=time.time() + 3600,
-        refresh="r",
-        refresh_expires_at=time.time() + 30 * 86400,
+def test_a_long_401_still_ends_with_the_relogin_command():
+    terminal = map_message(_unauthorized("x" * 5000), auth_mode=AuthMode.SUBSCRIPTION)[-1]
+    assert "re-run 'claude /login'" in terminal.reason
+    assert len(terminal.reason) < 600
+
+
+def test_a_401_on_an_api_key_run_is_not_told_to_log_in():
+    terminal = map_message(_unauthorized(), auth_mode=AuthMode.API_KEY)[-1]
+    assert terminal.status is TerminalStatus.ERROR
+    assert "claude /login" not in terminal.reason
+
+
+def test_another_error_on_a_subscription_run_is_not_told_to_log_in():
+    msg = ResultMessage(
+        subtype="success", is_error=True, api_error_status=500, result="Overloaded"
     )
-    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
-    assert receipt.ok, receipt.problem
-    assert receipt.detected_auth_mode is AuthMode.SUBSCRIPTION
-    assert "past its expiry" not in " ".join(receipt.notes)
-    assert calls == []
+    terminal = map_message(msg, auth_mode=AuthMode.SUBSCRIPTION)[-1]
+    assert "claude /login" not in terminal.reason
 
 
-def test_an_expired_login_without_a_refresh_token_keeps_its_refusal(
-    monkeypatch, subscription_connection, tmp_path
+def test_a_stateless_run_that_meets_a_401_tells_the_caller_to_log_in(
+    monkeypatch, subscription_request
 ):
-    adapter, _ = _preflight_adapter(
-        monkeypatch, auth_status=lambda binary, env: {"loggedIn": True}
-    )
-    _write_credentials(tmp_path, expires_at=time.time() - 600, refresh="")
-    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
-    assert not receipt.ok
-    assert "carries no refresh token" in receipt.problem
+    """The hint is on the run path itself, not only on the pure mapper."""
+
+    class UnauthorizedClient(FakeClient):
+        async def receive_response(self):
+            yield _unauthorized()
+
+    class UnauthorizedSdk(RecordingSdk):
+        def ClaudeSDKClient(self, options):
+            return UnauthorizedClient(options)
+
+    adapter = AnthropicAdapter()
+    monkeypatch.setattr(AnthropicAdapter, "_sdk", staticmethod(lambda: UnauthorizedSdk()))
+    terminal = list(adapter.run(subscription_request))[-1]
+    assert isinstance(terminal, TerminalEvent)
+    assert terminal.status is TerminalStatus.ERROR
+    assert "re-run 'claude /login'" in terminal.reason
 
 
-# --- macOS ---------------------------------------------------------------------
+def test_a_session_turn_that_meets_a_401_tells_the_caller_to_log_in(
+    monkeypatch, session_request
+):
+    sdk = SessionSdk(turns=[[_unauthorized()]])
+    handle = session_adapter(monkeypatch, sdk).open_session(session_request())
+    terminal = list(handle.send("hello"))[-1]
+    assert isinstance(terminal, TerminalEvent)
+    assert terminal.status is TerminalStatus.ERROR
+    assert "re-run 'claude /login'" in terminal.reason
+    handle.close()
+
+
+# --- every platform, one path ---------------------------------------------------
 #
-# Implemented from Claude Code's own documentation (the Keychain entry is keyed
-# to CLAUDE_CONFIG_DIR; a plaintext .credentials.json under the same directory
-# is the fallback when the Keychain refuses the write) and not yet exercised on
-# a Mac. Every branch below therefore monkeypatches sys.platform, which is the
-# only way this machine can reach them at all.
+# macOS used to be the special case: no file to read, so the probe was the only
+# evidence, and a probe that returned nothing was let through with a note. It is
+# now the general case, and nothing returned refuses. Not exercised on a Mac:
+# sys.platform is patched, which shows only that no branch reads it.
 
 
-def _darwin_preflight(monkeypatch, request, *, auth_status, identity=True):
-    from modelpass.adapters import anthropic as module
-
-    adapter = AnthropicAdapter(auth_status=lambda binary, env: auth_status)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
-    monkeypatch.setattr(adapter, "is_available", lambda: True)
-    monkeypatch.setattr(adapter, "_sdk", lambda: FakeSdk())
-    monkeypatch.setattr(adapter, "_cli_status", lambda sdk: ("claude", None))
-    monkeypatch.setattr(adapter, "_cli_version", lambda binary, env: "2.1.242")
-    return (adapter.identity_preflight if identity else adapter.preflight)(request)
-
-
-def _isolated_request(request_factory, root):
-    connection = replace(request_factory().connection, config_dir=str(root))
-    return replace(
-        request_factory(),
-        connection=connection,
-        plan=plan_launch(connection, {}),
-    )
-
-
-def test_mac_reads_the_keychain_fallback_file_under_the_config_dir(monkeypatch, tmp_path):
-    """When Claude Code fell back to a file, macOS parses it exactly like Linux."""
-    from modelpass.adapters import anthropic as module
-
-    root = tmp_path / "claude-work"
-    root.mkdir()
-    env = _write_credentials(root, expires_at=time.time() + 3600, refresh="r")
-    monkeypatch.setattr(module.sys, "platform", "darwin")
-
-    status = read_credential_status(env)
-    assert status.present is True
-    assert status.keychain_only is False
-    assert str(root / ".credentials.json") in status.source
-
-
-def test_mac_without_a_fallback_file_names_the_keyed_keychain_entry(monkeypatch, tmp_path):
-    from modelpass.adapters import anthropic as module
-
-    root = tmp_path / "claude-work"
-    monkeypatch.setattr(module.sys, "platform", "darwin")
-
-    status = read_credential_status({"CLAUDE_CONFIG_DIR": str(root)})
-    assert status.present is True
-    assert status.keychain_only is True
-    assert "macOS Keychain" in status.source
-    assert str(root) in status.source
-
-
-def test_mac_config_dir_profile_is_ok_when_auth_status_reports_a_login(
-    monkeypatch, request_factory, tmp_path
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+def test_the_verdict_is_the_same_on_every_platform(
+    monkeypatch, subscription_connection, tmp_path, platform
 ):
-    receipt = _darwin_preflight(
-        monkeypatch,
-        _isolated_request(request_factory, tmp_path / "claude-work"),
-        auth_status={"loggedIn": True, "email": "work@example.com"},
+    import sys
+
+    monkeypatch.setattr(sys, "platform", platform)
+    root = tmp_path / "claude-work"
+    request = _profile_request(subscription_connection, root)
+
+    adapter, _ = _preflight_adapter(
+        monkeypatch, auth_status=lambda b, e: {"loggedIn": True, "email": "work@example.com"}
     )
+    receipt = adapter.identity_preflight(request)
     assert receipt.ok is True
     assert receipt.account_profile is not None
     assert receipt.account_profile.email == "work@example.com"
+    assert "Keychain" not in receipt.credential_source
+    assert adapter.preflight(request).ok is True
 
-
-def test_mac_config_dir_profile_fails_closed_when_auth_status_says_logged_out(
-    monkeypatch, request_factory, tmp_path
-):
-    """The Keychain cannot be read, so `claude auth status` is the whole evidence."""
-    root = tmp_path / "claude-work"
-    receipt = _darwin_preflight(
-        monkeypatch,
-        _isolated_request(request_factory, root),
-        auth_status={"loggedIn": False},
-    )
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: {"loggedIn": False})
+    receipt = adapter.identity_preflight(request)
     assert receipt.ok is False
-    assert "claude auth status reports no login" in (receipt.problem or "")
-    assert str(root) in (receipt.problem or "")
+    assert "claude auth status reports no login" in receipt.problem
+    assert str(root) in receipt.problem
+    assert adapter.preflight(request).ok is False
+
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: None)
+    assert adapter.identity_preflight(request).ok is False
+    assert adapter.preflight(request).ok is False
 
 
-def test_mac_config_dir_profile_says_so_when_the_probe_returns_nothing(
-    monkeypatch, request_factory, tmp_path
+# --- the probe itself -----------------------------------------------------------
+
+
+class _Completed:
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def _fake_cli(monkeypatch, tmp_path, outputs):
+    """Stand in for the subprocess. ``outputs`` are stdout strings, or an
+    exception to raise, one per launch."""
+    from modelpass.adapters import anthropic as module
+
+    binary = tmp_path / "claude"
+    binary.write_text("", encoding="utf-8")
+    launches: list[tuple[list[str], dict[str, str]]] = []
+    remaining = list(outputs)
+
+    def run(argv, **kwargs):
+        launches.append((list(argv), dict(kwargs["env"])))
+        output = remaining.pop(0)
+        if isinstance(output, BaseException):
+            raise output
+        return _Completed(output)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module, "_AUTH_STATUS_RETRY_DELAYS", (0.001, 0.001))
+    return module, str(binary), launches
+
+
+def test_the_probe_runs_auth_status_in_exactly_the_environment_it_was_given(
+    monkeypatch, tmp_path
 ):
-    receipt = _darwin_preflight(
-        monkeypatch,
-        _isolated_request(request_factory, tmp_path / "claude-work"),
-        auth_status=None,
+    module, binary, launches = _fake_cli(monkeypatch, tmp_path, ['{"loggedIn": true}'])
+    env = {"CLAUDE_CONFIG_DIR": "/work", "PATH": "/bin"}
+    assert module._default_auth_status(binary, env) == {"loggedIn": True}
+    assert launches == [([binary, "auth", "status"], env)]
+
+
+def test_a_logged_out_answer_is_an_answer_whatever_the_exit_code(monkeypatch, tmp_path):
+    module, binary, launches = _fake_cli(monkeypatch, tmp_path, ['{"loggedIn": false}'])
+    assert module._default_auth_status(binary, {}) == {"loggedIn": False}
+    assert len(launches) == 1
+
+
+def test_the_probe_asks_again_when_it_gets_nothing_readable(monkeypatch, tmp_path):
+    """One empty answer among concurrent probes refused 97 of 100 calls on
+    2026-10-01. A run depends on this answer now, so it is asked for again."""
+    module, binary, launches = _fake_cli(
+        monkeypatch, tmp_path, ["", "not json", '{"loggedIn": true}']
     )
-    assert receipt.ok is True
-    assert any("identity could not be confirmed" in note for note in receipt.notes)
+    assert module._default_auth_status(binary, {}) == {"loggedIn": True}
+    assert len(launches) == 3
 
 
-@pytest.mark.skipif(os.sys.platform == "darwin", reason="macOS uses the keychain")
-def test_credential_status_never_carries_a_secret(tmp_path):
-    """The status type must have no field capable of holding a token."""
-    env = _write_credentials(tmp_path, expires_at=time.time() + 60, refresh="r")
-    status = read_credential_status(env)
-    assert "not-a-real-token" not in repr(status)
+def test_the_probe_gives_up_after_its_retries(monkeypatch, tmp_path):
+    module, binary, launches = _fake_cli(monkeypatch, tmp_path, ["", "{}", "[1]", "never"])
+    assert module._default_auth_status(binary, {}) is None
+    assert len(launches) == 3
+
+
+def test_a_cli_that_will_not_start_is_not_retried(monkeypatch, tmp_path):
+    module, binary, launches = _fake_cli(
+        monkeypatch, tmp_path, [OSError("nope"), '{"loggedIn": true}']
+    )
+    assert module._default_auth_status(binary, {}) is None
+    assert len(launches) == 1
+
+
+def test_the_probe_launches_nothing_that_is_not_a_file(monkeypatch, tmp_path):
+    module, _binary, launches = _fake_cli(monkeypatch, tmp_path, ['{"loggedIn": true}'])
+    assert module._default_auth_status("claude", {}) is None
+    assert launches == []
 
 
 # --- the environment scrub (the whole point, D1/D2) ----------------------------
@@ -1671,27 +1715,18 @@ def test_the_receipt_says_that_remaining_allowance_is_unknowable_before_a_run(
     absence and names where the answer does arrive instead. A receipt that was
     simply silent about it would leave a user assuming it had been checked.
     """
-    from modelpass.adapters import anthropic as module
-    from modelpass.adapters.base import RunRequest
-
-    monkeypatch.setattr(
-        module,
-        "read_credential_status",
-        lambda env=None: module.CredentialStatus(
-            source="Claude Code login (test)",
-            present=True,
-            subscription_type="Max 5x",
-            rate_limit_tier="default",
-        ),
-    )
     plan = plan_launch(subscription_connection, {})
     request = RunRequest(connection=subscription_connection, messages=(), plan=plan)
-    receipt = AnthropicAdapter()._subscription_receipt(request, [])
+    receipt = AnthropicAdapter()._subscription_receipt(
+        request,
+        [],
+        login={"loggedIn": True, "subscriptionType": "Max 5x", "planTier": "max_5x"},
+    )
 
     joined = " ".join(receipt.notes)
     assert "not knowable before a run" in joined
     assert "rate_limit" in joined
-    assert "rate limit tier: default" in joined
+    assert "plan tier: max_5x" in joined
     assert receipt.plan_name == "Max 5x"
 
 
@@ -1874,7 +1909,10 @@ def session_adapter(monkeypatch, sdk, *, version="2.1.233 (Claude Code)"):
     extra -- which is every machine CI runs on (D2) -- must exercise the same
     code as one with it, rather than skip.
     """
-    adapter = AnthropicAdapter(claude_version=lambda binary, env: version)
+    adapter = AnthropicAdapter(
+        claude_version=lambda binary, env: version,
+        auth_status=lambda binary, env: {"loggedIn": True, "subscriptionType": "pro"},
+    )
     monkeypatch.setattr(AnthropicAdapter, "is_available", classmethod(lambda cls: True))
     monkeypatch.setattr(AnthropicAdapter, "_sdk", staticmethod(lambda: sdk))
     monkeypatch.setattr(
@@ -2710,17 +2748,11 @@ def test_the_receipt_names_the_binary_this_run_would_launch(
 ):
     """Parity with the Codex receipt. The version decides real behavior: the
     prompt-cache TTL lever exists only from 2.1.242."""
-    from modelpass.adapters import anthropic as module
     from modelpass.adapters.base import RunRequest
 
     sdk = SessionSdk()
     sdk.__version__ = "0.2.139"
     adapter = session_adapter(monkeypatch, sdk, version="2.1.233 (Claude Code)")
-    monkeypatch.setattr(
-        module,
-        "read_credential_status",
-        lambda env=None: module.CredentialStatus(source="test", present=True),
-    )
     plan = plan_launch(subscription_connection, {})
     receipt = adapter.preflight(
         RunRequest(connection=subscription_connection, messages=(), plan=plan)
@@ -2762,18 +2794,10 @@ def bridge_over(monkeypatch, sdk, store, connection, **kwargs):
     stamped terminal are all the core's, and none of them are exercised by
     calling the handle directly.
     """
-    from modelpass.adapters import anthropic as module
     from modelpass.bridge import Bridge
     from modelpass.capabilities import CapabilityRegistry
 
     adapter = session_adapter(monkeypatch, sdk, **kwargs)
-    monkeypatch.setattr(
-        module,
-        "read_credential_status",
-        lambda env=None: module.CredentialStatus(
-            source="Claude Code login (test)", present=True, subscription_type="pro"
-        ),
-    )
     store.add(connection)
     bridge = Bridge(
         store=store,
@@ -2984,63 +3008,153 @@ def test_a_caller_option_cannot_silently_undo_isolation(
         launch_options(monkeypatch, request_factory(options={key: value}))
 
 
-# --- run time asks no identity question (owner decision, 2026-10-01) -------------
+# --- run time checks the login and asks no identity question ---------------------
+#
+# Owner decision, 2026-10-01: a run compares nothing with the pinned account.
+# That stands. What changed on 2026-11-13 is how a run knows a login is there:
+# it used to read the credential file and run no subprocess; it now shares the
+# cached ``claude auth status`` answer, because modelpass no longer opens that
+# file.
 
 
-def _no_probe(binary, env):
-    raise AssertionError("claude auth status must not run on the run path")
+def _clock(monkeypatch, module):
+    """Drive the adapter's cache clock by hand."""
+    now = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    return now
 
 
-def test_a_run_preflight_never_invokes_the_identity_probe(
+def test_a_run_preflight_reports_no_identity(
     monkeypatch, subscription_connection, tmp_path
 ):
-    adapter, _ = _preflight_adapter(monkeypatch, auth_status=_no_probe)
-    _write_credentials(tmp_path, expires_at=time.time() + 3600, refresh="r")
+    """Was: a run preflight never invokes the probe. It does now, and still
+    hands back no account for anyone to compare."""
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: dict(_LOGGED_IN))
     receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
     assert receipt.ok, receipt.problem
     assert receipt.account_profile is None
+    assert receipt.account is None
+    assert "person@example.com" not in repr(receipt)
 
 
-def test_four_concurrent_run_preflights_all_pass_with_a_probe_that_would_fail(
+def test_runs_share_one_probe_per_cache_window(
     monkeypatch, subscription_connection, tmp_path
 ):
-    """The 2026-10-01 failure: an empty probe refused every call for a minute."""
+    """The probe is seconds of subprocess; a batch of runs pays for it once."""
+    calls: list[int] = []
+
+    def auth_status(binary, env):
+        calls.append(1)
+        return {"loggedIn": True}
+
+    adapter, module = _preflight_adapter(monkeypatch, auth_status=auth_status)
+    now = _clock(monkeypatch, module)
+    request = _profile_request(subscription_connection, tmp_path)
+    for _ in range(5):
+        assert adapter.preflight(request).ok
+    assert adapter.identity_preflight(request).ok
+    assert len(calls) == 1
+
+    now[0] += module._IDENTITY_CACHE_TTL_SECONDS + 1
+    assert adapter.preflight(request).ok
+    assert len(calls) == 2
+
+
+def test_four_concurrent_run_preflights_all_pass_when_the_probe_then_fails(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """The 2026-10-01 failure: an empty probe refused every call for a minute.
+
+    A login confirmed minutes ago is not refused because the probe now returns
+    nothing: the run goes on the earlier answer and the receipt says how old
+    it is."""
     from concurrent.futures import ThreadPoolExecutor
 
-    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: None)
-    _write_credentials(tmp_path, expires_at=time.time() + 3600, refresh="r")
+    answers = [{"loggedIn": True}]
+
+    def auth_status(binary, env):
+        return answers.pop(0) if answers else None
+
+    adapter, module = _preflight_adapter(monkeypatch, auth_status=auth_status)
+    now = _clock(monkeypatch, module)
     request = _profile_request(subscription_connection, tmp_path)
+    assert adapter.preflight(request).ok
+
+    now[0] += module._IDENTITY_CACHE_TTL_SECONDS + 30
     with ThreadPoolExecutor(max_workers=4) as pool:
         receipts = list(pool.map(lambda _: adapter.preflight(request), range(8)))
     assert all(r.ok for r in receipts), [r.problem for r in receipts]
+    for receipt in receipts:
+        assert any(
+            "returned nothing just now" in note and "90s ago" in note
+            for note in receipt.notes
+        )
 
 
-def test_a_missing_login_names_the_directory_and_the_fix_and_tries_nothing_else(
+def test_an_old_answer_is_not_evidence_for_ever(
     monkeypatch, subscription_connection, tmp_path
 ):
-    adapter, _ = _preflight_adapter(monkeypatch, auth_status=_no_probe)
-    request = _profile_request(subscription_connection, tmp_path)  # no credential file
+    answers = [{"loggedIn": True}]
+    adapter, module = _preflight_adapter(
+        monkeypatch, auth_status=lambda b, e: answers.pop(0) if answers else None
+    )
+    now = _clock(monkeypatch, module)
+    request = _profile_request(subscription_connection, tmp_path)
+    assert adapter.preflight(request).ok
+
+    now[0] += module._LOGIN_EVIDENCE_GRACE_SECONDS + 1
+    receipt = adapter.preflight(request)
+    assert receipt.ok is False
+    assert "could not confirm a Claude Code login" in receipt.problem
+
+
+def test_a_setup_check_never_rests_on_an_old_answer(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """Pinning an account from an answer nobody just read would record a guess."""
+    answers = [dict(_LOGGED_IN)]
+    adapter, module = _preflight_adapter(
+        monkeypatch, auth_status=lambda b, e: answers.pop(0) if answers else None
+    )
+    now = _clock(monkeypatch, module)
+    request = _profile_request(subscription_connection, tmp_path)
+    assert adapter.identity_preflight(request).ok
+
+    now[0] += module._IDENTITY_CACHE_TTL_SECONDS + 1
+    receipt = adapter.identity_preflight(request)
+    assert receipt.ok is False
+    assert receipt.account_profile is None
+
+
+def test_a_probe_that_never_answers_refuses_every_run(
+    monkeypatch, subscription_connection, tmp_path
+):
+    """Fail closed has no fallback to fall back on: nothing was ever confirmed."""
+    adapter, _ = _preflight_adapter(monkeypatch, auth_status=lambda b, e: None)
+    request = _profile_request(subscription_connection, tmp_path)
+    receipts = [adapter.preflight(request) for _ in range(3)]
+    assert not any(r.ok for r in receipts)
+    assert all(r.detected_auth_mode is None for r in receipts)
+
+
+def test_logging_out_is_seen_once_the_cache_window_passes(
+    monkeypatch, subscription_connection, tmp_path
+):
+    answers = [{"loggedIn": True}, {"loggedIn": False}]
+    adapter, module = _preflight_adapter(
+        monkeypatch, auth_status=lambda b, e: answers.pop(0)
+    )
+    now = _clock(monkeypatch, module)
+    request = _profile_request(subscription_connection, tmp_path)
+    assert adapter.preflight(request).ok
+
+    now[0] += module._IDENTITY_CACHE_TTL_SECONDS + 1
     receipt = adapter.preflight(request)
     assert receipt.ok is False
     assert "claude /login" in receipt.problem
-    assert "CLAUDE_CONFIG_DIR set to that directory" in receipt.problem
-    assert str(tmp_path) in receipt.problem
-    with pytest.raises(SubpassError) as raised:
-        receipt.require_ok()
-    assert subscription_connection.name in str(raised.value)
 
 
-def test_an_expired_token_without_a_refresh_token_is_refused_with_the_relogin_command(
-    monkeypatch, subscription_connection, tmp_path
-):
-    adapter, _ = _preflight_adapter(monkeypatch, auth_status=_no_probe)
-    _write_credentials(tmp_path, expires_at=time.time() - 600, refresh="")
-    receipt = adapter.preflight(_profile_request(subscription_connection, tmp_path))
-    assert receipt.ok is False
-    assert "claude /login" in receipt.problem
-
-
-def test_the_setup_preflight_still_probes_identity(
+def test_the_setup_preflight_reports_identity(
     monkeypatch, subscription_connection, tmp_path
 ):
     calls: list[str] = []
@@ -3050,11 +3164,11 @@ def test_the_setup_preflight_still_probes_identity(
         return {"loggedIn": True, "email": "work@example.com"}
 
     adapter, _ = _preflight_adapter(monkeypatch, auth_status=auth_status)
-    _write_credentials(tmp_path, expires_at=time.time() + 3600, refresh="r")
     receipt = adapter.identity_preflight(_profile_request(subscription_connection, tmp_path))
     assert calls == [str(tmp_path)]
     assert receipt.account_profile is not None
     assert receipt.account_profile.email == "work@example.com"
+    assert receipt.account == "work@example.com"
 
 
 def test_an_empty_identity_answer_is_never_cached(monkeypatch):

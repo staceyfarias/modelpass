@@ -1566,12 +1566,12 @@ def _remove_schema_file(path: str | None) -> None:
 class CredentialStatus:
     """What the Codex ChatGPT login store looks like -- metadata only.
 
-    Mirrors ``modelpass.adapters.anthropic.CredentialStatus``: reads
-    ``auth.json`` for the stored access token's expiry and whether a
+    Reads ``auth.json`` for the stored access token's expiry and whether a
     refresh_token is present, never the token values themselves. The access
     token is a JWT (codex-rs's own ``token_data.rs`` parses the same ``exp``
-    claim client-side), so the expiry comes from decoding that claim rather
-    than from a plain field the way Claude Code's credential file has one.
+    claim client-side), so the expiry comes from decoding that claim. The
+    Anthropic adapter has no counterpart: since 2026-11-13 it does not open
+    Claude Code's credential store and asks ``claude auth status`` instead.
     """
 
     source: str
