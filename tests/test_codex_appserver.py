@@ -266,6 +266,52 @@ def test_start_is_not_repeated_on_a_second_call():
         assert server.methods == ["initialize", "initialized"]
 
 
+def test_a_client_closed_before_it_starts_refuses_to_start_and_launches_nothing():
+    """A cancel that lands first must win: there is nothing to stop afterwards.
+
+    ``close()`` returns early once the client is closed, so a child spawned
+    after it was a child nobody would ever terminate (reproduced 2026-11-13:
+    spawned once, never terminated, stdin left open).
+    """
+    server = FakeAppServer()
+    client, spawn = make_client(server)
+
+    client.close()
+    with pytest.raises(AppServerTransportClosed) as excinfo:
+        client.start()
+
+    assert spawn.calls == 0
+    assert "closed" in str(excinfo.value)
+    assert client.running is False
+
+
+def test_a_close_that_lands_while_the_child_is_being_launched_still_stops_it():
+    """The other half of the same race: closed between the check and the handle.
+
+    The close found no process to stop, so the start has to stop the one it was
+    in the middle of launching -- and must not go on to shake hands with it.
+    """
+    server = FakeAppServer()
+    holder: dict[str, AppServerClient] = {}
+
+    def spawn(argv, env, cwd):
+        holder["client"].close()  # the watchdog's close, mid-launch
+        return server
+
+    client = AppServerClient(
+        binary="C:/codex/codex.exe", env={"PATH": "/usr/bin"}, cwd="/work", spawn=spawn
+    )
+    holder["client"] = client
+
+    with pytest.raises(AppServerTransportClosed):
+        client.start()
+
+    assert server.terminated == 1
+    assert server.stdin.closed is True
+    assert server.methods == [], "nothing is written to a child that is being stopped"
+    assert client.running is False
+
+
 # --- handshake -------------------------------------------------------------------
 
 
@@ -648,6 +694,63 @@ def test_a_child_that_ignores_terminate_is_killed():
     client.close()
     assert server.terminated == 1
     assert server.killed == 1
+
+
+def test_a_child_whose_stream_ended_is_still_shut_down_by_close():
+    """*The transport ended* is not *the caller closed it*.
+
+    Stdout reaching EOF used to mark the client closed, so the ``close()`` that
+    followed returned early: stdin stayed open, the process was never waited on,
+    and a child that had only closed its stdout was never stopped.
+    """
+    server = FakeAppServer(
+        responder=lambda srv, m: [{"id": m["id"], "result": {}}]
+        if m.get("method") == "initialize"
+        else []
+    )
+    client, _ = make_client(server)
+    client.start()
+
+    server.eof()  # stdout ends; the process itself has not exited
+    assert wait_until(lambda: not client.running)
+    with pytest.raises(AppServerTransportClosed):
+        client.request("thread/list")
+
+    client.close()
+    client.close()
+
+    assert server.stdin.closed is True
+    assert server.terminated == 1
+
+
+def test_a_start_whose_handshake_fails_stops_the_child_it_launched():
+    """A caller that never got a client back has nothing to close."""
+    server = FakeAppServer(responder=lambda srv, message: [])
+    client, _ = make_client(server, handshake_timeout=0.15)
+
+    with pytest.raises(AppServerTimeout):
+        client.start()
+
+    assert server.terminated == 1
+    assert server.stdin.closed is True
+
+
+def test_the_stream_ends_once_however_many_ways_it_ended():
+    """EOF and ``close()`` both end the stream; a consumer must see one ending."""
+    server = FakeAppServer(
+        responder=lambda srv, m: [{"id": m["id"], "result": {}}]
+        if m.get("method") == "initialize"
+        else []
+    )
+    client, _ = make_client(server)
+    client.start()
+    server.eof()
+    assert wait_until(lambda: not client.running)
+    client.close()
+
+    assert client.next_notification(timeout=1) is None
+    with pytest.raises(queue.Empty):
+        client.next_notification(timeout=0.05)
 
 
 def test_a_malformed_line_is_recorded_rather_than_dropped():
@@ -1265,6 +1368,32 @@ def test_the_turns_own_verdict_outranks_an_earlier_error_notification():
     turn.observe(completed("failed", {"message": "the real reason"}))
     turn.observe(note("error", willRetry=False, error={"message": "a later noise line"}))
     assert turn.reason == "the real reason"
+
+
+def test_a_turn_that_completed_is_completed_whatever_error_came_before_it():
+    """The same rule, the other way round: the turn's own status is the verdict.
+
+    An ``error`` notification is a guess at the outcome made before the outcome
+    exists. It used to stick -- a turn the server went on to report as
+    ``completed`` was still returned as an error, with the answer it produced
+    sitting in the stream.
+    """
+    turn = AppServerTurn()
+    turn.observe(note("error", willRetry=False, error={"message": "upstream hiccup"}))
+    assert turn.status is TerminalStatus.ERROR
+
+    turn.observe(completed("completed"))
+
+    assert turn.status is TerminalStatus.OK
+    assert turn.reason is None
+
+
+def test_an_error_notification_still_fails_a_turn_that_then_reports_failure():
+    turn = AppServerTurn()
+    turn.observe(note("error", willRetry=False, error={"message": "unauthorized"}))
+    turn.observe(completed("failed", {"message": "unauthorized"}))
+    assert turn.status is TerminalStatus.ERROR
+    assert turn.reason == "unauthorized"
 
 
 def test_an_unreadable_error_keeps_its_raw_text():

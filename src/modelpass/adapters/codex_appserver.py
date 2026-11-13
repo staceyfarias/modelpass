@@ -194,7 +194,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .._background import process_options
+from .._background import kill_tree, release_tree, spawn_tree, terminate_tree
 from ..errors import InvalidTool, VendorRunFailed
 from ..preflight import check_launch_args
 from ..runtimes import Runtime
@@ -266,6 +266,18 @@ HANDSHAKE_TIMEOUT = 30.0
 
 #: Seconds allowed for a polite terminate, and again for the kill after it.
 _SHUTDOWN_GRACE = 5.0
+
+#: How long a child that could only be told to stop by closing its stdin is
+#: given to leave before its tree is killed. That is every real child on
+#: Windows, where there is no ``SIGTERM`` to send. Shorter than the grace after
+#: a signal because this wait sits inside a cancel, on the watchdog's thread.
+_EOF_GRACE = 2.0
+
+#: How long a shutdown waits for a message that is being written to the child
+#: to finish before concluding the write is stuck. A message is one line and a
+#: reading child takes it at once, so half a second of holding the write lock
+#: is a child that has stopped reading its stdin.
+_STUCK_WRITE_WAIT = 0.5
 
 
 # --- errors --------------------------------------------------------------------
@@ -748,9 +760,8 @@ def _default_spawn(
     server's lines, stderr the crash reason. Draining the last two needs two
     threads and gets them.
     """
-    return subprocess.Popen(
+    return spawn_tree(
         argv,
-        **process_options(),
         env=env,
         cwd=cwd,
         stdin=subprocess.PIPE,
@@ -761,6 +772,16 @@ def _default_spawn(
         errors="replace",
         bufsize=1,
     )
+
+
+def _close_quietly(stream: Any) -> None:
+    """Close a child's pipe. A pipe that is already gone is not a failure."""
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except (OSError, ValueError):
+        pass
 
 
 class AppServerClient:
@@ -803,7 +824,14 @@ class AppServerClient:
 
         self._proc: Any = None
         self._started = False
+        #: The caller closed this client. Set by :meth:`close` and nothing else.
         self._closed = False
+        #: The child's stdout reached EOF: the conversation is over, whoever
+        #: ended it. **Not the same statement as** ``_closed``, and it used to
+        #: be the same flag -- so the ``close()`` that followed a child's death
+        #: returned early, the process was never waited on and its stdin never
+        #: closed (2026-11-13). A client can be both.
+        self._transport_ended = False
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._next_id = 0
@@ -829,13 +857,18 @@ class AppServerClient:
         self.close()
 
     def __repr__(self) -> str:
-        state = "closed" if self._closed else ("running" if self._started else "unstarted")
+        if self._closed:
+            state = "closed"
+        elif self._transport_ended:
+            state = "ended"
+        else:
+            state = "running" if self._started else "unstarted"
         return f"<AppServerClient {self._binary}:{state}>"
 
     @property
     def running(self) -> bool:
         """Whether the child is up and the protocol is usable."""
-        return self._started and not self._closed
+        return self._started and not self._closed and not self._transport_ended
 
     def start(self) -> None:
         """Spawn the child, start the readers, and complete the handshake.
@@ -849,9 +882,23 @@ class AppServerClient:
         written before either. A server that received a ``thread/start`` ahead
         of the handshake would be within its rights to reject it, and the
         failure would arrive later and somewhere else.
+
+        **A closed client does not start** (2026-11-13). A cancel can land before
+        the run that owns this client has reached ``start()``, and ``close()``
+        returns early on a client that is already closed -- so a child launched
+        after the close was a child nothing would ever stop. The check is made
+        twice because the launch itself takes time: once before it, and once
+        under the lock when the handle is stored, where a close that arrived
+        mid-launch found no process and this method stops the one it just made.
         """
-        if self._started:
-            return
+        with self._state_lock:
+            if self._started:
+                return
+            if self._closed:
+                raise AppServerTransportClosed(
+                    "the codex app-server client was closed before it was started; "
+                    "nothing was launched"
+                )
         argv = app_server_argv(self._binary, self._config_overrides)
         # The same guard every launch in this package passes through, even
         # though this argv is fixed: a forbidden argument that only appears in
@@ -864,18 +911,46 @@ class AppServerClient:
                 f"the codex CLI at {self._binary!r} could not be launched as an "
                 f"app-server: {exc}"
             ) from exc
-        self._proc = proc
-        self._started = True
+        with self._state_lock:
+            # Under the lock close() takes the handle under, so exactly one of
+            # the two ends this child: a close after this line finds the
+            # process, and a close before it is seen here.
+            closed = self._closed
+            if not closed:
+                self._proc = proc
+                self._started = True
+        if closed:
+            self._shutdown(proc)
+            raise AppServerTransportClosed(
+                "the codex app-server client was closed while its child was being "
+                "launched; the child was stopped"
+            )
+        # The readers are handed the process rather than reading ``self._proc``:
+        # a close between the lines above and their first instruction clears it,
+        # and a reader that found ``None`` would leave a real pipe undrained.
         self._reader = threading.Thread(
-            target=self._read_loop, name="modelpass-appserver-reader", daemon=True
+            target=self._read_loop,
+            args=(proc,),
+            name="modelpass-appserver-reader",
+            daemon=True,
         )
         self._reader.start()
         if getattr(proc, "stderr", None) is not None:
             self._stderr_reader = threading.Thread(
-                target=self._drain_stderr, name="modelpass-appserver-stderr", daemon=True
+                target=self._drain_stderr,
+                args=(proc,),
+                name="modelpass-appserver-stderr",
+                daemon=True,
             )
             self._stderr_reader.start()
-        self._handshake()
+        try:
+            self._handshake()
+        except BaseException:
+            # A start that did not finish leaves a child its caller may never
+            # have been handed: a session stores the client only once start()
+            # returns. Stopped here, so no caller has to know that.
+            self.close()
+            raise
 
     def _handshake(self) -> None:
         """``initialize`` then ``initialized``. See :meth:`start` for the ordering."""
@@ -898,7 +973,7 @@ class AppServerClient:
         )
         self.notify("initialized")
 
-    def close(self) -> None:
+    def close(self, *, force: bool = False) -> None:
         """Terminate the child politely, then kill it. Idempotent.
 
         Politely first because the app-server may be holding a thread open, and
@@ -907,6 +982,15 @@ class AppServerClient:
         from returning. Every pending request is failed rather than left to time
         out, and the notification stream gets its end sentinel, so nothing that
         was waiting on this client stays blocked.
+
+        A child whose stream already ended is still shut down here -- its stdin
+        closed, the process waited on, anything it left running stopped. That
+        the transport ended says the conversation is over; it does not say
+        anybody cleaned up.
+
+        ``force`` skips the polite half. It is for a caller that already asked
+        this server to stop and was not answered: waiting on a child that has
+        shown it is not listening only delays the kill.
         """
         with self._state_lock:
             if self._closed:
@@ -914,28 +998,64 @@ class AppServerClient:
             self._closed = True
             proc, self._proc = self._proc, None
         if proc is not None:
-            self._shutdown(proc)
+            self._shutdown(proc, force=force)
         self._fail_pending("the app-server client was closed")
         self._end_stream()
 
-    def _shutdown(self, proc: Any) -> None:
-        """Close stdin, terminate, then kill. Never raises."""
+    def _shutdown(self, proc: Any, *, force: bool = False) -> None:
+        """Close stdin, ask the child to stop, then kill its whole tree. Never raises.
+
+        **The whole tree**, because the process held here is the ``codex.cmd``
+        shim on Windows and the server runs two levels below it. ``terminate()``
+        and ``kill()`` there both end the shim alone, so a server that did not
+        leave on its own was never stopped at all (reproduced 2026-11-13 with a
+        child that ignores stdin EOF, ``tests/test_codex_process_tree.py``).
+
+        The polite step differs by platform because the platforms do. Off
+        Windows it is ``SIGTERM``, as before. Windows has no such signal, so
+        there it is the closed stdin: the server is given
+        :data:`_EOF_GRACE` to notice and leave, and only then killed. A child
+        that left on its own is let go of without killing anything it started.
+
+        **A write stuck in the child's stdin skips all of that** (2026-11-13). A
+        server that has stopped reading leaves whoever was sending it a message
+        blocked inside the pipe, holding the write lock -- and holding the
+        pipe object's own lock, so closing stdin from here would block behind
+        it for as long as the child lived. That child is not going to notice
+        anything polite: it is killed first, which is also what frees the
+        writer, and its stdin is closed afterwards. ``force`` takes the same
+        short road for a caller who already knows the server is not answering.
+        """
         stdin = getattr(proc, "stdin", None)
-        if stdin is not None:
-            try:
-                stdin.close()
-            except OSError:
-                pass
+        writable = self._write_lock.acquire(timeout=_STUCK_WRITE_WAIT)
+        polite = writable and not force
         try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=_SHUTDOWN_GRACE)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=_SHUTDOWN_GRACE)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            if writable:
+                _close_quietly(stdin)
+            try:
+                if proc.poll() is None:
+                    if polite:
+                        asked = terminate_tree(proc)
+                        try:
+                            proc.wait(timeout=_SHUTDOWN_GRACE if asked else _EOF_GRACE)
+                        except subprocess.TimeoutExpired:
+                            kill_tree(proc)
+                            proc.wait(timeout=_SHUTDOWN_GRACE)
+                    else:
+                        kill_tree(proc)
+                        proc.wait(timeout=_SHUTDOWN_GRACE)
+                release_tree(proc)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        finally:
+            if writable:
+                self._write_lock.release()
+        if not writable and self._write_lock.acquire(timeout=_SHUTDOWN_GRACE):
+            # The child is dead, so the stuck write has failed and let go.
+            try:
+                _close_quietly(stdin)
+            finally:
+                self._write_lock.release()
 
     # --- sending -----------------------------------------------------------------
 
@@ -959,7 +1079,7 @@ class AppServerClient:
                 "the codex app-server client has not been started; call start() first"
             )
         with self._state_lock:
-            if self._closed:
+            if self._closed or self._transport_ended:
                 raise AppServerTransportClosed(
                     f"the codex app-server client is closed; {method!r} was not sent"
                 )
@@ -1053,14 +1173,13 @@ class AppServerClient:
         """The last of the child's stderr, as one string. Possibly empty."""
         return "".join(self._stderr).strip()
 
-    def _read_loop(self) -> None:
+    def _read_loop(self, proc: Any) -> None:
         """The single reader: classify each line and route it. Never raises out.
 
         Ends on EOF -- the child exited -- which is the condition that turns
         every blocked :meth:`request` into a reported failure instead of a hang.
         """
-        proc = self._proc
-        stdout = getattr(proc, "stdout", None) if proc is not None else None
+        stdout = getattr(proc, "stdout", None)
         try:
             for raw in stdout or ():
                 line = raw.strip()
@@ -1090,9 +1209,13 @@ class AppServerClient:
         a consumer that read two sentinels would see the second as a second
         ending. One event, one ``None``.
         """
-        if not self._ended.is_set():
+        with self._state_lock:
+            # Checked and set as one step: the reader's EOF and a close() race
+            # here by design, and two sentinels is what the docstring rules out.
+            if self._ended.is_set():
+                return
             self._ended.set()
-            self.notifications.put(None)
+        self.notifications.put(None)
 
     def _dispatch(self, message: Mapping[str, Any]) -> None:
         """Route one parsed line by which of ``method`` and ``id`` it carries."""
@@ -1162,10 +1285,9 @@ class AppServerClient:
         else:
             waiter.put(("result", message.get("result")))
 
-    def _drain_stderr(self) -> None:
+    def _drain_stderr(self, proc: Any) -> None:
         """Feed the bounded tail. Its own thread, because two pipes need two."""
-        proc = self._proc
-        stream = getattr(proc, "stderr", None) if proc is not None else None
+        stream = getattr(proc, "stderr", None)
         try:
             for line in stream or ():
                 self._stderr.append(line)
@@ -1182,10 +1304,16 @@ class AppServerClient:
         self._stderr.append(f"[unroutable] {line[:2000]}\n")
 
     def _fail_pending(self, reason: str) -> None:
-        """Wake every blocked request with a transport-closed outcome."""
+        """Wake every blocked request with a transport-closed outcome.
+
+        Marks the transport ended under the same lock :meth:`request` registers
+        a waiter under, so no request can slip in behind this and wait on a
+        child that will never answer. It does **not** mark the client closed:
+        only :meth:`close` does, and it still has a process to shut down.
+        """
         with self._state_lock:
             pending, self._pending = self._pending, {}
-            self._closed = True
+            self._transport_ended = True
         for waiter in pending.values():
             waiter.put(("closed", reason))
 
@@ -1855,6 +1983,16 @@ class AppServerTurn:
             )
             return
         if mapped is TerminalStatus.OK:
+            # The turn's own status is the verdict, in both directions
+            # (2026-11-13). An ``error`` notification that arrived earlier had
+            # already set a failure, and this branch used to return without
+            # touching it -- so a turn the server reported as ``completed`` was
+            # still handed back as an error. :meth:`_note_error` states the
+            # rule ("the turn's own status outranks a notification that
+            # preceded it"); this is the half of it that was not written.
+            # The notification itself is not lost: it left as a vendor_event.
+            self.status = TerminalStatus.OK
+            self.reason = None
             return
         detail = turn_error_detail(error)
         if mapped is TerminalStatus.CANCELLED:
@@ -1881,6 +2019,16 @@ class AppServerTurn:
         outcome -- and it does not overwrite a verdict ``turn/completed`` has
         already given, because the turn's own status outranks a notification
         that preceded it.
+
+        What it sets is **provisional** for the same reason: it stands if the
+        stream ends without a ``turn/completed``, and a ``turn/completed`` that
+        does arrive replaces it, whichever way that goes
+        (:meth:`_note_turn_completed`). **Assumed, not driven**: no capture
+        holds an ``error`` notification, so that a real server follows a
+        ``willRetry: false`` error on a turn with ``status: "failed"`` for that
+        turn is read from the schema (``TurnStatus``, ``TurnError``) and not
+        observed. If a server ever reported ``completed`` for a turn it had
+        also declared failed, this reading would take its word for it.
         """
         if params.get("willRetry") is True:
             return
