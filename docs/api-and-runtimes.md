@@ -2040,39 +2040,61 @@ exists to refuse.
 **Install and auth.** `pip install modelpass[anthropic]` brings `claude-agent-sdk`;
 the native CLI comes from `npm install -g @anthropic-ai/claude-code` and you log
 in with `claude /login`, which lands a credential in
-`~/.claude/.credentials.json` (macOS: Keychain). modelpass never reads, copies,
-replays or transmits it — it launches the runtime and the runtime authenticates
-itself. Both subscription and API-key auth are supported; a *subscription*
-connection **fails closed**, meaning that if the preflight cannot confirm a
-usable subscription credential it reports `ok=False` and the bridge raises rather
+`~/.claude/.credentials.json` (macOS: Keychain). modelpass never opens that store,
+on any platform — not the file, not the Keychain — and so never reads, copies,
+replays or transmits what is in it: it launches the runtime and the runtime
+authenticates itself. Both subscription and API-key auth are supported; a
+*subscription* connection **fails closed**, meaning that if the preflight cannot
+confirm a subscription login it reports `ok=False` and the bridge raises rather
 than falling through to an API key.
+
+**What the preflight knows about the login (2026-11-13).** One thing: the answer of
+the documented, token-free `claude auth status` command, run with the connection's
+`CLAUDE_CONFIG_DIR` and scrubbed environment. Until this date the preflight read
+`.credentials.json` for the token's expiry, the plan and the rate-limit tier. That
+file is an undocumented internal format and macOS already worked without it, so the
+owner decided modelpass opens it nowhere. `CredentialStatus`, `credentials_path` and
+`read_credential_status` are gone from `modelpass.adapters.anthropic`, and a test
+fails if any string in the package names the file.
+
+Only `loggedIn: true` passes. `loggedIn: false` is refused with the `claude /login`
+command for that config directory; no readable answer is refused as *could not
+confirm a login*, naming `claude auth status` as the thing to run. Four fields are
+read: `loggedIn`, `subscriptionType` (the receipt's `plan_name`), `planTier` and
+`loginExpiresAt` (receipt notes, when the CLI reports them). The last two were seen
+on Claude Code 2.1.322 on 2026-11-13 (`planTier: max_5x`, `loginExpiresAt` an ISO
+date twelve days out) and are not in the vendor's documentation, so they are
+reported and decide nothing: a `loginExpiresAt` in the past is a note, not a refusal.
+
+What is no longer knowable before a run, and is said on every passing receipt: the
+access token's expiry, and whether it can be refreshed. The old `rate limit tier`
+note is gone with the file. A login that has lapsed is found by the run, which ends
+`error` with `HTTP 401: ...` followed by the instruction to re-run `claude /login`
+(on a subscription connection only). The init message's `apiKeySource` check is
+unchanged, so a lapsed login still cannot become a metered run. Not driven live:
+the 401 shape is the one observed live before this change, and no run was made against an
+expired login for this change.
 
 **Multiple accounts.** [Claude Code's supported isolation
 boundary](https://code.claude.com/docs/en/team#credential-management) is
 `CLAUDE_CONFIG_DIR`: all credentials, settings, plugins and history move
 beneath that root. A connection's `configDir` field (or `--config-dir PATH` at setup)
-sets it per launch. The value is carried on the preflight plan and receipt, and the
-credential probe reads `<configDir>/.credentials.json`, so the directory reported is
+sets it per launch. The value is carried on the preflight plan and receipt, and
+`claude auth status` runs with the same value, so the directory reported is
 the directory the child receives. An ambient `CLAUDE_CONFIG_DIR` is scrubbed unless a
 connection explicitly names its own; this prevents an IDE-launched process from
 silently switching accounts.
 
 **macOS.** Claude Code prefers the login Keychain there, and keys the Keychain entry to
 `CLAUDE_CONFIG_DIR` — a session with a different directory reads a different entry — so
-directory isolation is real on macOS too. When the Keychain refuses a write (locked, an
-SSH session, a password out of sync) Claude Code writes the same plaintext
-`.credentials.json` under that directory that Linux uses, and modelpass's probe checks for
-that file first on every platform. Keychain contents are never inspected by modelpass; if
-there is no file, `CredentialStatus.keychain_only` is set, the receipt names the entry
-and the directory it is keyed to, and the token-free `claude auth status` probe — which
-already runs with this connection's `CLAUDE_CONFIG_DIR` — becomes the evidence for which
-account the directory selects. `loggedIn: false` there fails the subscription preflight
-closed; a probe that returns nothing leaves the receipt usable and adds a note saying
-identity could not be confirmed. Codex needs no macOS-specific handling: its keyring
-entry is keyed by `CODEX_HOME` in the same way. **This macOS behaviour is implemented
-from Claude Code's documentation and Codex's published source and has not yet been
-exercised on a Mac**; every branch of it is covered by unit tests that simulate the
-platform.
+directory isolation is real on macOS too. modelpass has no macOS branch any more
+(2026-11-13): it opens neither the Keychain nor the plaintext `.credentials.json`
+Claude Code falls back to when the Keychain refuses a write, and asks `claude auth
+status` as it does everywhere else. **One behaviour changed there:** a probe that
+returned nothing used to leave the receipt usable with a note, and now refuses, as
+on every platform. Codex needs no macOS-specific handling: its keyring entry is keyed
+by `CODEX_HOME` in the same way. **None of this has been exercised on a Mac**; the
+tests patch `sys.platform`, which shows only that no branch reads it.
 
 Modelpass exposes this as an account profile: `name` is the stable ID used by clients,
 `nickname` is the human label, `vendor` is derived from the runtime, and `configDir`
@@ -2085,13 +2107,17 @@ connection, verify_identity=True)` — what `modelpass connect`, `verify`, `chec
 Bench use, through `Adapter.identity_preflight` — runs the documented, token-free `claude
 auth status` JSON command inside the selected `CLAUDE_CONFIG_DIR` and compares it with the
 pin. Every run path (`chat`, `achat`, sessions, failover, and `preflight()` by default)
-uses `Adapter.preflight`, which reads the connection's credential file only: no probe, no
-comparison, and the receipt's `account` reads `<pinned account> (recorded at verify, not
-re-checked at run time)`. Missing or unrefreshable credentials fail with a message naming
-the config directory and the `claude /login` command; an expired access token with a
-refresh token proceeds. On macOS with no credential file the run path proceeds on the
-Keychain's word (it cannot be inspected); the `loggedIn: false` refusal below applies to
-the setup-time check. The probe's non-secret identity fields
+uses `Adapter.preflight`, which makes no comparison and reports no account: the receipt's
+`account` reads `<pinned account> (recorded at verify, not re-checked at run time)` and
+its `account_profile` is empty. **Changed 2026-11-13:** a run used to read the credential
+file and start no subprocess. It now asks the same `claude auth status` probe whether a
+login is there, through the 60-second cache described below, so a batch of runs pays for
+one probe a minute per config directory. The 2026-10-01 failure — one empty probe
+refusing a whole batch — is met three ways: an unreadable answer is asked for twice more
+(0.5 s, then 1 s), an empty answer is never cached, and a run whose probe still returns
+nothing goes on the last good answer if it is under 15 minutes old, with a receipt note
+giving its age. With no earlier answer the run is refused. Setup-time checks never use
+an old answer. At setup the probe's non-secret identity fields
 become `Receipt.account_profile`: login state and method, API provider, email,
 organization ID/name, and subscription type. The adapter normalizes an explicit
 allow-list rather than retaining the vendor payload, so tokens and future unknown fields

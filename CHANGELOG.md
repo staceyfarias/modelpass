@@ -5,6 +5,40 @@ work landed.
 
 ## Unreleased
 
+### Changed
+
+- **`anthropic-sdk` never opens Claude Code's credential store** (2026-11-13). The
+  subscription preflight read `<config dir>/.credentials.json` for the token's expiry,
+  the plan and the rate-limit tier. It now opens neither that file nor the Keychain,
+  on any platform, and asks the documented `claude auth status` instead, as macOS
+  already did. Owner decision: the file is an undocumented internal format. What this
+  changes for a caller:
+  - **A run now runs the probe.** Since 2026-10-01 a run read the file and started no
+    subprocess. It now shares the 60-second cached `claude auth status` answer, so the
+    first run in a minute per config directory waits for it (about 2.4 s). A run still
+    compares no account with the pin and its receipt carries no `account_profile`.
+  - **Still fails closed.** Only `loggedIn: true` passes. `loggedIn: false` is refused
+    with `no Claude Code login found ... claude auth status reports no login`; no
+    readable answer is refused with `could not confirm a Claude Code login`. On macOS
+    a probe that returned nothing used to pass with a note, and now refuses.
+  - **One empty probe does not refuse a batch.** The probe is asked twice more when its
+    output is unreadable, an empty answer is never cached, and a run may go on a good
+    answer up to 15 minutes old, with a receipt note giving its age. Setup checks
+    (`connect`, `verify`, `check`, the bench) never use an old answer.
+  - **The receipt.** `credential_source` reads `Claude Code login (claude auth status,
+    <config dir or "default config directory">)`. `plan_name` is the probe's
+    `subscriptionType`. New notes `plan tier: ...` and `login expires on ... (claude
+    auth status)` appear when the CLI reports `planTier` and `loginExpiresAt` (seen on
+    Claude Code 2.1.322; neither is documented, and neither decides anything). Every
+    passing receipt says access-token expiry and refresh are not checked before a run.
+    Gone: `rate limit tier: ...`, the `past its expiry` note, and the refusals that
+    named a blank credential file, a missing refresh token or an expired one.
+  - **A 401 on a subscription run names the fix.** The terminal reason is `HTTP 401:
+    <vendor text>` followed by an instruction to re-run `claude /login`. `map_message`
+    takes `auth_mode=` for this. Not driven against a really expired login.
+  - **Removed** from `modelpass.adapters.anthropic`: `CredentialStatus`,
+    `credentials_path`, `read_credential_status`.
+
 ### Fixed
 
 - **`promptCache = "5m"` or `"1h"` now reaches `anthropic-api`** (2026-11-04). The
