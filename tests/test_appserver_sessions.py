@@ -1346,6 +1346,18 @@ def test_closing_the_session_closes_the_child(tmp_path):
     assert server.returncode is not None
 
 
+def test_a_session_child_runs_in_the_overridden_codex_home(tmp_path):
+    server = ScriptedThreadServer(two_turn_script())
+    adapter, spawn = adapter_for(server)
+    handle = adapter.open_session(
+        session_request(tmp_path, options={"codex_home": "C:/somewhere/else"})
+    )
+
+    list(handle.send("hello"))
+
+    assert spawn.env["CODEX_HOME"] == "C:/somewhere/else"
+
+
 # --- a cancel the server does not honour -------------------------------------------
 #
 # A bounded turn is cancelled from the watchdog's thread while the consumer is

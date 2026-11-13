@@ -2485,7 +2485,9 @@ class CodexSession:
         if not request.mcp_servers or request.options.get("allow_configured_mcp_servers"):
             return []
         if self._exclusivity is None:
-            listing = self._adapter._mcp_list(self._binary or "", dict(request.plan.env))
+            listing = self._adapter._mcp_list(
+                self._binary or "", self._adapter._child_env(request)
+            )
             try:
                 disable = (
                     None
@@ -2539,7 +2541,7 @@ class CodexSession:
                     return
                 try:
                     proc = self._adapter._session_spawn(
-                        argv, dict(request.plan.env), request.project_folder, err
+                        argv, self._adapter._child_env(request), request.project_folder, err
                     )
                 except OSError as exc:
                     raise VendorRunFailed(
@@ -2949,7 +2951,7 @@ class CodexAppServerSession:
         request = self._request
         client = AppServerClient(
             binary=self._binary or "",
-            env=dict(request.plan.env),
+            env=self._adapter._child_env(request),
             cwd=request.project_folder,
             spawn=self._adapter._app_server_spawn,
             server_request_handler=self._dispatcher,
@@ -3573,10 +3575,29 @@ class OpenAIAdapter(Adapter):
             return str(override)
         return _which_codex()
 
-    def _codex_home_for(self, request: RunRequest) -> Path:
+    def _codex_home_for(self, request: RunRequest | SessionRequest) -> Path:
         return codex_home(
             request.plan.env, request.options.get("codex_home") or self._codex_home
         )
+
+    def _child_env(self, request: RunRequest | SessionRequest) -> dict[str, str]:
+        """The environment every Codex child of this request is launched with.
+
+        The plan's scrubbed environment, plus one thing: a ``codex_home``
+        override -- ``options={"codex_home": ...}`` or the adapter's own -- is
+        written into it as ``CODEX_HOME``. The override used to steer only what
+        the *preflight* read, so the receipt could describe a ChatGPT login in
+        one home while the child ran on an API-key login in another
+        (2026-11-13). The home that was inspected and the home that is used are
+        now one value, for the run, for a session's turns and for every probe.
+
+        Without an override this is the plan's environment, unchanged.
+        """
+        env = dict(request.plan.env)
+        override = request.options.get("codex_home") or self._codex_home
+        if override:
+            env["CODEX_HOME"] = str(override)
+        return env
 
     def _model_fields(self, request: RunRequest, home: Path) -> dict[str, Any]:
         """What the receipt should say about the model, when the plan cannot say.
@@ -3603,7 +3624,7 @@ class OpenAIAdapter(Adapter):
         the rejection arrives as an opaque 400 mid-run rather than as a line read
         beforehand (operational finding, 2026-08-30).
         """
-        version = self._codex_version(binary, dict(request.plan.env))
+        version = self._codex_version(binary, self._child_env(request))
         notes = [f"codex binary: {binary}" + (f" ({version})" if version else "")]
         configured = read_configured_cli_path(home)
         if configured and os.path.normcase(configured) != os.path.normcase(binary):
@@ -3827,7 +3848,7 @@ class OpenAIAdapter(Adapter):
             source = "API key login (codex login --with-api-key)"
             ok, problem = True, None
         else:
-            output = self._login_status(binary, dict(plan.env))
+            output = self._login_status(binary, self._child_env(request))
             if output is None and not probe_identity:
                 detected, source, ok, problem = (
                     request.connection.auth_mode,
@@ -3862,7 +3883,7 @@ class OpenAIAdapter(Adapter):
         account_profile = None
         if detected is not None and probe_identity:
             account_profile = _account_profile_from_account_read(
-                self._cached_account_read(binary, dict(plan.env), home)
+                self._cached_account_read(binary, self._child_env(request), home)
             )
 
         return Receipt.from_plan(
@@ -4178,7 +4199,7 @@ class OpenAIAdapter(Adapter):
             # enumeration fails, because running without a promised guarantee is
             # the kind of silent surprise this library exists to prevent.
             # Explicit opt-out: options={"allow_configured_mcp_servers": True}.
-            listing = self._mcp_list(binary, dict(request.plan.env))
+            listing = self._mcp_list(binary, self._child_env(request))
             try:
                 disable = None if listing is None else exclusivity_disable_args(
                     listing, request.mcp_servers
@@ -4239,7 +4260,7 @@ class OpenAIAdapter(Adapter):
                 cwd = str(
                     request.options.get("cwd") or tempfile.mkdtemp(prefix="modelpass-codex-")
                 )
-                proc = self._spawn(argv, dict(request.plan.env), cwd)
+                proc = self._spawn(argv, self._child_env(request), cwd)
             except OSError as exc:
                 raise VendorRunFailed(
                     f"the codex CLI at {binary!r} could not be launched: {exc}"
@@ -4354,7 +4375,7 @@ class OpenAIAdapter(Adapter):
         dispatcher = CallerToolDispatcher(request.tools) if request.tools else None
         client = AppServerClient(
             binary=binary,
-            env=dict(request.plan.env),
+            env=self._child_env(request),
             cwd=cwd,
             spawn=self._app_server_spawn,
             server_request_handler=dispatcher,
@@ -4861,7 +4882,7 @@ class OpenAIAdapter(Adapter):
             raise VendorRunFailed("codex CLI not found")
         client = AppServerClient(
             binary=binary,
-            env=dict(request.plan.env),
+            env=self._child_env(request),
             cwd=request.project_folder,
             spawn=self._app_server_spawn,
         )
@@ -4890,7 +4911,7 @@ class OpenAIAdapter(Adapter):
             raise VendorRunFailed("codex CLI not found")
         client = AppServerClient(
             binary=binary,
-            env=dict(request.plan.env),
+            env=self._child_env(request),
             cwd=tempfile.gettempdir(),
             spawn=self._app_server_spawn,
         )

@@ -2034,6 +2034,16 @@ def test_a_run_that_cannot_be_isolated_fails_closed_before_any_thread(config_rea
     assert "turn/start" not in server.methods
 
 
+def test_a_codex_home_override_is_the_home_the_app_server_runs_in():
+    """Preflight and child must agree on the home, or the receipt describes another login."""
+    server = ScriptedAppServer(script_for())
+    adapter, spawn = adapter_for(server)
+
+    list(adapter.run(request_for(options={"codex_home": "C:/somewhere/else"})))
+
+    assert spawn.env["CODEX_HOME"] == "C:/somewhere/else"
+
+
 def test_the_option_surface_is_the_one_isolation_was_checked_against():
     """A new option must be weighed against isolation before it can exist."""
     assert OpenAIAdapter.option_keys == frozenset(

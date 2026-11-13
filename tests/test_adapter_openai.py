@@ -405,6 +405,57 @@ def test_run_launches_an_isolated_account_with_its_codex_home(tmp_path):
     assert spawn.proc.stdin.closed is True
 
 
+def test_a_codex_home_override_is_the_home_the_child_runs_in(tmp_path):
+    """The login the receipt describes has to be the login the run uses.
+
+    ``options={"codex_home": X}`` pointed the preflight at X and left the child
+    in whatever home the plan named -- so X could hold a ChatGPT login while the
+    child ran on an API-key login in ``~/.codex``: a receipt saying
+    *subscription* over a run billed to a key.
+    """
+    home = tmp_path / "other-codex"
+    spawn = FakeSpawn(FakeProc(SUCCESS_STREAM))
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=spawn)
+
+    list(
+        adapter.run(
+            request_for(codex_connection(), options={**EXEC, "codex_home": str(home)})
+        )
+    )
+
+    assert spawn.env["CODEX_HOME"] == str(home)
+
+
+def test_an_adapter_wide_codex_home_reaches_the_child_and_the_probes(tmp_path):
+    home = tmp_path / "other-codex"
+    home.mkdir()
+    seen: dict[str, str | None] = {}
+
+    def login_status(binary, env):
+        seen["login"] = env.get("CODEX_HOME")
+        return "Logged in using ChatGPT\n"
+
+    def version(binary, env):
+        seen["version"] = env.get("CODEX_HOME")
+        return "codex-cli 0.117.0"
+
+    spawn = FakeSpawn(FakeProc(SUCCESS_STREAM))
+    adapter = OpenAIAdapter(
+        codex_bin="codex",
+        spawn=spawn,
+        login_status=login_status,
+        codex_version=version,
+        codex_home=home,
+    )
+    request = request_for(codex_connection())
+
+    assert adapter.preflight(request).ok is True
+    list(adapter.run(request))
+
+    assert seen == {"login": str(home), "version": str(home)}
+    assert spawn.env["CODEX_HOME"] == str(home)
+
+
 def test_prompt_rides_stdin_because_cmd_truncates_argv_at_newline():
     """The defect this transport exists to prevent, pinned.
 
@@ -1892,6 +1943,18 @@ def test_a_cancelled_exec_session_turn_ends_cancelled_not_as_a_failed_exit():
     assert spawn.procs[0].killed
     assert terminal.status is TerminalStatus.CANCELLED
     assert session.id is None
+
+
+def test_an_exec_session_turn_runs_in_the_overridden_codex_home(tmp_path):
+    home = tmp_path / "other-codex"
+    spawn = FakeSessionSpawn(SUCCESS_STREAM)
+    session = session_adapter(spawn).open_session(
+        session_request(options={**EXEC, "codex_home": str(home)})
+    )
+
+    list(session.send("hello"))
+
+    assert spawn.envs[0]["CODEX_HOME"] == str(home)
 
 
 def test_resume_session_refuses_a_system_prompt():
