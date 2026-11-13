@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -1143,6 +1144,53 @@ def test_an_interrupt_that_cannot_even_be_written_gives_up_on_time():
 
     assert accepted is False
     assert time.monotonic() - started < 5
+
+
+@pytest.fixture
+def run_dirs(monkeypatch):
+    """Every ``modelpass-codex-`` directory a run makes for itself, as it is made."""
+    import modelpass.adapters.openai as module
+
+    made: list[Path] = []
+    real = module.tempfile.mkdtemp
+
+    def recording(*args, **kwargs):
+        made.append(Path(real(*args, **kwargs)))
+        return str(made[-1])
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", recording)
+    yield made
+    for path in made:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_the_directory_an_app_server_run_makes_for_itself_is_removed(run_dirs):
+    """On every way out: finished, cancelled, and failed before the turn."""
+    list(adapter_for(ScriptedAppServer(script_for()))[0].run(request_for()))
+
+    server = ScriptedAppServer(script_for())
+    stream = adapter_for(server)[0].run(request_for())
+    for _ in range(3):
+        next(stream)
+    stream.cancel()
+    list(stream)
+
+    script = script_for()
+    script["thread/start"] = ({"thread": {}}, [])
+    with pytest.raises(VendorRunFailed):
+        list(adapter_for(ScriptedAppServer(script))[0].run(request_for()))
+
+    assert len(run_dirs) == 3
+    assert not any(path.exists() for path in run_dirs)
+
+
+def test_an_app_server_run_leaves_the_callers_own_directory_alone(tmp_path, run_dirs):
+    adapter, _ = adapter_for(ScriptedAppServer(script_for()))
+
+    list(adapter.run(request_for(options={"cwd": str(tmp_path)})))
+
+    assert run_dirs == []
+    assert tmp_path.is_dir()
 
 
 def test_interrupt_needs_both_ids_and_never_raises():

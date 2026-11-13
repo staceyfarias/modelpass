@@ -1570,6 +1570,28 @@ def _write_schema_file(schema: Mapping[str, Any]) -> str:
     return handle.name
 
 
+def _remove_run_dir(path: str | None) -> None:
+    """Remove the working directory a stateless run made for itself.
+
+    A run with no ``options={"cwd": ...}`` gets a fresh ``modelpass-codex-``
+    directory so the runtime has no repository to walk, and one of those was
+    left in the temp folder per call (2026-11-13). Only a directory the run
+    created is ever passed here; a caller's own is never touched.
+
+    Called after the child is stopped. A few short tries, because on Windows a
+    directory cannot be removed while a process that has only just been killed
+    still holds it. Never the reason a run fails: a directory that will not go
+    is left behind, as all of them used to be.
+    """
+    if not path:
+        return
+    for _ in range(5):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            return
+        time.sleep(0.1)
+
+
 def _remove_schema_file(path: str | None) -> None:
     """Remove the per-run schema file. Never the reason a run fails."""
     if not path:
@@ -4225,6 +4247,7 @@ class OpenAIAdapter(Adapter):
         # Created last, so every refusal above happens before there is a file to
         # clean up.
         schema_file: str | None = None
+        run_dir: str | None = None
         proc: Any = None
         try:
             if request.schema is not None:
@@ -4257,10 +4280,10 @@ class OpenAIAdapter(Adapter):
                 )
                 return
             try:
-                cwd = str(
-                    request.options.get("cwd") or tempfile.mkdtemp(prefix="modelpass-codex-")
-                )
-                proc = self._spawn(argv, self._child_env(request), cwd)
+                cwd = request.options.get("cwd")
+                if not cwd:
+                    cwd = run_dir = tempfile.mkdtemp(prefix="modelpass-codex-")
+                proc = self._spawn(argv, self._child_env(request), str(cwd))
             except OSError as exc:
                 raise VendorRunFailed(
                     f"the codex CLI at {binary!r} could not be launched: {exc}"
@@ -4275,6 +4298,7 @@ class OpenAIAdapter(Adapter):
             run.detach()
             self._runs.discard(run)
             _remove_schema_file(schema_file)
+            _remove_run_dir(run_dir)
 
     def _stream_run(
         self, request: RunRequest, proc: Any, run: _CodexRun
@@ -4368,7 +4392,11 @@ class OpenAIAdapter(Adapter):
         """
         self._refuse_on_app_server(request)
         check_dynamic_tool_names(request.tools)
-        cwd = str(request.options.get("cwd") or tempfile.mkdtemp(prefix="modelpass-codex-"))
+        run_dir: str | None = None
+        cwd = request.options.get("cwd")
+        if not cwd:
+            cwd = run_dir = tempfile.mkdtemp(prefix="modelpass-codex-")
+        cwd = str(cwd)
         # No tools means no dispatcher, which means the client keeps
         # ``decline_approvals`` verbatim: a plain chat run on this transport is
         # byte-for-byte the run S4 shipped.
@@ -4479,6 +4507,7 @@ class OpenAIAdapter(Adapter):
             run.detach()
             self._runs.discard(run)
             client.close()
+            _remove_run_dir(run_dir)
 
     def _isolation_thread_config(
         self, client: AppServerClient, cwd: str

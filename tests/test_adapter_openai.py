@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 import time
 import tomllib
 from pathlib import Path
@@ -44,6 +45,7 @@ from modelpass.errors import (
     PreflightFailed,
     SessionClosed,
     SessionNotFound,
+    VendorRunFailed,
 )
 from modelpass.preflight import plan_launch
 from modelpass.runtimes import Runtime
@@ -1032,6 +1034,62 @@ def test_a_run_cancelled_before_it_starts_launches_no_process():
     assert spawn.argv is None
     assert [e.type for e in events] == ["terminal"]
     assert events[0].status is TerminalStatus.CANCELLED
+
+
+@pytest.fixture
+def run_dirs(monkeypatch):
+    """Every ``modelpass-codex-`` directory a run makes for itself, as it is made."""
+    import modelpass.adapters.openai as module
+
+    made: list[Path] = []
+    real = module.tempfile.mkdtemp
+
+    def recording(*args, **kwargs):
+        made.append(Path(real(*args, **kwargs)))
+        return str(made[-1])
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", recording)
+    yield made
+    for path in made:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_the_directory_a_run_makes_for_itself_is_removed_when_it_ends(run_dirs):
+    """One per stateless call used to stay behind in the temp folder for good."""
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=FakeSpawn(FakeProc(SUCCESS_STREAM)))
+
+    list(adapter.run(request_for(codex_connection())))
+
+    assert len(run_dirs) == 1
+    assert not run_dirs[0].exists()
+
+
+def test_the_run_directory_is_removed_on_a_cancel_and_on_a_failed_launch(run_dirs):
+    proc = FakeProc([THREAD_STARTED, TURN_STARTED], returncode=1)
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=FakeSpawn(proc))
+    stream = adapter.run(request_for(codex_connection()))
+    next(stream)
+    stream.cancel()
+    list(stream)
+
+    def refuse(argv, env, cwd):
+        raise OSError(193, "%1 is not a valid Win32 application")
+
+    with pytest.raises(VendorRunFailed):
+        adapter = OpenAIAdapter(codex_bin="codex", spawn=refuse)
+        list(adapter.run(request_for(codex_connection())))
+
+    assert len(run_dirs) == 2
+    assert not any(path.exists() for path in run_dirs)
+
+
+def test_a_directory_the_caller_named_is_never_removed(tmp_path, run_dirs):
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=FakeSpawn(FakeProc(SUCCESS_STREAM)))
+
+    list(adapter.run(request_for(codex_connection(), options={**EXEC, "cwd": str(tmp_path)})))
+
+    assert run_dirs == []
+    assert tmp_path.is_dir()
 
 
 # --- preflight ------------------------------------------------------------------
