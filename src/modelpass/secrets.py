@@ -15,8 +15,11 @@ Three rules this module holds to, and the tests are their executable form:
    thing about a key that may.
 2. **A protection is reported, never claimed.** POSIX gets ``0600`` and a read
    that notices group or other bits says so. Windows gets a best-effort
-   ``icacls`` whose *actual* result -- success or the reason it failed -- is
-   recorded in the file and printed by ``modelpass check``.
+   ``icacls`` on every write, applied to the temp file *before* it is moved
+   into place, and ``modelpass check`` reports the ACL the file really has --
+   read back from the file, never from a note saying what was attempted
+   (2026-11-13: the note said "restricted" over a file whose restriction the
+   very next write had replaced).
 3. **An orphan is recoverable; a deleted key is not.** So the delete rules lean
    toward leaving an entry in place and saying so, and a secret that a
    connection still references is never removed.
@@ -31,6 +34,7 @@ from __future__ import annotations
 
 import os
 import stat
+import struct
 import subprocess
 import tempfile
 import tomllib
@@ -50,6 +54,9 @@ __all__ = [
     "SecretPermissions",
     "SecretSource",
     "SecretStore",
+    "read_windows_acl",
+    "restrict_windows_acl",
+    "windows_account_sid",
 ]
 
 SECRETS_VERSION = 1
@@ -76,9 +83,10 @@ _HEADER = f"""\
 # variable has (D2).
 #
 # Permissions. On macOS and Linux this file is created 0600 and modelpass check
-# says so if the mode has since been widened. On Windows modelpass runs, once at
-# creation, icacls <path> /inheritance:r /grant:r "<you>":F, and records below
-# whether that actually worked -- the floor either way is the ACL on your user
+# says so if the mode has since been widened. On Windows modelpass runs, on
+# every write, icacls <path> /inheritance:r /grant:r "<you>":F, and records below
+# whether that attempt worked. modelpass check does not trust the record: it
+# reads the file's real ACL. The floor either way is the ACL on your user
 # profile directory, which is what %USERPROFILE% carries.
 #
 # Compatibility: this build reads any version and refuses to write one newer
@@ -129,6 +137,19 @@ class SecretPermissions:
     Every field is an observation. ``note`` is the sentence ``modelpass check``
     prints, and it is written so that a protection that was not applied is never
     described as though it were.
+
+    ``windows_acl`` on Windows is read off the file's own ACL (2026-11-13):
+
+    * ``"restricted"`` -- every entry that allows access names the account this
+      process runs as, and none is inherited.
+    * ``"failed"`` -- the file is not restricted and the last attempt to
+      restrict it is on record as having failed; ``windows_acl_detail`` is why.
+    * ``"open"`` -- the file is not restricted and nothing on record explains
+      it; ``windows_acl_detail`` says what the ACL has in it.
+    * ``"unknown"`` -- the ACL could not be read.
+
+    Anywhere else it is whatever the file's ``[permissions]`` note carries,
+    which is ``None`` for a file that has never been on Windows.
     """
 
     path: str
@@ -149,6 +170,18 @@ class SecretPermissions:
                 reason = self.windows_acl_detail or "no reason was recorded"
                 return (
                     f"could not restrict the secrets file: {reason}; the profile "
+                    "directory's own ACL is the floor"
+                )
+            if self.windows_acl == "open":
+                reason = self.windows_acl_detail or "its ACL allows more than that"
+                return (
+                    f"the secrets file is readable beyond your account: {reason}; "
+                    "the profile directory's own ACL is the floor"
+                )
+            if self.windows_acl == "unknown":
+                reason = self.windows_acl_detail or "no reason was reported"
+                return (
+                    f"could not read the secrets file's ACL: {reason}; the profile "
                     "directory's own ACL is the floor"
                 )
             return (
@@ -322,6 +355,18 @@ class SecretStore:
         if not self.exists():
             return SecretPermissions(path=str(self.path), exists=False)
         acl, detail = self._recorded_acl()
+        if os.name == "nt":
+            # The record is what an attempt reported; the ACL is what is true.
+            # Only the second may be described as a protection, so the file is
+            # asked. The record keeps one job: where the file is not restricted,
+            # it may know why the attempt to restrict it failed.
+            observed, why = read_windows_acl(self.path)
+            if observed == "restricted":
+                acl, detail = "restricted", ""
+            elif acl == "failed":
+                detail = detail or why
+            else:
+                acl, detail = observed, why
         try:
             mode = stat.S_IMODE(self.path.stat().st_mode)
         except OSError:
@@ -460,15 +505,23 @@ class SecretStore:
         for key, value in raw.items():
             if key not in {"version", "secrets", "permissions"}:
                 document.setdefault(key, value)
+        self._write(document)
+
+    @staticmethod
+    def _render(document: Mapping[str, Any]) -> str:
         body = _toml.dumps(document) if document else ""
-        self._write(_HEADER + ("\n" + body if body else ""))
+        return _HEADER + ("\n" + body if body else "")
 
     def _permissions_table_to_write(self) -> dict[str, Any]:
         """The ``[permissions]`` note to re-emit, preserving what is recorded.
 
-        Carried rather than recomputed: it records what happened *when the file
-        was created*, and re-running ``icacls`` on every write would turn a
-        one-time observation into a claim refreshed behind the user's back.
+        On Windows :meth:`_write` then overwrites the two ACL keys with what
+        this write's own ``icacls`` did, because the ACL is re-applied on every
+        write (2026-11-13). It used to be applied once, at creation, on the
+        reasoning that a one-time observation should not be refreshed behind
+        the user's back -- but every write replaces the file with a new one, so
+        the one-time restriction did not outlive the first of them and the
+        note went on describing a file that no longer existed.
         """
         raw = self._read().get("permissions")
         if not isinstance(raw, Mapping):
@@ -477,8 +530,20 @@ class SecretStore:
         # the file follows.
         return dict(raw)
 
-    def _write(self, text: str) -> None:
-        created = not self.exists()
+    def _write(self, document: Mapping[str, Any]) -> None:
+        """Replace the file with ``document``, atomically, restricted first.
+
+        **The restriction goes on the temp file, before the move.** A move
+        within a directory keeps the ACL the file arrives with, and a freshly
+        created temp file arrives with the directory's inherited one. Applying
+        ``icacls`` to the file already in place and then rewriting it -- which
+        is what recording the outcome did -- threw the restriction away on the
+        spot (2026-11-13, confirmed with ``icacls`` on a real machine). So the
+        order is: write the temp file, restrict it, note in it what the
+        restriction did, move it. The file in place is never one that has not
+        been through that.
+        """
+        document = dict(document)
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             try:
@@ -496,7 +561,7 @@ class SecretStore:
             )
             try:
                 with handle:
-                    handle.write(text)
+                    handle.write(self._render(document))
                 # NamedTemporaryFile already creates at 0600 and os.replace
                 # preserves the source mode, so this is belt and braces -- but
                 # the file it protects is the one file in modelpass that holds a
@@ -506,52 +571,79 @@ class SecretStore:
                     os.chmod(handle.name, 0o600)
                 except (OSError, NotImplementedError):  # pragma: no cover - Windows
                     pass
+                if os.name == "nt":
+                    noted = _with_acl_outcome(
+                        document, restrict_windows_acl(Path(handle.name))
+                    )
+                    if noted != document:
+                        # Rewritten in place, not replaced: the same file keeps
+                        # the ACL it was just given. Only the first write, and a
+                        # write whose outcome differs from the last one's, gets
+                        # here.
+                        with open(
+                            handle.name, "w", encoding="utf-8", newline="\n"
+                        ) as again:
+                            again.write(self._render(noted))
                 os.replace(handle.name, self.path)
             except BaseException:
                 Path(handle.name).unlink(missing_ok=True)
                 raise
         except OSError as exc:
             raise ConfigError(f"cannot write {self.path}: {exc}") from exc
-        if created and os.name == "nt":
-            self._record_windows_acl(restrict_windows_acl(self.path))
 
-    def _record_windows_acl(self, outcome: tuple[str, str]) -> None:
-        """Store what ``icacls`` actually did, so ``check`` can report it honestly."""
-        status, detail = outcome
-        raw = self._read()
-        document: dict[str, Any] = {"permissions": {"windowsAcl": status}}
-        if detail:
-            document["permissions"]["windowsAclDetail"] = detail
-        secrets = raw.get("secrets")
-        if isinstance(secrets, Mapping) and secrets:
-            document["secrets"] = dict(secrets)
-        for key, value in raw.items():
-            if key not in {"version", "secrets", "permissions"}:
-                document.setdefault(key, value)
-        body = _toml.dumps(document)
-        try:
-            self._write(_HEADER + "\n" + body)
-        except ConfigError:  # pragma: no cover - best effort, never fatal
-            pass
+
+def _with_acl_outcome(
+    document: Mapping[str, Any], outcome: tuple[str, str]
+) -> dict[str, Any]:
+    """``document`` with its ``[permissions]`` note saying what ``icacls`` just did.
+
+    The note is first in the file, as it always was, and any key in it this
+    build does not know is carried. A detail left over from an earlier failure
+    is dropped once an attempt succeeds, so the file never explains a failure
+    that is no longer true.
+    """
+    status, detail = outcome
+    recorded = document.get("permissions")
+    permissions = dict(recorded) if isinstance(recorded, Mapping) else {}
+    permissions["windowsAcl"] = status
+    if detail:
+        permissions["windowsAclDetail"] = detail
+    else:
+        permissions.pop("windowsAclDetail", None)
+    noted: dict[str, Any] = {"permissions": permissions}
+    for key, value in document.items():
+        if key != "permissions":
+            noted[key] = value
+    return noted
 
 
 def restrict_windows_acl(path: Path) -> tuple[str, str]:
-    """Best-effort ``icacls`` on a freshly created secrets file.
+    """Best-effort ``icacls`` on a secrets file that is about to be moved into place.
 
     Returns ``("restricted", "")`` or ``("failed", reason)``. It never raises and
     it never claims more than happened: the documented floor is the ACL that
     ``%USERPROFILE%`` already carries, and this is one layer on top of that
-    which may or may not have been applied. ``modelpass check`` prints whichever
-    of the two is true.
+    which may or may not have been applied. What it returns is what the
+    *attempt* reported; ``modelpass check`` prints what :func:`read_windows_acl`
+    finds on the file.
+
+    **The grantee is the account this process is running as, by SID**
+    (2026-11-13). It used to be ``%USERDOMAIN%\\%USERNAME%``, and those are
+    environment variables: a service, a scheduled task or a ``runas`` launch can
+    carry somebody else's, a scrubbed environment carries none, and whoever
+    sets them chooses who gets full control of the one file that holds keys.
+    The process token cannot be talked out of who it belongs to, and a SID
+    needs no name lookup.
     """
-    user = os.environ.get("USERNAME") or ""
-    if not user:
-        return "failed", "USERNAME is not set, so there is no account to grant to"
-    domain = os.environ.get("USERDOMAIN")
-    account = f"{domain}\\{user}" if domain else user
+    sid = windows_account_sid()
+    if not sid:
+        return "failed", (
+            "could not determine the account this process is running as, so "
+            "there is no account to grant to"
+        )
     try:
         completed = subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{account}:F"],
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
             capture_output=True,
             text=True,
             timeout=20,
@@ -565,4 +657,215 @@ def restrict_windows_acl(path: Path) -> tuple[str, str]:
         detail = (completed.stderr or completed.stdout or "").strip().splitlines()
         reason = detail[0] if detail else f"icacls exited {completed.returncode}"
         return "failed", reason
+    return "restricted", ""
+
+
+# --- reading Windows security through its own API ------------------------------------
+#
+# ctypes rather than a parsed ``icacls`` listing or a parsed ``whoami``: both of
+# those print for a person, in the machine's language, and the two questions
+# here -- whose process is this, and who may open that file -- have typed
+# answers one call away. Standard library only, like the rest of core.
+
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER = 1  # TOKEN_INFORMATION_CLASS.TokenUser
+_SE_FILE_OBJECT = 1
+_DACL_SECURITY_INFORMATION = 0x00000004
+_ACL_SIZE_INFORMATION = 2  # ACL_INFORMATION_CLASS.AclSizeInformation
+_ACCESS_ALLOWED_ACE_TYPE = 0
+_ACCESS_DENIED_ACE_TYPE = 1
+_INHERITED_ACE = 0x10
+
+
+def _win32() -> tuple[Any, Any, Any, Any] | None:
+    """``(ctypes, wintypes, advapi32, kernel32)`` with signatures set, or ``None``."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    except (ImportError, OSError, AttributeError):  # pragma: no cover - no Win32
+        return None
+
+    pointer = ctypes.POINTER
+    void_p = ctypes.c_void_p
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [void_p]
+    kernel32.LocalFree.restype = void_p
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        pointer(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        void_p,
+        wintypes.DWORD,
+        pointer(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [void_p, pointer(void_p)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        pointer(void_p),
+        pointer(void_p),
+        pointer(void_p),
+        pointer(void_p),
+        pointer(void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetAclInformation.argtypes = [void_p, void_p, wintypes.DWORD, ctypes.c_int]
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [void_p, wintypes.DWORD, pointer(void_p)]
+    advapi32.GetAce.restype = wintypes.BOOL
+    return ctypes, wintypes, advapi32, kernel32
+
+
+def _sid_string(win: tuple[Any, Any, Any, Any], sid: int | None) -> str | None:
+    """``S-1-5-...`` for a SID pointer, or ``None``."""
+    ctypes, _wintypes, advapi32, kernel32 = win
+    if not sid:
+        return None
+    text = ctypes.c_void_p()
+    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+        return None
+    try:
+        return ctypes.wstring_at(text.value)
+    finally:
+        kernel32.LocalFree(text)
+
+
+def windows_account_sid() -> str | None:
+    """The SID of the account this process is running as, off its own token.
+
+    ``None`` anywhere but Windows, and on Windows if the token cannot be read --
+    in which case there is nobody to grant to and the caller says so, rather
+    than falling back to a name out of the environment.
+    """
+    win = _win32()
+    if win is None:
+        return None
+    ctypes, wintypes, advapi32, kernel32 = win
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
+    ):
+        return None
+    try:
+        needed = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, _TOKEN_USER, None, 0, ctypes.byref(needed))
+        if not needed.value:
+            return None
+        buffer = ctypes.create_string_buffer(needed.value)
+        if not advapi32.GetTokenInformation(
+            token, _TOKEN_USER, buffer, needed.value, ctypes.byref(needed)
+        ):
+            return None
+        # TOKEN_USER opens with SID_AND_ATTRIBUTES, which opens with the PSID.
+        sid = ctypes.c_void_p.from_buffer(buffer).value
+        return _sid_string(win, sid)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def read_windows_acl(path: Path) -> tuple[str, str]:
+    """Who the file's ACL really lets in: ``(state, detail)``.
+
+    ``("restricted", "")`` when every entry that allows access names the
+    account this process runs as and none of them is inherited -- which is what
+    ``icacls /inheritance:r /grant:r <you>:F`` leaves. ``("open", why)`` for
+    anything wider, and ``("unknown", why)`` when the ACL could not be read or
+    holds an entry of a kind this does not interpret. An unreadable ACL is never
+    reported as restricted.
+
+    Read from the file every time. Nothing here consults what a previous write
+    recorded, because that record is exactly what was wrong (2026-11-13).
+    """
+    win = _win32()
+    if win is None:
+        return "unknown", "the Windows security API is not available"
+    ctypes, wintypes, advapi32, kernel32 = win
+    mine = windows_account_sid()
+    if not mine:
+        return "unknown", "could not determine the account this process is running as"
+
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        _SE_FILE_OBJECT,
+        _DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        return "unknown", f"the ACL could not be read (Windows error {status})"
+    try:
+        if not dacl.value:
+            # A null DACL is the absence of any restriction at all.
+            return "open", "it has no access control list, so everyone is allowed"
+
+        class AclSize(ctypes.Structure):
+            _fields_ = (
+                ("AceCount", wintypes.DWORD),
+                ("AclBytesInUse", wintypes.DWORD),
+                ("AclBytesFree", wintypes.DWORD),
+            )
+
+        size = AclSize()
+        if not advapi32.GetAclInformation(
+            dacl, ctypes.byref(size), ctypes.sizeof(size), _ACL_SIZE_INFORMATION
+        ):
+            return "unknown", "the ACL's entries could not be counted"
+
+        inherited = 0
+        others: set[str] = set()
+        granted_to_me = False
+        for index in range(size.AceCount):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
+                return "unknown", "an ACL entry could not be read"
+            # ACE_HEADER: type, flags, size. Then, for the two plain kinds, a
+            # 4-byte access mask and the SID.
+            ace_type, flags, _size = struct.unpack("<BBH", ctypes.string_at(ace.value, 4))
+            if ace_type == _ACCESS_DENIED_ACE_TYPE:
+                continue  # a denial only ever narrows
+            if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
+                return "unknown", "the ACL holds an entry of a kind modelpass does not read"
+            if flags & _INHERITED_ACE:
+                inherited += 1
+            sid = _sid_string(win, ace.value + 8)
+            if sid is None:
+                return "unknown", "an ACL entry names an account that could not be read"
+            if sid == mine:
+                granted_to_me = True
+            else:
+                others.add(sid)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+    if inherited:
+        return "open", "it inherits its directory's permissions"
+    if others:
+        count = len(others)
+        return "open", (
+            f"its ACL also allows {count} other account{'s' if count != 1 else ''} "
+            "or group" + ("s" if count != 1 else "")
+        )
+    if not granted_to_me:
+        return "unknown", "its ACL allows nobody, this account included"
     return "restricted", ""
