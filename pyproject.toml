@@ -33,8 +33,21 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-anthropic = ["claude-agent-sdk>=0.2.159"]
-openai = ["openai-codex"]
+# The Claude Agent SDK for the `anthropic-sdk` runtime. Capped below 0.3 because
+# this adapter leans on the package's internals, and on a 0.x line the minor is
+# where those move: it subclasses the private `SubprocessCLITransport`, depends
+# on that transport building the child environment from `os.environ` (the whole
+# reason for the environment scrub), and dispatches on message class names.
+# Written and verified against 0.2.180; `tests/test_anthropic_sdk_seams.py`
+# holds those three facts against whatever is installed. The floor is the
+# release that first carried the surface the adapter needs.
+anthropic = ["claude-agent-sdk>=0.2.159,<0.3"]
+# The Codex SDK for the `openai-sdk` runtime. The floor is the release the
+# adapter's generated types were read from (0.154.0) and the cap is the next
+# major, like the API extras below. The package numbers every Codex release as
+# a 0.x minor, so the cap does not say the releases in between were verified:
+# 0.154.0 is the only one that was.
+openai = ["openai-codex>=0.154,<1"]
 # The Messages API client for the `anthropic-api` runtime (ticket 1.6). Pinned
 # below 1.0 because the adapter was written and verified against 0.97.0 and the
 # 1.x line is a major with its own breaking changes; the floor is the release

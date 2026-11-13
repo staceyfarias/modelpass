@@ -2295,6 +2295,15 @@ class AnthropicAdapter(Adapter):
 
         Source distributions and ``npm ci --omit=optional`` installs ship without
         the bundled binary; a native install then has to be found instead.
+
+        **This reads a private name, and there is no public one to read
+        instead** (re-checked on claude-agent-sdk 0.2.180, 2026-11-13): the
+        package exports no function that answers "which binary would you run",
+        only the transport that finds it on the way to running it. An SDK that
+        drops ``_find_cli`` lands in the ``PATH`` fallback below with a note on
+        the receipt, and ``tests/test_anthropic_sdk_seams.py`` fails where the
+        package is installed, so the change is seen rather than absorbed. The
+        ``anthropic`` extra is capped below the next minor for the same reason.
         """
         try:
             from claude_agent_sdk._internal.transport.subprocess_cli import (
