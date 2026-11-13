@@ -426,3 +426,62 @@ def test_an_async_session_turn_takes_the_connections_bound_too(tmp_path):
         assert events[-1].status is TerminalStatus.TIMED_OUT
     finally:
         session.close()
+
+
+def _effort_session(tmp_path):
+    connection = Connection(
+        name="codex-sub",
+        runtime=Runtime.OPENAI_SDK,
+        auth_mode=AuthMode.SUBSCRIPTION,
+        credential_ref=CredentialRef.native_login(),
+        reasoning="medium",
+    )
+    adapter = _StallingSessionAdapter(runtime=Runtime.OPENAI_SDK)
+    bridge, _, _ = _bridge(tmp_path, connection, adapter)
+    return bridge.new_chat(connection="codex-sub"), adapter
+
+
+def _assert_first_token_fired(events, adapter):
+    assert adapter.efforts == ["high"]
+    changed = [
+        e for e in events if getattr(e, "name", None) == "reasoning_effort_changed"
+    ]
+    assert len(changed) == 1, "the announcement still reaches the caller"
+    assert events[-1].status is TerminalStatus.TIMED_OUT
+    assert "first_token" in events[-1].reason
+
+
+def test_a_per_turn_effort_change_does_not_retire_the_first_token_bound(tmp_path):
+    """The change announcement is modelpass talking, not the runtime answering.
+
+    It was fed through the fold like a vendor event, which counted it as the
+    first sign of life: ``send(reasoning=..., timeout=Timeout(first_token=...))``
+    on a runtime that never answered had no bound left at all.
+    """
+    session, adapter = _effort_session(tmp_path)
+    try:
+        events = list(
+            session.send("hi", reasoning="high", timeout=Timeout(first_token=0.3))
+        )
+        _assert_first_token_fired(events, adapter)
+    finally:
+        session.close()
+
+
+def test_an_async_effort_change_does_not_retire_the_first_token_bound(tmp_path):
+    import asyncio
+
+    session, adapter = _effort_session(tmp_path)
+
+    async def drive():
+        return [
+            event
+            async for event in session.asend(
+                "hi", reasoning="high", timeout=Timeout(first_token=0.3)
+            )
+        ]
+
+    try:
+        _assert_first_token_fired(asyncio.run(drive()), adapter)
+    finally:
+        session.close()

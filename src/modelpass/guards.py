@@ -45,6 +45,11 @@ class GuardTracker:
         self._guards = guards
         self._connection = connection
         self._total = TokenUsage()
+        #: What had been spent when the run now reporting began. A stateless
+        #: call is one run and never moves it; a session moves it at every turn
+        #: (:meth:`begin_turn`), which is what lets a ``run_total`` -- the total
+        #: of *that turn* -- land on top of the turns before it.
+        self._base = TokenUsage()
         self._warned = False
         self._stopped = False
 
@@ -55,6 +60,19 @@ class GuardTracker:
     @property
     def stopped(self) -> bool:
         return self._stopped
+
+    def begin_turn(self) -> None:
+        """Mark the start of another run on this tracker: a session's next turn.
+
+        A session keeps one tracker for its whole life, because the ceiling is
+        the session's. A runtime's ``run_total`` is the total of one run,
+        though, and on a session a run is a turn -- so folding it in against the
+        session's figure took the *largest turn* for the whole conversation, and
+        three turns of 1000 tokens never crossed a ceiling of 1500
+        (2026-11-13). Everything observed before this call is kept as the base
+        the next ``run_total`` is added to.
+        """
+        self._base = self._total
 
     def observe(
         self,
@@ -67,9 +85,13 @@ class GuardTracker:
         ``run_total`` replaces without ever lowering the figure. That is what
         lets a runtime emit per-turn usage *and* a final authoritative total for
         the same run without the guard counting the work twice.
+
+        "The same run" is the part that matters on a session: a ``run_total``
+        replaces what *this turn* has reported, on top of what the turns before
+        it spent (:meth:`begin_turn`), and never the session's whole figure.
         """
         if scope is UsageScope.RUN_TOTAL:
-            self._total = self._total.at_least(usage)
+            self._total = self._total.at_least(self._base + usage)
         else:
             self._total = self._total + usage
         observed = self._total.total_tokens

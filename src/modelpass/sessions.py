@@ -505,6 +505,9 @@ class Session:
         effort: ReasoningPlan | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """:meth:`_run_turn` with ``await`` where it blocks. One fold, two pumps."""
+        # A ``run_total`` this turn reports is this turn's, on top of the turns
+        # before it (2026-11-13).
+        self._tracker.begin_turn()
         fold = TurnFold(
             connection=self._request.connection,
             receipt=self._turn_receipt(effort),
@@ -524,8 +527,8 @@ class Session:
             # subprocess. ``send`` is called **on that thread**: on
             # ``anthropic-sdk`` it is where the vendor session is created.
             for event in self._announce_effort(effort):
-                for out in fold.feed(event):
-                    yield out
+                fold.effort_changed = True
+                yield event
             # Same rule as the sync pump: the older signature still works.
             level = effort.runtime_value if effort is not None else None
             stream = threaded_run(
@@ -650,9 +653,13 @@ class Session:
         transitions would fill the ledger with measurements of a cache that was
         never asked to survive anything.
 
-        The event is fed through the fold on its way to the caller, the way
-        every other event on this stream is -- :class:`~modelpass._fold.RunFold`
-        observes it to set the flag and passes it along untouched.
+        **The event goes to the caller and sets the fold's flag, and it does not
+        go through** ``fold.feed`` (2026-11-13). Everything fed there retires
+        the ``first_token`` bound, on the reasoning that any event is the
+        runtime showing signs of life -- and this one is modelpass announcing
+        what it is about to send, before the runtime has been asked anything.
+        Feeding it left ``send(reasoning=..., timeout=Timeout(first_token=...))``
+        with no bound at all on a runtime that never answered.
         """
         if effort is None:
             return ()
@@ -762,6 +769,9 @@ class Session:
         way, which is the whole reason the folding moved out of both of them
         (ticket 1.13).
         """
+        # A ``run_total`` this turn reports is this turn's, on top of the turns
+        # before it (2026-11-13).
+        self._tracker.begin_turn()
         fold = TurnFold(
             connection=self._request.connection,
             receipt=self._turn_receipt(effort),
@@ -774,7 +784,9 @@ class Session:
         try:
             yield from fold.begin()
             for event in self._announce_effort(effort):
-                yield from fold.feed(event)
+                # Not through ``fold.feed``: see :meth:`_announce_effort`.
+                fold.effort_changed = True
+                yield event
             if deadline is not None:
                 # Run-scoped: one adapter backs every session and every
                 # stateless call on its runtime, so the bound cancels this turn
