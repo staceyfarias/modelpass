@@ -266,6 +266,52 @@ def test_start_is_not_repeated_on_a_second_call():
         assert server.methods == ["initialize", "initialized"]
 
 
+def test_a_client_closed_before_it_starts_refuses_to_start_and_launches_nothing():
+    """A cancel that lands first must win: there is nothing to stop afterwards.
+
+    ``close()`` returns early once the client is closed, so a child spawned
+    after it was a child nobody would ever terminate (reproduced 2026-11-13:
+    spawned once, never terminated, stdin left open).
+    """
+    server = FakeAppServer()
+    client, spawn = make_client(server)
+
+    client.close()
+    with pytest.raises(AppServerTransportClosed) as excinfo:
+        client.start()
+
+    assert spawn.calls == 0
+    assert "closed" in str(excinfo.value)
+    assert client.running is False
+
+
+def test_a_close_that_lands_while_the_child_is_being_launched_still_stops_it():
+    """The other half of the same race: closed between the check and the handle.
+
+    The close found no process to stop, so the start has to stop the one it was
+    in the middle of launching -- and must not go on to shake hands with it.
+    """
+    server = FakeAppServer()
+    holder: dict[str, AppServerClient] = {}
+
+    def spawn(argv, env, cwd):
+        holder["client"].close()  # the watchdog's close, mid-launch
+        return server
+
+    client = AppServerClient(
+        binary="C:/codex/codex.exe", env={"PATH": "/usr/bin"}, cwd="/work", spawn=spawn
+    )
+    holder["client"] = client
+
+    with pytest.raises(AppServerTransportClosed):
+        client.start()
+
+    assert server.terminated == 1
+    assert server.stdin.closed is True
+    assert server.methods == [], "nothing is written to a child that is being stopped"
+    assert client.running is False
+
+
 # --- handshake -------------------------------------------------------------------
 
 

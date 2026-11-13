@@ -965,6 +965,24 @@ def test_cancel_kills_the_process_and_synthesizes_cancelled():
     assert terminal.reason is not None and "no vendor-side record" in terminal.reason
 
 
+def test_a_run_cancelled_before_it_starts_launches_no_process():
+    """Nothing is launched for a run that was already cancelled.
+
+    It used to be launched and killed at once, which ended ``cancelled`` too --
+    but a ``codex exec`` that exists for an instant is still one that existed.
+    """
+    spawn = FakeSpawn(FakeProc([THREAD_STARTED, TURN_STARTED], returncode=1))
+    adapter = OpenAIAdapter(codex_bin="codex", spawn=spawn)
+
+    stream = adapter.run(request_for(codex_connection()))
+    stream.cancel()
+    events = list(stream)
+
+    assert spawn.argv is None
+    assert [e.type for e in events] == ["terminal"]
+    assert events[0].status is TerminalStatus.CANCELLED
+
+
 # --- preflight ------------------------------------------------------------------
 
 

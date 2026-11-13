@@ -854,9 +854,23 @@ class AppServerClient:
         written before either. A server that received a ``thread/start`` ahead
         of the handshake would be within its rights to reject it, and the
         failure would arrive later and somewhere else.
+
+        **A closed client does not start** (2026-11-13). A cancel can land before
+        the run that owns this client has reached ``start()``, and ``close()``
+        returns early on a client that is already closed -- so a child launched
+        after the close was a child nothing would ever stop. The check is made
+        twice because the launch itself takes time: once before it, and once
+        under the lock when the handle is stored, where a close that arrived
+        mid-launch found no process and this method stops the one it just made.
         """
-        if self._started:
-            return
+        with self._state_lock:
+            if self._started:
+                return
+            if self._closed:
+                raise AppServerTransportClosed(
+                    "the codex app-server client was closed before it was started; "
+                    "nothing was launched"
+                )
         argv = app_server_argv(self._binary, self._config_overrides)
         # The same guard every launch in this package passes through, even
         # though this argv is fixed: a forbidden argument that only appears in
@@ -869,15 +883,36 @@ class AppServerClient:
                 f"the codex CLI at {self._binary!r} could not be launched as an "
                 f"app-server: {exc}"
             ) from exc
-        self._proc = proc
-        self._started = True
+        with self._state_lock:
+            # Under the lock close() takes the handle under, so exactly one of
+            # the two ends this child: a close after this line finds the
+            # process, and a close before it is seen here.
+            closed = self._closed
+            if not closed:
+                self._proc = proc
+                self._started = True
+        if closed:
+            self._shutdown(proc)
+            raise AppServerTransportClosed(
+                "the codex app-server client was closed while its child was being "
+                "launched; the child was stopped"
+            )
+        # The readers are handed the process rather than reading ``self._proc``:
+        # a close between the lines above and their first instruction clears it,
+        # and a reader that found ``None`` would leave a real pipe undrained.
         self._reader = threading.Thread(
-            target=self._read_loop, name="modelpass-appserver-reader", daemon=True
+            target=self._read_loop,
+            args=(proc,),
+            name="modelpass-appserver-reader",
+            daemon=True,
         )
         self._reader.start()
         if getattr(proc, "stderr", None) is not None:
             self._stderr_reader = threading.Thread(
-                target=self._drain_stderr, name="modelpass-appserver-stderr", daemon=True
+                target=self._drain_stderr,
+                args=(proc,),
+                name="modelpass-appserver-stderr",
+                daemon=True,
             )
             self._stderr_reader.start()
         self._handshake()
@@ -1072,14 +1107,13 @@ class AppServerClient:
         """The last of the child's stderr, as one string. Possibly empty."""
         return "".join(self._stderr).strip()
 
-    def _read_loop(self) -> None:
+    def _read_loop(self, proc: Any) -> None:
         """The single reader: classify each line and route it. Never raises out.
 
         Ends on EOF -- the child exited -- which is the condition that turns
         every blocked :meth:`request` into a reported failure instead of a hang.
         """
-        proc = self._proc
-        stdout = getattr(proc, "stdout", None) if proc is not None else None
+        stdout = getattr(proc, "stdout", None)
         try:
             for raw in stdout or ():
                 line = raw.strip()
@@ -1181,10 +1215,9 @@ class AppServerClient:
         else:
             waiter.put(("result", message.get("result")))
 
-    def _drain_stderr(self) -> None:
+    def _drain_stderr(self, proc: Any) -> None:
         """Feed the bounded tail. Its own thread, because two pipes need two."""
-        proc = self._proc
-        stream = getattr(proc, "stderr", None) if proc is not None else None
+        stream = getattr(proc, "stderr", None)
         try:
             for line in stream or ():
                 self._stderr.append(line)

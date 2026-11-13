@@ -3952,6 +3952,19 @@ class OpenAIAdapter(Adapter):
             # case: CreateProcess rejects the extensionless shim with WinError
             # 193, which used to escape the stream as AdapterFailed with no
             # terminal event behind it.
+            if run.cancelled:
+                # Cancelled ahead of the first next(). attach_proc below would
+                # kill the process the instant it existed; not launching it is
+                # the same outcome without a codex that ran for a moment.
+                yield TerminalEvent(
+                    status=TerminalStatus.CANCELLED,
+                    connection=request.connection.name,
+                    runtime=self.runtime,
+                    auth_mode=request.connection.auth_mode,
+                    reason="run cancelled before the codex CLI was launched; "
+                    "nothing was started",
+                )
+                return
             try:
                 cwd = str(
                     request.options.get("cwd") or tempfile.mkdtemp(prefix="modelpass-codex-")
@@ -4091,31 +4104,58 @@ class OpenAIAdapter(Adapter):
         turn = AppServerTurn()
         run.attach_client(client, turn)
         try:
-            client.start()
-            isolation = self._isolation_thread_config(client, cwd)
-            started = self._start_thread(client, request, cwd, isolation)
-            turn.thread_id = _started_thread_id(started)
-            # The round trip this runtime alone makes possible: the level was
-            # sent on turn/start, and thread/start answers with the level the
-            # thread is actually running at. Emitted as a vendor event so the
-            # fold can stamp it on the terminal (and the run log), which is the
-            # only way a caller can tell a level that was honoured from one the
-            # server ignored. Silent about agreement; explicit about a
-            # disagreement, which is discoverable no other way.
-            for event in _reasoning_echo_events(request, started):
-                yield event
-            injected = True
-            for event in self._inject_history(client, request, turn.thread_id):
-                injected = False
-                yield event
-            # Accepted, not finished. See the docstring.
-            client.request(
-                "turn/start",
-                _turn_start_params(request, turn.thread_id, history_injected=injected),
-            )
-            yield from self._drain_app_server(
-                client, turn, dispatcher, cancelled=lambda: run.cancelled
-            )
+            if run.cancelled:
+                # Cancelled before there was anything to cancel -- a bound that
+                # fired, or a cancel() that landed, ahead of the first next().
+                # The client is already closed and would refuse to start; say
+                # so as the outcome it is rather than through that refusal.
+                yield TerminalEvent(
+                    status=TerminalStatus.CANCELLED,
+                    connection=request.connection.name,
+                    runtime=self.runtime,
+                    auth_mode=request.connection.auth_mode,
+                    reason="run cancelled before the app-server was started; "
+                    "nothing was launched",
+                    usage=turn.usage,
+                )
+                return
+            try:
+                client.start()
+                isolation = self._isolation_thread_config(client, cwd)
+                started = self._start_thread(client, request, cwd, isolation)
+                turn.thread_id = _started_thread_id(started)
+                # The round trip this runtime alone makes possible: the level
+                # was sent on turn/start, and thread/start answers with the
+                # level the thread is actually running at. Emitted as a vendor
+                # event so the fold can stamp it on the terminal (and the run
+                # log), which is the only way a caller can tell a level that was
+                # honoured from one the server ignored. Silent about agreement;
+                # explicit about a disagreement, which is discoverable no other
+                # way.
+                for event in _reasoning_echo_events(request, started):
+                    yield event
+                injected = True
+                for event in self._inject_history(client, request, turn.thread_id):
+                    injected = False
+                    yield event
+                # Accepted, not finished. See the docstring.
+                client.request(
+                    "turn/start",
+                    _turn_start_params(
+                        request, turn.thread_id, history_injected=injected
+                    ),
+                )
+                yield from self._drain_app_server(
+                    client, turn, dispatcher, cancelled=lambda: run.cancelled
+                )
+            except AppServerTransportClosed:
+                # A cancel closes the client, and a run that was waiting on a
+                # request rather than on the stream -- the handshake, the
+                # thread, the turn's own start -- meets that close as a failed
+                # request. It is the cancel arriving, not the vendor failing,
+                # and it ends the run the way a cancel in the drain does.
+                if not run.cancelled:
+                    raise
 
             status, reason = turn.status, turn.reason
             if run.cancelled:

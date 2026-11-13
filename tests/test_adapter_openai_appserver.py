@@ -1049,6 +1049,77 @@ def test_cancel_attempts_the_interrupt_and_still_synthesizes_the_terminal():
     assert server.terminated == 1
 
 
+def test_a_run_cancelled_before_it_starts_launches_nothing_and_ends_cancelled():
+    """A bound or a cancel can land before the first ``next()``.
+
+    The run used to close its client and then start it anyway: a child nobody
+    would terminate, and a run reported as a transport failure
+    (``AppServerTransportClosed``) rather than as the cancel it was.
+    """
+    server = ScriptedAppServer(script_for())
+    adapter, spawn = adapter_for(server)
+
+    stream = adapter.run(request_for())
+    stream.cancel()
+    events = list(stream)
+
+    assert spawn.calls == 0
+    assert [e.type for e in events] == ["terminal"]
+    assert events[0].status is TerminalStatus.CANCELLED
+
+
+class _SilentOn(ScriptedAppServer):
+    """A server that receives one method and never answers it."""
+
+    def __init__(self, script, silent: str) -> None:
+        super().__init__(script)
+        self.silent = silent
+        self.heard = threading.Event()
+
+    def on_write(self, text: str) -> None:
+        if json.loads(text).get("method") == self.silent:
+            self.received.append(json.loads(text))
+            self.heard.set()
+            return
+        super().on_write(text)
+
+
+@pytest.mark.parametrize("silent", ["initialize", "thread/start", "turn/start"])
+def test_a_cancel_while_the_server_is_not_answering_ends_the_run_cancelled(silent):
+    """Blocked in a request, not in the drain: the cancel still ends the run.
+
+    Closing the client fails the request the run is waiting on, and that failure
+    is the cancel arriving -- one ``cancelled`` terminal, not a vendor error.
+    Driven with a real second thread because the order matters: the run has to
+    be inside the request when the cancel lands.
+    """
+    server = _SilentOn(script_for(), silent)
+    adapter, _ = adapter_for(server)
+    stream = adapter.run(request_for())
+    outcome: list = []
+
+    def consume() -> None:
+        try:
+            outcome.append(list(stream))
+        except BaseException as exc:  # recording it is the assertion
+            outcome.append(exc)
+
+    worker = threading.Thread(target=consume, daemon=True)
+    worker.start()
+    try:
+        assert server.heard.wait(timeout=5)
+        stream.cancel()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "the cancel did not unblock the run"
+    finally:
+        server.eof()
+
+    assert isinstance(outcome[0], list), f"the run raised {outcome[0]!r}"
+    terminals = [e for e in outcome[0] if e.type == "terminal"]
+    assert [t.status for t in terminals] == [TerminalStatus.CANCELLED]
+    assert server.terminated == 1
+
+
 def test_interrupt_needs_both_ids_and_never_raises():
     """Defensive by construction: the method has not been driven live.
 
