@@ -58,15 +58,22 @@
         {% for g in c.groups %}<span class="tag"><a href="/?group={{ g }}">{{ g }}</a></span>{% endfor %}
       </h3>
       <div class="row">
-        <a class="btn" href="/?check={{ c.name }}#receipt">Check</a>
+        {# A form, not a link: Check starts a vendor process, so it is a POST
+           and carries the token like every other action here. #}
+        <form class="inline" method="post" action="/accounts/{{ c.name }}/check#receipt">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">Check</button>
+        </form>
         <a class="btn" href="/accounts/{{ c.name }}/edit">Edit</a>
         <form class="inline" method="post" action="/accounts/{{ c.name }}/enabled">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="enabled" value="{{ 'false' if c.enabled else 'true' }}">
           <button type="submit">{{ 'Disable' if c.enabled else 'Enable' }}</button>
         </form>
         {% if c.auth_mode == 'subscription' %}
           <form class="inline" method="post" action="/accounts/{{ c.name }}/verify"
                 onsubmit="return confirm('Pin {{ c.name }} to the vendor account currently logged in?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button type="submit">{{ 'Re-verify' if c.verified_identity else 'Verify identity' }}</button>
           </form>
         {% elif c.is_compatible %}
@@ -74,11 +81,13 @@
              three short calls against whatever the base URL points at. #}
           <form class="inline" method="post" action="/accounts/{{ c.name }}/verify"
                 onsubmit="return confirm('Drive {{ c.name }} with three short calls -- one chat, one tool round trip, one structured-output request? Against a metered endpoint this spends a few hundred tokens.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button type="submit">{{ 'Re-verify capabilities' if c.verified_any else 'Verify capabilities' }}</button>
           </form>
         {% endif %}
         <form class="inline" method="post" action="/accounts/{{ c.name }}/delete"
               onsubmit="return confirm('Delete account {{ c.name }}? Its guard thresholds go with it.');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit">Delete</button>
         </form>
       </div>
@@ -199,7 +208,10 @@
         <dt>live profile</dt>
         <dd class="muted small">
           This page reads only what is configured &mdash; it asks no vendor anything.
-          <a href="/?check={{ c.name }}#receipt">Check</a> runs the token-free identity
+          <form class="inline" method="post" action="/accounts/{{ c.name }}/check#receipt">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="linklike">Check</button>
+          </form> runs the token-free identity
           probe and shows the account the runtime is logged into right now.
         </dd>
       {% endif %}

@@ -11,20 +11,25 @@ Three rules this module holds to, each tested:
    refused by the same :class:`CredentialRefIsSecret` validation the store uses.
    The ambient-environment audit shows variable **names** only; no value read
    from the environment reaches a template.
-2. **Every mutation is a POST**, and a POST from another origin is refused. A
-   page on the internet can reach ``127.0.0.1`` in your browser, and the thing
-   behind this one edits your connection file.
+2. **Every mutation is a POST, and so is anything that starts a vendor
+   process.** A page on the internet can reach ``127.0.0.1`` in your browser,
+   and the thing behind this one edits your connection file. So every request
+   must name this bench's own loopback host, a browser's ``Origin`` must be this
+   bench's, and every POST must carry a token only a page served here can know
+   -- see ``_guard`` in :func:`create_app` (2026-11-13).
 3. **The playground spends real allowance.** It says so, on the page, next to
    the button -- and shows the usage per run rather than leaving you to guess.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from secrets import token_urlsafe
 from typing import Any
 
 from ..adapters.base import RunRequest
@@ -58,6 +63,19 @@ __all__ = ["DEFAULT_PORT", "HOST", "create_app", "hello_world_tool", "serve"]
 #: one mistyped flag away from the local network.
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+
+#: The names a browser can reach this bench by. It binds :data:`HOST` only, so
+#: these are the address and the name every system maps to it. ``[::1]`` is not
+#: here because nothing is listening on it.
+_LOOPBACK_NAMES: frozenset[str] = frozenset({"127.0.0.1", "localhost"})
+
+#: Where the per-process token rides on a request: a hidden field in every form
+#: the bench renders, and a header on the playground's ``fetch``.
+CSRF_FIELD = "csrf_token"
+CSRF_HEADER = "X-Modelpass-Csrf"
+
+#: Methods that change nothing and start nothing. Everything else is guarded.
+_SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 
 #: Runtimes the bench offers, in the order the columns read.
 #:
@@ -388,9 +406,11 @@ def _capability_rows(bridge: Bridge) -> list[dict[str, Any]]:
 def _receipt_view(bridge: Bridge, name: str) -> dict[str, Any]:
     """Run a preflight and shape its receipt for display, or report the refusal.
 
-    A preflight costs nothing and touches no allowance, which is why the check
-    button is a plain GET and why it still runs for a *disabled* connection --
-    ``enabled = false`` switches off spending, not looking.
+    A preflight costs nothing and touches no allowance, which is why it still
+    runs for a *disabled* connection -- ``enabled = false`` switches off
+    spending, not looking. It does start a vendor process on the two
+    subscription runtimes, which is why the Check button is a POST (2026-11-13):
+    as a GET, any page on the internet could start one with an image tag.
     """
     try:
         connection = bridge.connection(name)
@@ -408,40 +428,143 @@ def _receipt_view(bridge: Bridge, name: str) -> dict[str, Any]:
 # --- the app ----------------------------------------------------------------------
 
 
+def _host_name(host: str) -> str:
+    """The name part of a ``Host`` value: ``localhost:8765`` -> ``localhost``."""
+    name, _, port = host.rpartition(":")
+    return name if name and port.isdigit() else host
+
+
 def create_app(
     *,
     bridge: Bridge | None = None,
     codex_root: str | os.PathLike[str] | None = None,
+    port: int | None = None,
 ) -> Any:
     """Build the bench application.
 
     ``bridge`` carries the store path, the adapter registry and the environment
     the audit reports on, so the whole surface is testable offline against
     ``FakeAdapter`` and a temp home -- the same injection seam the CLI uses.
+
+    ``port`` is the port the bench is bound to, and :func:`serve` always passes
+    it. With it, a request must name ``127.0.0.1:<port>`` or
+    ``localhost:<port>`` exactly. Without it -- the test client, which binds
+    nothing -- the same two names are accepted on any port; the name is the part
+    a rebinding attack cannot forge, because the name it sends is its own.
     """
     flask = require_flask()
     from flask import Response, abort, redirect, render_template, request, url_for
+    from flask.testing import FlaskClient
 
     active = bridge if bridge is not None else Bridge()
     app = flask.Flask(__name__)
     app.config["SUBPASS_BRIDGE"] = active
     app.config["SUBPASS_CODEX_ROOT"] = codex_root
 
-    @app.before_request
-    def _refuse_cross_origin_writes():
-        """A page on the internet can POST to 127.0.0.1 in your browser.
+    # One token per process, never written anywhere. It reaches a browser only
+    # inside a page this app rendered, and a page is only rendered for a request
+    # that named this bench's own host -- so the only thing that can read it is
+    # this bench's own origin.
+    csrf_token = token_urlsafe(32)
+    app.config["BENCH_CSRF_TOKEN"] = csrf_token
 
-        Behind this one is a form that rewrites the connection file, so a
-        mutating request carrying somebody else's Origin is refused. Requests
-        with no Origin header at all (curl, the test client, an old browser
-        doing a plain form post) are allowed -- this is a guard against a
-        hostile *page*, not an authentication system.
+    if port is None:
+        allowed_hosts: frozenset[str] | None = None
+    else:
+        # A browser leaves the port off the Host header only for the scheme's
+        # default, which for this plain-HTTP server is 80.
+        allowed_hosts = frozenset(
+            host
+            for name in _LOOPBACK_NAMES
+            for host in ((f"{name}:{port}", name) if port == 80 else (f"{name}:{port}",))
+        )
+
+    class _BenchTestClient(FlaskClient):
+        """The test client, carrying the token a rendered page would carry.
+
+        In-process only: this is the object ``app.test_client()`` hands a test,
+        and nothing a browser or a network client can reach. It exists so a test
+        of what a route does need not scrape a form first, which is the reason
+        Django's test client skips CSRF checks. The guard's own tests build a
+        plain ``FlaskClient`` and send exactly what they mean to.
         """
-        if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+
+        def open(self, *args: Any, **kwargs: Any) -> Any:
+            self.environ_base.setdefault(
+                "HTTP_" + CSRF_HEADER.upper().replace("-", "_"), csrf_token
+            )
+            return super().open(*args, **kwargs)
+
+    app.test_client_class = _BenchTestClient
+
+    @app.context_processor
+    def _csrf_for_templates() -> dict[str, str]:
+        return {"csrf_token": csrf_token, "csrf_header": CSRF_HEADER}
+
+    @app.before_request
+    def _guard():
+        """Refuse a request that is not from this bench's own pages.
+
+        **A page on the internet can reach 127.0.0.1 in your browser**, and
+        behind this app are a form that rewrites the connection file, a button
+        that sends a stored key to a base URL, and a button that spends
+        allowance. Three checks, in this order, and any one of them refuses:
+
+        1. **Host, on every request.** It must be this bench's loopback name.
+           The rule this replaces compared ``Origin`` with ``request.host_url``,
+           and ``host_url`` is built from the ``Host`` header -- which a page
+           chooses, by serving itself from a name it then rebinds to 127.0.0.1.
+           Both headers said ``evil.example``, so they agreed, and the request
+           went through (2026-11-13). GETs are refused too: a rebound name that
+           could read a page could read the token out of it.
+        2. **Origin, where there is one**, against this bench's own origins --
+           a fixed list, not "whatever Host said". ``Sec-Fetch-Site``, where a
+           browser sends it, is believed when it says the request came from
+           somewhere else.
+        3. **The token, on every mutating request.** This is what a request
+           with *no* Origin is held to, and it is why there is no longer a
+           no-Origin exception: curl sends none, but so do some browsers on a
+           form posted from another site, and the server cannot tell those
+           apart. A script can still drive the bench -- read any page, take
+           ``csrf_token`` from a form or the ``modelpass-csrf`` meta tag, and
+           send it back as that field or as the ``X-Modelpass-Csrf`` header.
+
+        Not authentication: anything already running as you on this machine can
+        read a page and its token. This is a guard against a hostile *page*.
+        """
+        host = (request.host or "").lower()
+        if allowed_hosts is not None:
+            host_ok = host in allowed_hosts
+        else:
+            host_ok = _host_name(host) in _LOOPBACK_NAMES
+        if not host_ok:
+            abort(403, "this bench answers only to its own loopback address")
+
+        if request.method in _SAFE_METHODS:
             return None
+
         origin = request.headers.get("Origin")
-        if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
+        if origin is not None:
+            # After the Host check, ``host`` is one of this bench's own names,
+            # so with no port configured "the origin of the host addressed" is
+            # still a fixed set and not something a page can choose.
+            origins = (
+                {f"http://{allowed}" for allowed in allowed_hosts}
+                if allowed_hosts is not None
+                else {f"http://{host}"}
+            )
+            if origin.rstrip("/").lower() not in origins:
+                abort(403, "cross-origin request refused")
+        if request.headers.get("Sec-Fetch-Site", "").lower() in {"cross-site", "same-site"}:
             abort(403, "cross-origin request refused")
+
+        sent = request.headers.get(CSRF_HEADER) or request.form.get(CSRF_FIELD) or ""
+        if not hmac.compare_digest(sent.encode(), csrf_token.encode()):
+            abort(
+                403,
+                "this request did not carry the bench's token; reload the page "
+                "and try again",
+            )
         return None
 
     def _flash(message: str, kind: str = "ok"):
@@ -449,9 +572,7 @@ def create_app(
 
     # --- 1. configured connections -------------------------------------------
 
-    @app.route("/")
-    def connections():
-        checked = request.args.get("check")
+    def _connections_page(checked: str | None = None):
         # A filter rather than a separate page: these are the same rows, and a
         # group that nothing is in shows an empty listing rather than an error,
         # because the user asked to look.
@@ -478,6 +599,26 @@ def create_app(
             note=request.args.get("note"),
             note_kind=request.args.get("note_kind", "ok"),
         )
+
+    @app.route("/")
+    def connections():
+        # Offline, always. ``?check=<name>`` used to run that connection's
+        # preflight from here, which made a page load -- and so an image tag on
+        # anybody's page -- a way to start a vendor process. The parameter is
+        # now ignored; the Check button posts to ``check_connection`` below.
+        return _connections_page()
+
+    @app.post("/accounts/<name>/check")
+    @app.post("/connections/<name>/check")
+    def check_connection(name: str):
+        """Run one connection's preflight and show its receipt.
+
+        A POST because it starts a vendor process on the subscription runtimes,
+        so it is held to the same guard as everything else that does something.
+        Rendered directly rather than redirected to: a receipt is an answer to
+        this request, and is stored nowhere a second request could read it from.
+        """
+        return _connections_page(checked=name)
 
     @app.route("/groups")
     def groups():
@@ -1237,5 +1378,6 @@ def serve(
     debug: bool = False,
 ) -> None:
     """Run the bench on the loopback interface. Blocks until interrupted."""
-    app = create_app(bridge=bridge)
+    # The port is passed so the app answers only to the address it is bound to.
+    app = create_app(bridge=bridge, port=port)
     app.run(host=HOST, port=port, debug=debug, threaded=True)

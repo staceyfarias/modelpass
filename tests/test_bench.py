@@ -142,7 +142,7 @@ def test_a_disabled_connection_is_shown_as_disabled(bench):
 
 def test_check_renders_the_preflight_receipt(bench):
     _, client, _, _ = bench([anthropic()])
-    body = client.get("/?check=claude-sub").get_data(as_text=True)
+    body = client.post("/accounts/claude-sub/check").get_data(as_text=True)
     assert "Preflight receipt" in body
     assert "the runtime&#39;s own login store" in body or "own login store" in body
     assert "fake-account" in body
@@ -152,8 +152,8 @@ def test_the_check_receipt_shows_the_vendor_reported_subscription_and_profile(be
     """The live identity belongs to the Check receipt, not to every listed row.
 
     A probe per row turned loading this page into a fan-out of multi-second
-    vendor subprocesses. GET / is offline again; ?check= is where a vendor is
-    asked anything.
+    vendor subprocesses. GET / is offline again; the Check button's POST is
+    where a vendor is asked anything.
     """
     fake = FakeAdapter(
         account="person@example.com",
@@ -173,7 +173,7 @@ def test_the_check_receipt_shows_the_vendor_reported_subscription_and_profile(be
     _, client, _, _ = bench(
         [anthropic()], adapters={Runtime.ANTHROPIC_SDK: fake}
     )
-    body = client.get("/?check=claude-sub").get_data(as_text=True)
+    body = client.post("/accounts/claude-sub/check").get_data(as_text=True)
     assert "subscription type" in body
     assert "person@example.com" in body
     assert "Example Co" in body
@@ -216,14 +216,14 @@ def test_verify_button_pins_the_current_vendor_identity(bench):
 def test_check_still_works_on_a_disabled_connection(bench):
     """enabled = false switches off spending, not looking."""
     _, client, _, _ = bench([anthropic(enabled=False)])
-    body = client.get("/?check=claude-sub").get_data(as_text=True)
+    body = client.post("/accounts/claude-sub/check").get_data(as_text=True)
     assert "Preflight receipt" in body
     assert "switches off is spending, not looking" in body
 
 
 def test_check_on_an_unknown_connection_reports_rather_than_500s(bench):
     _, client, _, _ = bench([anthropic()])
-    response = client.get("/?check=nope")
+    response = client.post("/accounts/nope/check")
     assert response.status_code == 200
     assert "no connection named" in response.get_data(as_text=True)
 
@@ -568,12 +568,122 @@ def test_openai_isolated_account_page_explains_the_one_time_login(bench, tmp_pat
     assert "cli_auth_credentials_store" not in body
 
 
+# --- the guard: Host, Origin, and a token (2026-11-13) -----------------------------
+#
+# What this used to be: "a POST whose Origin differs from request.host_url is
+# refused". ``host_url`` is built from the ``Host`` header, and the page making
+# the request chooses that. A page on evil.example that rebinds its name to
+# 127.0.0.1 sends ``Host: evil.example:8765`` and ``Origin:
+# http://evil.example:8765``; the two agree, the check passes, and the page can
+# save an ``openai-compatible`` connection whose key is ``ANTHROPIC_API_KEY`` and
+# whose base URL is its own server, then POST ``/accounts/x/verify`` and be sent
+# the key. The first test below is that attack, reproduced.
+#
+# Three layers now, each of which stops it alone:
+#
+# 1. **Host** must be this bench's own loopback name, on every request, GET
+#    included -- so a rebound name cannot read a page either.
+# 2. **Origin**, where a browser sends one, must be this bench's origin from a
+#    fixed list, not "whatever Host said".
+# 3. **A per-process token** on every mutating request, which only a page this
+#    bench served can know. That is what closes the no-Origin case: the old rule
+#    let a request with no Origin through, and "no Origin" is also what some
+#    browsers send on a cross-site form post.
+
+
+def raw_client(app):
+    """A client that sends only what the test gives it: no token is added.
+
+    ``app.test_client()`` carries the token for the same reason Django's test
+    client skips CSRF: a test of what a route *does* should not have to scrape
+    a form first. The tests of the guard itself use this one.
+    """
+    from flask.testing import FlaskClient
+
+    return FlaskClient(app, app.response_class)
+
+
+def token_of(app) -> str:
+    return app.config["BENCH_CSRF_TOKEN"]
+
+
+REBOUND = {"Host": "evil.example:8765", "Origin": "http://evil.example:8765"}
+
+
+def test_a_rebound_hostname_cannot_send_a_key_to_its_own_server(bench):
+    """The reported attack, end to end, with the Host and Origin a browser
+    would send for a name rebound to 127.0.0.1."""
+    drives = []
+
+    class Recording(FakeAdapter):
+        def verify_capabilities(self, request):
+            drives.append(request.connection.base_url)
+            return None
+
+    app, _, bridge, _ = bench(
+        [anthropic()],
+        env={"ANTHROPIC_API_KEY": "sk-not-a-real-key"},
+        adapters={
+            Runtime.ANTHROPIC_SDK: FakeAdapter(),
+            Runtime.OPENAI_COMPATIBLE: Recording(runtime=Runtime.OPENAI_COMPATIBLE),
+        },
+    )
+    attacker = raw_client(app)
+    saved = attacker.post(
+        "/accounts/save",
+        headers=REBOUND,
+        data={
+            "name": "x",
+            "runtime": "openai-compatible",
+            "credential": "env",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "base_url": "https://evil.example/v1",
+        },
+    )
+    assert saved.status_code == 403
+    assert bridge.store.names() == ("claude-sub",)
+    verified = attacker.post("/accounts/x/verify", headers=REBOUND)
+    assert verified.status_code == 403
+    assert drives == []
+
+
+def test_a_rebound_hostname_is_refused_even_holding_the_token(bench):
+    """Each layer alone: the Host check does not lean on the token being secret."""
+    app, _, bridge, _ = bench([anthropic()])
+    response = raw_client(app).post(
+        "/connections/claude-sub/delete",
+        headers={**REBOUND, "X-Modelpass-Csrf": token_of(app)},
+    )
+    assert response.status_code == 403
+    assert bridge.store.names() == ("claude-sub",)
+
+
+@pytest.mark.parametrize("path", ["/", "/playground", "/runs", "/accounts/new", "/groups"])
+def test_a_rebound_hostname_cannot_read_a_page_either(bench, path):
+    """GET included: a page it could read is a page it could lift the token from."""
+    app, _, _, _ = bench([anthropic()])
+    response = raw_client(app).get(path, headers={"Host": "evil.example:8765"})
+    assert response.status_code == 403
+    assert token_of(app) not in response.get_data(as_text=True)
+
+
 def test_a_cross_origin_post_is_refused(bench):
     """A page on the internet can reach 127.0.0.1 in your browser."""
     _, client, bridge, _ = bench([anthropic()])
     response = client.post(
         "/connections/claude-sub/delete",
         headers={"Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403
+    assert bridge.store.names() == ("claude-sub",)
+
+
+def test_another_local_server_is_another_origin(bench):
+    """Same machine, different port: still not this bench."""
+    _, client, bridge, _ = bench([anthropic()])
+    response = client.post(
+        "/connections/claude-sub/delete",
+        headers={"Origin": "http://localhost:9999"},
     )
     assert response.status_code == 403
     assert bridge.store.names() == ("claude-sub",)
@@ -588,6 +698,173 @@ def test_a_same_origin_post_is_allowed(bench):
     )
     assert response.status_code == 200
     assert bridge.store.names() == ()
+
+
+def test_a_post_with_no_origin_and_no_token_is_refused(bench):
+    """The old bypass. curl sends no Origin -- and so do some browsers, on a
+    form posted from another site."""
+    app, _, bridge, _ = bench([anthropic()])
+    response = raw_client(app).post("/connections/claude-sub/delete")
+    assert response.status_code == 403
+    assert bridge.store.names() == ("claude-sub",)
+
+
+def test_a_same_origin_post_without_the_token_is_refused(bench):
+    app, _, bridge, _ = bench([anthropic()])
+    response = raw_client(app).post(
+        "/connections/claude-sub/delete", headers={"Origin": "http://localhost"}
+    )
+    assert response.status_code == 403
+    assert bridge.store.names() == ("claude-sub",)
+
+
+def test_a_wrong_token_is_refused(bench):
+    app, _, bridge, _ = bench([anthropic()])
+    response = raw_client(app).post(
+        "/connections/claude-sub/delete", data={"csrf_token": "not-the-token"}
+    )
+    assert response.status_code == 403
+    assert bridge.store.names() == ("claude-sub",)
+
+
+def test_a_browser_that_says_the_request_is_cross_site_is_believed(bench):
+    app, _, bridge, _ = bench([anthropic()])
+    response = raw_client(app).post(
+        "/connections/claude-sub/delete",
+        headers={"Sec-Fetch-Site": "cross-site", "X-Modelpass-Csrf": token_of(app)},
+    )
+    assert response.status_code == 403
+    assert bridge.store.names() == ("claude-sub",)
+
+
+def test_the_token_is_new_for_every_process(bench):
+    first, _, _, _ = bench([anthropic()])
+    second, _, _, _ = bench([anthropic()])
+    assert token_of(first) != token_of(second)
+    assert len(token_of(first)) >= 32
+
+
+def test_a_form_the_bench_rendered_posts_successfully(bench):
+    """The browser's path, with nothing added by the test client: read the
+    page, take the hidden field out of the form, post it back."""
+    import re
+
+    app, _, bridge, _ = bench([anthropic()])
+    client = raw_client(app)
+    page = client.get("/").get_data(as_text=True)
+    form = re.search(
+        r'<form[^>]*action="/accounts/claude-sub/delete".*?</form>', page, re.S
+    ).group(0)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', form).group(1)
+    response = client.post(
+        "/accounts/claude-sub/delete",
+        data={"csrf_token": token},
+        headers={"Origin": "http://localhost"},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert bridge.store.names() == ()
+
+
+def test_every_form_the_bench_renders_carries_the_token(bench):
+    import re
+
+    app, client, _, _ = bench([anthropic(), compatible(), openai()])
+    token = token_of(app)
+    pages = ["/", "/groups", "/accounts/new", "/accounts/claude-sub/edit", "/playground"]
+    seen = 0
+    for path in pages:
+        body = client.get(path).get_data(as_text=True)
+        for form in re.findall(r"<form\b.*?</form>", body, re.S):
+            if 'method="post"' not in form:
+                continue
+            seen += 1
+            assert f'name="csrf_token" value="{token}"' in form, (path, form[:120])
+    assert seen >= 5
+
+
+def test_the_playground_script_sends_the_token(bench):
+    app, client, _, _ = bench([anthropic()])
+    body = client.get("/playground").get_data(as_text=True)
+    assert f'<meta name="modelpass-csrf" content="{token_of(app)}">' in body
+    assert "X-Modelpass-Csrf" in body
+
+
+def test_the_playground_run_needs_the_token_too(bench):
+    """The route that spends allowance is a mutating route like the others."""
+    app, _, _, fake = bench([anthropic()], script=[TextDeltaEvent(text="hi")])
+    refused = raw_client(app).post(
+        "/playground/run", json={"connection": "claude-sub", "message": "hi"}
+    )
+    assert refused.status_code == 403
+    assert fake.requests == []
+    allowed = raw_client(app).post(
+        "/playground/run",
+        json={"connection": "claude-sub", "message": "hi"},
+        headers={"X-Modelpass-Csrf": token_of(app)},
+    )
+    assert allowed.status_code == 200
+    allowed.get_data()
+    assert len(fake.requests) == 1
+
+
+def test_a_bench_that_knows_its_port_accepts_only_that_port(store):
+    """What ``serve`` builds: the two loopback names, on the port it bound."""
+    store.add(anthropic())
+    bridge = Bridge(
+        store=store,
+        registry=CapabilityRegistry(),
+        adapters={Runtime.ANTHROPIC_SDK: FakeAdapter()},
+        env={},
+    )
+    app = create_app(bridge=bridge, port=8765)
+    client = raw_client(app)
+    for host in ("127.0.0.1:8765", "localhost:8765", "LOCALHOST:8765"):
+        assert client.get("/", headers={"Host": host}).status_code == 200, host
+    for host in (
+        "127.0.0.1:9999",
+        "localhost",
+        "evil.example:8765",
+        "127.0.0.1.evil.example:8765",
+        "evil.example",
+        "[::1]:8765",
+        "0.0.0.0:8765",
+    ):
+        assert client.get("/", headers={"Host": host}).status_code == 403, host
+
+    token = token_of(app)
+    good = {"Host": "127.0.0.1:8765", "X-Modelpass-Csrf": token}
+    # The origin is checked against the fixed list, not against the Host sent.
+    for origin in ("http://localhost:9999", "https://127.0.0.1:8765", "null"):
+        refused = client.post(
+            "/accounts/claude-sub/enabled",
+            headers={**good, "Origin": origin},
+            data={"enabled": "false"},
+        )
+        assert refused.status_code == 403, origin
+    for origin in ("http://127.0.0.1:8765", "http://localhost:8765"):
+        allowed = client.post(
+            "/accounts/claude-sub/enabled",
+            headers={**good, "Origin": origin},
+            data={"enabled": "false"},
+        )
+        assert allowed.status_code == 302, origin
+
+
+def test_loading_a_page_with_check_in_the_url_starts_no_vendor_probe(bench):
+    """``GET /?check=`` used to run the preflight: an image tag on any page
+    could start ``claude auth status`` or a Codex app-server. Check is a
+    button now, so it needs the token like every other action."""
+    fake = FakeAdapter()
+    app, client, _, _ = bench([anthropic()], adapters={Runtime.ANTHROPIC_SDK: fake})
+    response = client.get("/?check=claude-sub")
+    assert response.status_code == 200
+    assert fake.preflights == []
+    assert "Preflight receipt" not in response.get_data(as_text=True)
+
+    refused = raw_client(app).post("/accounts/claude-sub/check")
+    assert refused.status_code == 403
+    assert fake.preflights == []
 
 
 # --- 3. playground ----------------------------------------------------------------
@@ -1437,9 +1714,6 @@ def test_no_page_the_bench_renders_contains_a_credential_value(bench, store):
     _write_run(store, sampling_applied={"temperature": 0.2})
     pages = [
         "/",
-        "/?check=claude-sub",
-        "/?check=claude-api",
-        "/?check=ollama",
         "/connections/new",
         "/accounts/claude-api/edit",
         "/accounts/ollama/edit",
@@ -1449,7 +1723,13 @@ def test_no_page_the_bench_renders_contains_a_credential_value(bench, store):
     for path in pages:
         body = client.get(path, follow_redirects=True).get_data(as_text=True)
         assert SECRET not in body, path
-    for path in ("/accounts/ollama/verify", "/accounts/claude-sub/enabled"):
+    for path in (
+        "/accounts/claude-sub/check",
+        "/accounts/claude-api/check",
+        "/accounts/ollama/check",
+        "/accounts/ollama/verify",
+        "/accounts/claude-sub/enabled",
+    ):
         body = client.post(path, follow_redirects=True).get_data(as_text=True)
         assert SECRET not in body, path
 

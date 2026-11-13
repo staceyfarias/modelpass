@@ -23,6 +23,7 @@
   </p>
 
   <form method="post" action="/accounts/save">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="original_name" value="{{ form.original_name }}">
 
     <div class="grid2">
