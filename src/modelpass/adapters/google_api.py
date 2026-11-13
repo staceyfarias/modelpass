@@ -140,13 +140,16 @@ from ..types import (
 from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
 from .base import (
     Adapter,
+    AsyncInterrupt,
     InFlight,
     RunCancel,
+    RunInterrupted,
     RunRequest,
     RunStream,
     SessionHandle,
     SessionRequest,
     document_rejection,
+    interrupt_client,
     native_run,
     refuse_documents,
 )
@@ -795,6 +798,11 @@ class GoogleAPIAdapter(Adapter):
         """
         self._client_factory = client_factory or _default_client
         self._async_client_factory = async_client_factory or _default_async_client
+        #: Whether the sync client is one this adapter builds per run, and may
+        #: therefore close to interrupt that run. A client from an injected
+        #: factory may be shared by other runs, so cancelling one run must not
+        #: close it; such a run is cancelled at the next event instead.
+        self._owns_clients = client_factory is None
         self._env = env
         self._secrets = secrets
         #: The runs in flight, each with its own cancel state. Nothing about one
@@ -1045,6 +1053,11 @@ class GoogleAPIAdapter(Adapter):
         # one run ending stopped whichever other run reached a round boundary.
         cancel = RunCancel()
         self._runs.add(cancel)
+        if self._owns_clients:
+            # The floor under the flag (D10): a run blocked in a read cannot
+            # look at one, so the cancel reaches the socket. Only for a client
+            # this adapter built for this run -- see ``interrupt_client``.
+            cancel.on_cancel(lambda: interrupt_client(client))
         return RunStream(self._loop(client, request, cancel), cancel.cancel)
 
     def _loop(self, client: Any, request: RunRequest, cancel: RunCancel) -> Iterator[AgentEvent]:
@@ -1071,6 +1084,8 @@ class GoogleAPIAdapter(Adapter):
                 stream = client.models.generate_content_stream(**params)
                 try:
                     for chunk in stream:
+                        if cancel.is_set():
+                            raise RunInterrupted
                         usage = getattr(chunk, "usage_metadata", None) or usage
                         blocked = blocked or _blocked_reason(chunk)
                         for candidate in candidates(chunk):
@@ -1100,6 +1115,14 @@ class GoogleAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
+                # A cancel that interrupted the wait surfaces here, as whatever
+                # the transport raised when it was cut. The caller stopped the
+                # run; that, not the wreckage, is how it ended.
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1111,6 +1134,16 @@ class GoogleAPIAdapter(Adapter):
                 return
 
             yield UsageEvent(usage=token_usage(usage), scope=UsageScope.DELTA)
+
+            # A stream cut by a cancel can also just *end* (a body delimited by
+            # the connection closing), and a cancel can land while the last
+            # event is in hand. Either way nothing below may run: not a tool,
+            # not another round, not an ``ok``.
+            if cancel.is_set():
+                yield _bare_terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                )
+                return
 
             if text:
                 final_text = text
@@ -1147,6 +1180,14 @@ class GoogleAPIAdapter(Adapter):
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                # No handler runs after a cancel -- including one that arrived
+                # while the caller was looking at the call just announced, or
+                # while the previous handler was running.
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 tool = by_name.get(name)
                 payload = (
                     invoke_handler(tool, arguments) if tool is not None else _missing_tool(name)
@@ -1204,6 +1245,10 @@ class GoogleAPIAdapter(Adapter):
         by_name = {tool.name: tool for tool in request.tools}
         final_text = ""
 
+        # Every vendor wait below goes through this, so a cancel -- the
+        # timeout watchdog's, from its own thread -- interrupts it.
+        scope = AsyncInterrupt(cancel)
+
         while True:
             if cancel.is_set():
                 yield _bare_terminal(
@@ -1220,9 +1265,11 @@ class GoogleAPIAdapter(Adapter):
             text = ""
             answered = False
             try:
-                stream = await client.models.generate_content_stream(**params)
+                stream = await scope.run(
+                    client.models.generate_content_stream(**params)
+                )
                 try:
-                    async for chunk in stream:
+                    async for chunk in scope.iterate(stream):
                         usage = getattr(chunk, "usage_metadata", None) or usage
                         blocked = blocked or _blocked_reason(chunk)
                         for candidate in candidates(chunk):
@@ -1257,6 +1304,11 @@ class GoogleAPIAdapter(Adapter):
             except SubpassError:
                 raise
             except Exception as exc:
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1268,6 +1320,12 @@ class GoogleAPIAdapter(Adapter):
                 return
 
             yield UsageEvent(usage=token_usage(usage), scope=UsageScope.DELTA)
+
+            if cancel.is_set():
+                yield _bare_terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                )
+                return
 
             if text:
                 final_text = text
@@ -1296,6 +1354,11 @@ class GoogleAPIAdapter(Adapter):
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 tool = by_name.get(name)
                 # The caller's own coroutine, awaited on the caller's own loop.
                 payload = (

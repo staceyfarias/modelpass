@@ -157,13 +157,16 @@ from ..types import (
 from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
 from .base import (
     Adapter,
+    AsyncInterrupt,
     InFlight,
     RunCancel,
+    RunInterrupted,
     RunRequest,
     RunStream,
     SessionHandle,
     SessionRequest,
     document_rejection,
+    interrupt_client,
     native_run,
     refuse_documents,
 )
@@ -896,6 +899,11 @@ class OpenAIAPIAdapter(Adapter):
         """
         self._client_factory = client_factory or _default_client
         self._async_client_factory = async_client_factory or _default_async_client
+        #: Whether the sync client is one this adapter builds per run, and may
+        #: therefore close to interrupt that run. A client from an injected
+        #: factory may be shared by other runs, so cancelling one run must not
+        #: close it; such a run is cancelled at the next event instead.
+        self._owns_clients = client_factory is None
         self._env = env
         self._secrets = secrets
         #: The runs in flight, each with its own cancel state. Nothing about one
@@ -1140,6 +1148,11 @@ class OpenAIAPIAdapter(Adapter):
         # one run ending stopped whichever other run reached a round boundary.
         cancel = RunCancel()
         self._runs.add(cancel)
+        if self._owns_clients:
+            # The floor under the flag (D10): a run blocked in a read cannot
+            # look at one, so the cancel reaches the socket. Only for a client
+            # this adapter built for this run -- see ``interrupt_client``.
+            cancel.on_cancel(lambda: interrupt_client(client))
         return RunStream(self._loop(client, request, cancel), cancel.cancel)
 
     def _loop(self, client: Any, request: RunRequest, cancel: RunCancel) -> Iterator[AgentEvent]:
@@ -1159,11 +1172,21 @@ class OpenAIAPIAdapter(Adapter):
             try:
                 with client.responses.stream(**params) as stream:
                     for event in stream:
+                        if cancel.is_set():
+                            raise RunInterrupted
                         response = final_response(event) or response
                         yield from stream_events(event, self.runtime)
             except SubpassError:
                 raise
             except Exception as exc:
+                # A cancel that interrupted the wait surfaces here, as whatever
+                # the transport raised when it was cut. The caller stopped the
+                # run; that, not the wreckage, is how it ended.
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1179,6 +1202,16 @@ class OpenAIAPIAdapter(Adapter):
                 usage=token_usage(getattr(response, "usage", None)),
                 scope=UsageScope.DELTA,
             )
+
+            # A stream cut by a cancel can also just *end* (a body delimited by
+            # the connection closing), and a cancel can land while the last
+            # event is in hand. Either way nothing below may run: not a tool,
+            # not another round, not an ``ok``.
+            if cancel.is_set():
+                yield _bare_terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                )
+                return
 
             text = response_text(response)
             if text:
@@ -1208,6 +1241,14 @@ class OpenAIAPIAdapter(Adapter):
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                # No handler runs after a cancel -- including one that arrived
+                # while the caller was looking at the call just announced, or
+                # while the previous handler was running.
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 tool = by_name.get(name)
                 payload = (
                     invoke_handler(tool, arguments) if tool is not None else _missing_tool(name)
@@ -1270,6 +1311,10 @@ class OpenAIAPIAdapter(Adapter):
         by_name = {tool.name: tool for tool in request.tools}
         final_text = ""
 
+        # Every vendor wait below goes through this, so a cancel -- the
+        # timeout watchdog's, from its own thread -- interrupts it.
+        scope = AsyncInterrupt(cancel)
+
         while True:
             if cancel.is_set():
                 yield _bare_terminal(
@@ -1280,14 +1325,19 @@ class OpenAIAPIAdapter(Adapter):
             params = self.request_params(request, items)
             response = None
             try:
-                async with client.responses.stream(**params) as stream:
-                    async for event in stream:
+                async with scope.entering(client.responses.stream(**params)) as stream:
+                    async for event in scope.iterate(stream):
                         response = final_response(event) or response
                         for out in stream_events(event, self.runtime):
                             yield out
             except SubpassError:
                 raise
             except Exception as exc:
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 code, after = vendor_error_facts(exc)
                 rejected = document_rejection(self.runtime, request, code, exc)
                 if rejected is not None:
@@ -1306,6 +1356,12 @@ class OpenAIAPIAdapter(Adapter):
                 usage=token_usage(getattr(response, "usage", None)),
                 scope=UsageScope.DELTA,
             )
+
+            if cancel.is_set():
+                yield _bare_terminal(
+                    TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                )
+                return
 
             text = response_text(response)
             if text:
@@ -1330,6 +1386,11 @@ class OpenAIAPIAdapter(Adapter):
                     id=call_id,
                     server=CALLER_TOOL_SERVER,
                 )
+                if cancel.is_set():
+                    yield _bare_terminal(
+                        TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
+                    )
+                    return
                 tool = by_name.get(name)
                 # The caller's own coroutine, awaited on the caller's own loop.
                 payload = (

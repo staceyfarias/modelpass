@@ -83,7 +83,9 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 import queue
+import socket
 import threading
 import time
 import weakref
@@ -110,9 +112,11 @@ from ..types import (
 
 __all__ = [
     "Adapter",
+    "AsyncInterrupt",
     "AsyncRun",
     "InFlight",
     "RunCancel",
+    "RunInterrupted",
     "RunRequest",
     "RunStream",
     "SessionHandle",
@@ -120,6 +124,7 @@ __all__ = [
     "cancel_run",
     "close_async_run",
     "document_rejection",
+    "interrupt_client",
     "native_run",
     "refuse_documents",
     "run_canceller",
@@ -1074,6 +1079,199 @@ class RunCancel:
                 hook()
             except Exception:
                 continue
+
+
+class RunInterrupted(Exception):
+    """Raised *inside* an adapter's own stream loop when its run was cancelled.
+
+    Private to the adapter that raises it: the loop catches it beside the
+    vendor's own errors and ends the run on one ``cancelled`` terminal. It never
+    reaches the bridge, and it is deliberately not a
+    :class:`~modelpass.errors.SubpassError`, which those loops re-raise.
+    """
+
+
+def _client_sockets(client: Any) -> list[socket.socket]:
+    """The live sockets under a vendor SDK client, found by duck typing.
+
+    Read off the installed packages on 2026-11-13 (httpx 0.28.1, httpcore 1.0.5,
+    anthropic 0.97.0, openai 2.32.0, google-genai 1.73.1): the Stainless clients
+    keep their ``httpx.Client`` at ``_client`` and google-genai keeps one at
+    ``_api_client._httpx_client``; an ``httpx.Client`` keeps its transports at
+    ``_transport`` and ``_mounts``; a transport keeps an ``httpcore`` pool at
+    ``_pool``, whose ``connections`` is public; and a connection's
+    ``_connection._network_stream`` answers ``get_extra_info("socket")``, which
+    is httpcore's documented way to reach the socket.
+
+    Every step is a ``getattr`` with a default, so a client shaped any other way
+    -- a later SDK, a test double -- yields no sockets rather than an error, and
+    :func:`interrupt_client` falls back to ``close()`` alone.
+    ``tests/test_api_cancel_interrupts.py`` holds the path against the real
+    clients, so an SDK upgrade that moves it fails a test.
+    """
+    found: list[socket.socket] = []
+    for path in (("_client",), ("_api_client", "_httpx_client")):
+        http: Any = client
+        for name in path:
+            http = getattr(http, name, None)
+        if http is None:
+            continue
+        mounts = getattr(http, "_mounts", None)
+        transports = [getattr(http, "_transport", None)]
+        if isinstance(mounts, Mapping):
+            transports.extend(mounts.values())
+        for transport in transports:
+            pool = getattr(transport, "_pool", None)
+            try:
+                connections = list(getattr(pool, "connections", None) or ())
+            except Exception:
+                continue
+            for connection in connections:
+                inner = getattr(connection, "_connection", None)
+                stream = getattr(inner, "_network_stream", None)
+                extra = getattr(stream, "get_extra_info", None)
+                if not callable(extra):
+                    continue
+                try:
+                    sock = extra("socket")
+                except Exception:
+                    continue
+                if isinstance(sock, socket.socket):
+                    found.append(sock)
+    return found
+
+
+def interrupt_client(client: Any) -> None:
+    """Unblock whatever thread is waiting on ``client``'s network, from any thread.
+
+    The cancel hook of a synchronous API run (D10's transport-level floor). A
+    run blocked in a read -- headers that never come, a stream that stalled --
+    cannot look at a flag, so the cancel has to reach the socket.
+
+    **Both steps are needed, and which one works depends on the platform**
+    (measured 2026-11-13, a ``recv`` blocked under a timeout, plain and TLS,
+    which is how httpcore's sync backend reads):
+
+    * ``shutdown(SHUT_RDWR)`` wakes the reader on Linux, and does not on
+      Windows;
+    * ``close()`` wakes the reader on Windows, and does not on Linux, where a
+      descriptor closed under a blocked ``poll`` simply stays blocked.
+
+    So the sockets are shut down first and the client is closed after. The
+    blocked call then fails with a transport error inside the adapter's loop,
+    which reads the cancel flag and ends the run ``cancelled``.
+
+    Only ever called on a client the adapter built for this one run: closing a
+    client that other runs share would be one run cancelling another, which is
+    exactly what run-scoped cancellation exists to prevent. Never raises.
+    """
+    for sock in _client_sockets(client):
+        try:
+            # The base-class call on purpose: ``SSLSocket.shutdown`` also drops
+            # its TLS object, under a thread that is in the middle of using it.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except Exception:
+            continue
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+async def _awaited(awaitable: Any) -> Any:
+    return await awaitable
+
+
+class _InterruptibleSteps:
+    """An async iterator whose every step goes through :meth:`AsyncInterrupt.run`.
+
+    A class rather than an async generator, so abandoning it mid-stream leaves
+    nothing for the loop to finalize later.
+    """
+
+    def __init__(self, scope: AsyncInterrupt, iterable: Any) -> None:
+        self._scope = scope
+        self._iterator = iterable.__aiter__()
+
+    def __aiter__(self) -> _InterruptibleSteps:
+        return self
+
+    async def __anext__(self) -> Any:
+        return await self._scope.run(self._iterator.__anext__())
+
+
+class AsyncInterrupt:
+    """One async run's cancel, able to interrupt the await the run is blocked in.
+
+    The native ``arun`` of an API adapter waits on the vendor's async client
+    from inside the caller's own task. A cancel -- usually the timeout
+    watchdog's, from a timer thread -- cannot stop that wait by setting a flag,
+    and must not cancel the caller's task, which is the caller's. So every
+    vendor wait is run through :meth:`run`, as a child task this object may
+    cancel: task cancellation is the one interruption every async HTTP stack
+    (httpx on anyio, aiohttp) is built to clean up after.
+
+    Constructed inside the run's own generator, so the running loop is the one
+    the run lives on. A cancelled wait raises :class:`RunInterrupted`; a caller
+    cancelling its *own* task still sees ``CancelledError``, untouched.
+    """
+
+    def __init__(self, cancel: RunCancel) -> None:
+        self._cancel = cancel
+        self._loop = asyncio.get_running_loop()
+        self._task: asyncio.Future[Any] | None = None
+        self._fired = False
+        cancel.on_cancel(self._from_any_thread)
+
+    def _from_any_thread(self) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._interrupt)
+        except RuntimeError:
+            # The loop is closed: nothing is waiting on it any more.
+            pass
+
+    def _interrupt(self) -> None:
+        self._fired = True
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def run(self, awaitable: Any) -> Any:
+        """Await ``awaitable``, unless or until this run is cancelled."""
+        if self._cancel.is_set():
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()  # a coroutine never started; closed so it does not warn
+            raise RunInterrupted
+        task = asyncio.ensure_future(_awaited(awaitable))
+        self._task = task
+        try:
+            return await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if self._fired and not (current is not None and current.cancelling()):
+                raise RunInterrupted from None
+            raise
+        finally:
+            self._task = None
+
+    def iterate(self, iterable: Any) -> AsyncIterator[Any]:
+        """``async for`` over ``iterable``, each step interruptible."""
+        return _InterruptibleSteps(self, iterable)
+
+    @contextlib.asynccontextmanager
+    async def entering(self, manager: Any) -> AsyncIterator[Any]:
+        """``async with manager``, with the entry -- the request -- interruptible."""
+        value = await self.run(manager.__aenter__())
+        try:
+            yield value
+        except BaseException as exc:
+            if not await manager.__aexit__(type(exc), exc, exc.__traceback__):
+                raise
+        else:
+            await manager.__aexit__(None, None, None)
 
 
 class InFlight:
