@@ -352,7 +352,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, ClassVar
 
-from .._background import process_options
+from .._background import kill_tree, release_tree, run_tree, spawn_tree
 from .._toml import dumps_inline
 from ..capabilities import Capability, Support
 from ..errors import (
@@ -1821,16 +1821,7 @@ def exclusivity_disable_args(
 def _default_mcp_list(binary: str, env: dict[str, str]) -> str | None:
     """Run ``codex mcp list --json`` with the scrubbed environment. Costs no tokens."""
     try:
-        result = subprocess.run(
-            [binary, "mcp", "list", "--json"],
-            **process_options(),
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=20,
-        )
+        result = run_tree([binary, "mcp", "list", "--json"], env=env, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
@@ -1839,9 +1830,11 @@ def _default_mcp_list(binary: str, env: dict[str, str]) -> str | None:
 
 
 def _default_spawn(argv: list[str], env: dict[str, str], cwd: str) -> subprocess.Popen[str]:
-    return subprocess.Popen(
+    # spawn_tree, not Popen: what this launches is a shim with the turn running
+    # two processes below it, and a cancel has to stop all of them
+    # (OpenAIAdapter._terminate, 2026-11-13).
+    return spawn_tree(
         argv,
-        **process_options(),
         env=env,
         cwd=cwd,
         stdout=subprocess.PIPE,
@@ -1906,16 +1899,7 @@ def _default_codex_version(binary: str, env: dict[str, str]) -> str | None:
     if not os.path.isfile(binary):
         return None
     try:
-        result = subprocess.run(
-            [binary, "--version"],
-            **process_options(),
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=20,
-        )
+        result = run_tree([binary, "--version"], env=env, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
@@ -1927,16 +1911,7 @@ def _default_codex_version(binary: str, env: dict[str, str]) -> str | None:
 def _default_login_status(binary: str, env: dict[str, str]) -> str | None:
     """Run ``codex login status`` with the scrubbed environment. Costs no tokens."""
     try:
-        result = subprocess.run(
-            [binary, "login", "status"],
-            **process_options(),
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=20,
-        )
+        result = run_tree([binary, "login", "status"], env=env, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return (result.stdout or "") + (result.stderr or "")
@@ -2010,9 +1985,8 @@ def _default_session_spawn(
     because it is written once and closed immediately -- the prompt goes through
     it rather than through argv, for the reason :func:`_send_prompt` records.
     """
-    return subprocess.Popen(
+    return spawn_tree(
         argv,
-        **process_options(),
         env=env,
         cwd=cwd,
         stdout=subprocess.PIPE,
@@ -4727,13 +4701,24 @@ class OpenAIAdapter(Adapter):
 
     @staticmethod
     def _terminate(proc: Any) -> None:
+        """Kill a run's process **and everything under it**, if it is still going.
+
+        The whole tree, because the process held here is the ``codex.cmd`` shim
+        on Windows and the turn runs two levels below it: killing the shim alone
+        left the turn running, spending allowance and holding stdout open so the
+        stream never ended (reproduced 2026-11-13,
+        ``tests/test_codex_process_tree.py``). A process that already exited on
+        its own is let go of without killing anything it left behind.
+        """
         if proc is None:
             return
         try:
             if proc.poll() is None:
-                proc.kill()
+                kill_tree(proc)
                 proc.wait(timeout=10)
-        except OSError:
+            else:
+                release_tree(proc)
+        except (OSError, subprocess.TimeoutExpired):
             pass
 
 

@@ -194,7 +194,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .._background import process_options
+from .._background import kill_tree, release_tree, spawn_tree, terminate_tree
 from ..errors import InvalidTool, VendorRunFailed
 from ..preflight import check_launch_args
 from ..runtimes import Runtime
@@ -266,6 +266,12 @@ HANDSHAKE_TIMEOUT = 30.0
 
 #: Seconds allowed for a polite terminate, and again for the kill after it.
 _SHUTDOWN_GRACE = 5.0
+
+#: How long a child that could only be told to stop by closing its stdin is
+#: given to leave before its tree is killed. That is every real child on
+#: Windows, where there is no ``SIGTERM`` to send. Shorter than the grace after
+#: a signal because this wait sits inside a cancel, on the watchdog's thread.
+_EOF_GRACE = 2.0
 
 
 # --- errors --------------------------------------------------------------------
@@ -748,9 +754,8 @@ def _default_spawn(
     server's lines, stderr the crash reason. Draining the last two needs two
     threads and gets them.
     """
-    return subprocess.Popen(
+    return spawn_tree(
         argv,
-        **process_options(),
         env=env,
         cwd=cwd,
         stdin=subprocess.PIPE,
@@ -919,21 +924,35 @@ class AppServerClient:
         self._end_stream()
 
     def _shutdown(self, proc: Any) -> None:
-        """Close stdin, terminate, then kill. Never raises."""
+        """Close stdin, ask the child to stop, then kill its whole tree. Never raises.
+
+        **The whole tree**, because the process held here is the ``codex.cmd``
+        shim on Windows and the server runs two levels below it. ``terminate()``
+        and ``kill()`` there both end the shim alone, so a server that did not
+        leave on its own was never stopped at all (reproduced 2026-11-13 with a
+        child that ignores stdin EOF, ``tests/test_codex_process_tree.py``).
+
+        The polite step differs by platform because the platforms do. Off
+        Windows it is ``SIGTERM``, as before. Windows has no such signal, so
+        there it is the closed stdin: the server is given
+        :data:`_EOF_GRACE` to notice and leave, and only then killed. A child
+        that left on its own is let go of without killing anything it started.
+        """
         stdin = getattr(proc, "stdin", None)
         if stdin is not None:
             try:
                 stdin.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
         try:
             if proc.poll() is None:
-                proc.terminate()
+                asked = terminate_tree(proc)
                 try:
-                    proc.wait(timeout=_SHUTDOWN_GRACE)
+                    proc.wait(timeout=_SHUTDOWN_GRACE if asked else _EOF_GRACE)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    kill_tree(proc)
                     proc.wait(timeout=_SHUTDOWN_GRACE)
+            release_tree(proc)
         except (OSError, subprocess.TimeoutExpired):
             pass
 
