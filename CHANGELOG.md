@@ -5,6 +5,69 @@ work landed.
 
 ## Unreleased
 
+The entries dated 2026-11-13 below, apart from the credential-store one, come from
+one code review of that date. Each behaviour is held by an offline test. Where a
+claim rests on a real vendor, a real Codex server, or a platform the suite did not
+run on, the entry says so.
+
+### Security
+
+- **The bench answers only to its own loopback host, and every POST needs a token**
+  (2026-11-13). The write guard compared `Origin` with a URL built from the `Host`
+  header, which the requesting page chooses. A page that rebound its name to
+  127.0.0.1 could save a connection pointing a stored key at its own endpoint and be
+  sent the key. Three checks now, any one of which answers 403:
+  - **Host**, on every request, GET included: `127.0.0.1:<port>` or
+    `localhost:<port>` for the port `serve()` bound. `create_app()` takes `port=` for
+    this. Without it (the test client) the two names are accepted on any port.
+  - **Origin**, where a browser sends one, against that fixed list. `Sec-Fetch-Site`
+    of `cross-site` or `same-site` is refused.
+  - **A per-process token on every POST**, as the `csrf_token` form field or the
+    `X-Modelpass-Csrf` header. A page carries it in every form and in the
+    `modelpass-csrf` meta tag. There is no longer a no-`Origin` exception, so a
+    script must read the token from a page first. `app.test_client()` carries it
+    in-process.
+  - **Check is a POST** (`POST /accounts/<name>/check`). `GET /?check=<name>` ran a
+    preflight from any page load, and a preflight starts a vendor process on the
+    subscription runtimes. `?check=` on a GET is now ignored.
+
+- **The secrets file's Windows ACL survives a write, and `check` reads the real one**
+  (2026-11-13). `icacls` restricted the new file, and the note recording that was
+  then written through a temp file that arrived with the directory's inherited ACL
+  and replaced it. Every later write did the same, while `modelpass check` went on
+  reporting "restricted" from the note. Now:
+  - The ACL is applied to the temp file on **every write**, before it is moved into
+    place. This reverses the documented "once at creation".
+  - The grantee is the process token's own SID, not `%USERDOMAIN%\%USERNAME%`.
+  - `SecretStore.permissions()` reads the file's ACL through the Windows security
+    API. `windows_acl` is `"restricted"` only when every allowing entry names the
+    process account and none is inherited. Otherwise it is `"failed"`, `"open"` or
+    `"unknown"`, with `windows_acl_detail` saying why. `"open"` and `"unknown"` are
+    new values. A file an earlier build left with inherited entries reads `"open"`,
+    or `"failed"` where a failure was recorded, until its next write restricts it.
+
+- **API connections take their endpoint and identity from the connection only**
+  (2026-11-13). The four API adapters passed the vendor SDK a key and left every
+  other constructor argument unset, which sends each SDK to the process environment.
+  Ignored now: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_BASE_URL`,
+  `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, `GOOGLE_GEMINI_BASE_URL`,
+  `GOOGLE_GENAI_USE_VERTEXAI` and `GOOGLE_GENAI_CLIENT_MODE`. The base URL is the
+  connection's `baseUrl`, else the vendor's own endpoint by name. `openai-compatible`
+  refuses a missing base URL instead of falling through to api.openai.com. **If you
+  relied on one of those variables, put the endpoint on the connection as
+  `baseUrl`.** Proxy and CA variables (`HTTPS_PROXY`, `SSL_CERT_FILE` and the like)
+  are not touched: the SDKs' HTTP layer reads them as before, and no test here holds
+  that. On `anthropic-sdk`, `ANTHROPIC_BASE_URL` through `allowEnv` is unchanged. The
+  `client_factory` seam keeps its `(api_key, base_url)` signature.
+
+- **A `codex_home` override is the home the Codex child runs in** (2026-11-13).
+  `options={"codex_home": X}` and the adapter's `codex_home=` chose which home the
+  preflight read and nothing else. The receipt could say subscription over a run
+  that used an API-key login in `~/.codex`. The override is now written into the
+  child's environment as `CODEX_HOME` for every launch: both transports, both kinds
+  of session, `list_sessions`, `input_modalities` and the probes. A connection's
+  `configDir` is unchanged.
+
 ### Changed
 
 - **`anthropic-sdk` never opens Claude Code's credential store** (2026-11-13). The
@@ -39,6 +102,186 @@ work landed.
   - **Removed** from `modelpass.adapters.anthropic`: `CredentialStatus`,
     `credentials_path`, `read_credential_status`.
 
+- **A 429 that names a wait is retryable and does not fail over** (2026-11-13).
+  Every API adapter types a 429 as `quota_exhausted`, and that row read
+  `retryable = no`. A per-minute rate limit with `retry-after: 7` read not-retryable
+  and, on a connection with `onQuotaExhausted.failover`, moved the call to the named
+  (possibly metered) connection. Now, on the API runtimes:
+  - **A 429 with a `retry-after`** keeps `status = quota_exhausted`, reads
+    `retryable = yes` with `retry_after` set, and **does not trigger the failover**.
+    The terminal stays on the first connection and its reason ends `the failover to
+    '<name>' was not used`. `ask()` and `raise_on_stop` still raise `QuotaExhausted`,
+    carrying the 429 and the wait.
+  - **A 429 with no wait is unchanged**: `retryable = no`, and it fails over where a
+    failover is configured.
+  - `retry = "never"` still forces the verdict to `no`. A named wait still does not
+    fail over there. Subscription runtimes report no status code and are unchanged.
+  - New `modelpass.retry.rate_limit_named_a_wait`, the one function both decisions
+    ask.
+
+  The docs had not said what a named-wait rate limit does to a failover. This is the
+  conservative reading and wants the owner's confirmation.
+
+- **The API clients no longer retry underneath modelpass** (2026-11-13).
+  `anthropic-api`, `openai-api` and `openai-compatible` built their clients without
+  `max_retries`, so each kept the SDK's two automatic retries on 429, 5xx and
+  timeouts. A quota failover waited out two backoffs, `retry = "never"` retried
+  anyway, and a request the vendor had already processed could be sent and billed
+  again. Every default client now passes `max_retries=0`, and `google-api` states one
+  attempt explicitly. A caller that leaned on those silent retries now sees the first
+  429 or 5xx as a terminal with its verdict.
+
+- **A cancel or a timeout interrupts an API run that is blocked** (2026-11-13). The
+  four API runtimes read their cancel flag only at the top of each tool round. A
+  request that never answered held the run until the SDK's own 600-second read
+  timeout, and `timeout=` bounded nothing there. Now:
+  - Sync: a run on a client the adapter built shuts that client's sockets down and
+    closes it. A client from an injected `client_factory` is never closed, and such
+    a run is cancelled at its next event.
+  - Async: every vendor wait is a child task, and the cancel cancels that task. The
+    caller's own task is not cancelled.
+  - The flag is read on every stream event and after each tool call is announced.
+    **No tool handler starts after a cancel**, and a cancel that lands after the
+    last stream event and before the terminal ends `cancelled`, where it ended `ok`.
+  - A transport error caused by the interruption ends the run on one `cancelled`
+    terminal (`timed_out` where a bound fired), not a vendor error.
+
+  Run on Windows against the real SDK clients and a loopback server. Not run on
+  Linux or macOS with the real SDKs: that half rests on a stdlib socket measurement.
+
+- **A refusal, a dropped stream and an unfinished tool call are no longer `ok`**
+  (2026-11-13). These endings reported success and now end `error`, or on the
+  truncation terminal:
+  - **`anthropic-api`: a stream that ends with no `stop_reason`** is `status = error`
+    with a reason saying the stream ended before the vendor sent one. Half an answer
+    was reported as a finished call. `google-api` and `openai-compatible` keep their
+    documented choice that content with no finish reason is `ok`.
+  - **`openai-api` and `openai-compatible`: a refusal** is `status = error` with the
+    reason `the model refused this request: <the refusal>`. It ended `ok` with no
+    text. No `StructuredOutputEvent` is emitted for a refused schema call.
+  - **`openai-api`, `openai-compatible` and `google-api`: a turn that was truncated,
+    filtered or failed while asking for a tool** runs no tool and ends on that
+    terminal. A handler used to run with `{}` or a fragment of the arguments.
+  - **`openai-api` and `openai-compatible`: arguments that are not a JSON object**
+    get a failed tool result without the handler being called. An empty arguments
+    string is still `{}`.
+  - **`google-api`: the `LANGUAGE`, `NO_IMAGE` and `IMAGE_OTHER`** finish reasons end
+    `error`. They fell through as `ok`.
+
+  A consumer that treated `ok` as "the vendor answered" now sees these as errors.
+  None was driven against a vendor.
+
+- **A session turn takes the connection's `timeoutSeconds`** (2026-11-13).
+  `Session.send` and `asend` used only their own `timeout=`, so a session on a
+  connection configured at 120 seconds waited on a hung runtime for ever. A turn now
+  resolves its bound as `chat()` does: the turn's own, else the connection's, else
+  none. A turn's own bound still replaces the connection's, and an empty `Timeout()`
+  still means unbounded. **A session turn that runs longer than its connection's
+  `timeoutSeconds` now ends `timed_out`.**
+
+- **A session's token ceiling counts every turn** (2026-11-13). The session's total
+  was its largest turn: three turns of 1,000 tokens against `stop_at_tokens=1500`
+  never stopped. `stop_at_tokens` and `warn_at_tokens` on a session now add up across
+  turns, as documented, so a long session stops sooner than it did. New
+  `GuardTracker.begin_turn`. A stateless call is unchanged.
+
+- **An abandoned run is written to the run log as `cancelled`** (2026-11-13). The
+  ledger line was written on the way to the terminal event. A caller who closed the
+  iterator early, which is the documented way to stop a run, left no line however
+  much the run had spent. `chat`, `achat`, `Session.send` and `asend` now write one
+  line when the iterator is closed, `aclose()`d, or its task is cancelled:
+  - `status = cancelled` with the usage seen so far. The terminal's reason is
+    `cancelled by caller: the stream was closed before the run ended`.
+  - A terminal already decided and not yet read (a guard stop) is written as itself.
+    A bound that had fired is written as `timed_out`.
+  - Nothing for a call closed at its receipt or never driven, and nothing twice for
+    a run that finished.
+  - **Still nothing for a call that ended by raising.**
+  - `Session.id` stays `None` after an abandoned first turn.
+
+  This reverses "the ledger is a record of terminals". **A consumer that counts
+  lines in `runs.jsonl` will see more `cancelled` rows.**
+
+- **A bare `TimeoutError` reads `unknown`, and a `CancelledError` reads `no`**
+  (2026-11-13). `classify_error(TimeoutError())` read `yes`. The builtin says only
+  that a wait ran out, and `asyncio.wait_for` around a whole call raises it for a run
+  that may have spent most of its allowance. `CancelledError` (asyncio's and
+  `concurrent.futures`') was not in the table and read `unknown`. The timeouts that
+  name themselves are unchanged: `APITimeoutError`, a 408 or 504, a `first_token`
+  expiry.
+
+- **A failover's second leg keeps the caller's sampling, and cannot start late**
+  (2026-11-13).
+  - **Sampling crosses.** `Sampling(max_output_tokens=256, temperature=0)` did not
+    reach the second leg, which is usually the metered one. It does now. A field the
+    target cannot take is dropped by the target's rules and named on its receipt.
+    **The effort level does not cross**: the target uses its own connection's level.
+  - **The second receipt is a full one**, with the same disclosures as a first leg,
+    and the second ledger line carries its sampling.
+  - **No second leg after the bound.** If `total` has fired before or during the
+    target's preflight, the call ends with one `timed_out` terminal on the first
+    connection, carrying the first leg's usage and the quota stop in its reason. No
+    `failover` event, no second receipt, one ledger line.
+  - **A same-runtime target uses its own model** unless the caller named one on the
+    call. The first connection's configured model used to cross.
+  - An unexpected exception from the target's preflight is a refusal on the first
+    leg's terminal. It used to escape raw. `achat` runs an agent-runtime target's
+    preflight off the event loop.
+
+- **The two agent-runtime extras are capped** (2026-11-13). `modelpass[anthropic]` is
+  `claude-agent-sdk>=0.2.159,<0.3`, verified against 0.2.180. `modelpass[openai]` is
+  `openai-codex>=0.154,<1`. Only 0.154.0 is verified: the package numbers every
+  Codex release as a 0.x minor, so the cap does not say the later ones were read.
+  The first had no upper bound and the second no version at all.
+
+- **`anthropic-sdk`: the environment scrub covers the spawn only** (2026-11-13). The
+  scrub removes credential variables from `os.environ` while the Claude Code child
+  starts. It wrapped the whole `connect()`, handshake included. For up to a minute a
+  concurrent `anthropic-api` call resolving `env:ANTHROPIC_API_KEY` found no key, and
+  every other `anthropic-sdk` spawn waited behind it. Now:
+  - The client is given the SDK's own `SubprocessCLITransport` with only its
+    `connect()` wrapped, so the scrub ends when the child has started.
+  - New `modelpass.adapters.anthropic.process_env()` answers with the removed names
+    put back, and `Bridge.env` reads through it. modelpass never sees the gap.
+  - The whole-`connect()` scrub remains as the fallback: for `can_use_tool` or
+    `session_store` options, and for an SDK without the class or the parameter.
+
+  Still exposed: code that is not modelpass reading `os.environ`, or starting a
+  child, during the spawn itself. Held offline against claude-agent-sdk 0.2.180. Not
+  driven live.
+
+- **Codex: a cancel kills the process tree** (2026-11-13). On Windows `codex` is
+  `codex.cmd`, so the process modelpass held was `cmd.exe` with the turn two levels
+  below it. A cancelled or timed-out run kept running and spending. Every Codex
+  child is now started and killed as a tree:
+  - **Windows**: a kill-on-close Job Object, so the tree also dies if this process
+    dies, and `taskkill /T` before the job is ended.
+  - **Elsewhere**: the child leads its own session and the kill is SIGKILL to its
+    process group. **Not run.** It is held by tests with a faked `os`.
+  - Closing an app-server child on Windows gives it 2 seconds to leave on a closed
+    stdin, then kills the tree. `codex --version`, `login status` and `mcp list` are
+    killed as trees when they time out.
+  - A run cancelled before it starts launches nothing and ends `cancelled`.
+
+- **Codex sessions: a cancelled turn ends, and a dead child's thread is resumed**
+  (2026-11-13).
+  - **Cancel and timeout.** A session turn's cancel was `turn/interrupt` alone, so a
+    hung server left `send(timeout=...)` waiting for ever. If the interrupt cannot be
+    sent, is not answered within 2 seconds, or the turn has not ended 3 seconds after
+    the answer, the child is closed. The turn ends `cancelled` or `timed_out`, and
+    the next turn starts a new child.
+  - **Resume on a new child.** A session whose child died sent its next turn to a
+    process that had never loaded the thread. The thread is now resumed by id on the
+    new child. A thread no turn finished on is started afresh.
+  - **Only `no rollout found` is `SessionNotFound`.** Any `thread/resume` failure was
+    reported as a conversation that no longer existed. Other refusals now surface as
+    themselves.
+  - A cancelled exec session turn ends `cancelled`, not `codex exited with code 1`.
+
+  Assumed from the schema, not driven against a real Codex: that `thread/resume` on
+  a second child continues a thread the first wrote, that an interrupted turn ends
+  inside the 3 seconds, and that the thread is usable afterwards.
+
 ### Fixed
 
 - **`promptCache = "5m"` or `"1h"` now reaches `anthropic-api`** (2026-11-04). The
@@ -49,6 +292,86 @@ work landed.
   from the prompt without a word. It now raises the same `ValueError` as a
   document beside a part modelpass has no block for. It is not yet converted to
   a `DocumentBlock`.
+
+- **`anthropic-sdk` sessions: a turn can be cancelled while connecting, and a failed
+  turn stops the runtime** (2026-11-13). A cancel or timeout during a hung spawn or
+  handshake did nothing until `connect()` returned. It now cancels the turn, which
+  ends `cancelled` or `timed_out` with no message sent, and the next turn connects
+  afresh. A turn that fails after it was sent and before its result (a vendor error,
+  an `AuthModeMismatch`) is interrupted, the client is disconnected, and the session
+  is marked broken: the next `send()` reports it. A failed connect, and a failure
+  after the result, leave the session usable.
+
+- **A changed effort keeps the `first_token` bound** (2026-11-13). On a session,
+  `send(reasoning="high", timeout=Timeout(first_token=...))` had no bound left. The
+  `reasoning_effort_changed` event modelpass emits itself was counted as the
+  runtime's first answer.
+
+- **A managed history `send` accepts `guards=`** (2026-11-13). It always raised
+  `InvalidGuards`, on both faces. The conversation's no-failover rule is written onto
+  a copy of the caller's `Guards` as a clean stop. The caller's object is not edited.
+
+- **A caller's 1-hour cache pin no longer draws a 400** (2026-11-13). On
+  `promptCacheTime = "auto"`, and on `"custom"` with no lifetime, a block pinned
+  `ttl="1h"` was sent after unpinned 5-minute breakpoints, an order the Messages API
+  refuses. The earlier breakpoints are now raised to 1 hour in every mode that takes
+  breakpoints. A call with no 1-hour pin is unchanged. The ordering rule was re-read
+  on the vendor's page on 2026-11-13. No live call.
+
+- **The run log survives an `Infinity`** (2026-11-13). One line with a non-finite
+  count made `RunLog.read()` raise for the whole log. Such a count reads as 0, and a
+  non-finite `allowance_utilization` as `None`.
+
+- **The connection store writes every TOML type it carries** (2026-11-13). One
+  preserved key holding a date-time, a date, a time or a table inside an array made
+  every add, change and remove fail with a `TypeError`. An array of tables (`[[x]]`)
+  is rewritten as `x = [{...}, {...}]`, the same data on one line.
+
+- **`modelpass remove` can drop a malformed connection** (2026-11-13). `remove`
+  loaded every connection before looking for the one named, so a connection that
+  fails validation could not be removed by the command meant to remove it. It is now
+  dropped by name without being parsed. Removing a valid connection from a file that
+  holds a malformed one still refuses.
+
+- **A bench save that is refused no longer leaves its rename behind** (2026-11-13).
+  A rename plus one invalid field answered 400 with the connection already renamed
+  and its secret moved. The whole save is now checked before anything is written.
+
+- **Strict structured output validates against the schema that was sent**
+  (2026-11-13). `openai-api` and `openai-compatible` rewrite a schema for
+  `strict: true`, which makes an optional property required and nullable.
+  - An answer that obeyed the sent schema, `{"name": "a", "nick": null}`, came back
+    `valid=False` against the caller's original. It is now validated against the
+    rewrite. `data` is still never edited.
+  - `to_openai_strict` and `openai_strict_issues` now reach `$defs` and
+    `definitions`, where a Pydantic nested model lives. On `openai-sdk` the receipt
+    names issues there too.
+  - The LangChain leaf strips the introduced nulls on all three runtimes. A null no
+    longer overwrites a dataclass default on the two API runtimes.
+
+- **`google-api`: parallel calls to one tool get distinct ids** (2026-11-13). The
+  fallback id on `tool_call` and `tool_result` events was the tool name. The first
+  call keeps the name. Later ones are `name#2`, `name#3`, counted across the run. A
+  vendor id is used unchanged.
+
+- **`anthropic-api`: an MCP image from a tool handler is sent as a Messages image
+  block** (2026-11-13). The MCP shape (`data`, `mimeType`) went out unchanged and
+  the request was rejected after the tool had run. Content with no Messages shape
+  (audio, a resource link) becomes the `[<type>]` text marker the event already
+  shows. Not sent to the vendor.
+
+- **The LangChain leaf no longer takes `tool_choice="any"` for a schema name**
+  (2026-11-13). `"any"`, `"auto"`, `"required"`, `"none"`, `True` and a provider
+  dict that names no tool became the name of the structured-output tool. A
+  `tool_choice` supplies the name only when it names a tool. Otherwise the name is
+  the schema title, then the class name.
+
+- **Codex: three smaller fixes** (2026-11-13).
+  - A failed caller tool on the app-server transport is one `tool_result`, not two.
+  - A stateless run removes the temporary working directory it made, on completion,
+    cancel and error. A directory the caller named is never touched.
+  - A turn the server reports `completed` is not failed by an earlier error
+    notification. Read from the schema: no capture holds such a notification.
 
 ### Added
 
@@ -664,6 +987,17 @@ work landed.
   Reported against 0.2.2 by a consumer whose preflight refused on a machine
   where `claude auth status` also answered `loggedIn: false` — the refusal was
   right and the explanation was not.
+
+### Left as is
+
+Two review findings were read and not changed (2026-11-13).
+
+- **A malformed connection still refuses the whole store on read.** That is the
+  documented compatibility policy, and its own test holds it. What changed is that
+  `remove` can now drop the bad connection by name.
+- **The Codex adapter still reads `~/.codex/auth.json`.** The 2026-10-01 decision
+  stands. `codex login status` prints one unstructured line on stderr, which is not
+  something to read a billing mode from.
 
 ## 0.2.2 — 2026-09-21
 
