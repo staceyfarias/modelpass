@@ -1414,6 +1414,53 @@ _VERIFY_SCHEMA: dict[str, Any] = {
 }
 
 
+def _client_kwargs(sdk: Any, *, api_key: str, base_url: str | None) -> dict[str, Any]:
+    """The constructor arguments that leave the SDK nothing to discover (D2).
+
+    The SDK fills these from the environment when they are ``None``
+    (``OpenAI.__init__``, openai 2.32.0, read 2026-11-13):
+
+    * ``api_key`` from ``OPENAI_API_KEY`` -- always passed.
+    * ``base_url`` from ``OPENAI_BASE_URL`` -- always passed. This runtime
+      has no default endpoint, so a missing one is refused, never discovered.
+    * ``organization`` / ``project`` from ``OPENAI_ORG_ID`` /
+      ``OPENAI_PROJECT_ID``, sent as the ``OpenAI-Organization`` and
+      ``OpenAI-Project`` headers. The constructor has no value that means
+      "none" (``None`` is what triggers the lookup, and ``""`` sends an empty
+      header), so the *headers* are omitted instead. ``default_headers`` is
+      what survives ``with_options()``/``copy()``, which rebuild the client and
+      read the environment again.
+    """
+    if not base_url:
+        # ``Connection`` requires a baseUrl on this runtime, so this is a caller
+        # of the factory seam getting it wrong. Refused rather than passed on:
+        # ``None`` is what sends the SDK to ``OPENAI_BASE_URL`` and then to
+        # api.openai.com, with a key that belongs to neither.
+        raise ValueError(
+            "openai-compatible has no default endpoint: a base_url is required"
+        )
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "default_headers": {
+            "OpenAI-Organization": sdk.Omit(),
+            "OpenAI-Project": sdk.Omit(),
+        },
+    }
+
+
+def _sealed(client: Any) -> Any:
+    """Drop what the constructor may have picked up from the environment anyway.
+
+    The omitted headers already keep the organization and project off the
+    wire; this keeps them, and ``OPENAI_WEBHOOK_SECRET``, off the object.
+    """
+    client.organization = None
+    client.project = None
+    client.webhook_secret = None
+    return client
+
+
 def _default_client(*, api_key: str, base_url: str | None) -> Any:
     """``openai.OpenAI``, constructed with an explicit key and nothing ambient.
 
@@ -1427,10 +1474,7 @@ def _default_client(*, api_key: str, base_url: str | None) -> Any:
         raise RuntimeNotAvailable(
             Runtime.OPENAI_COMPATIBLE.value, _EXTRA, _PACKAGE
         ) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    return sdk.OpenAI(**kwargs)
+    return _sealed(sdk.OpenAI(**_client_kwargs(sdk, api_key=api_key, base_url=base_url)))
 
 
 def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
@@ -1441,9 +1485,6 @@ def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
         raise RuntimeNotAvailable(
             Runtime.OPENAI_COMPATIBLE.value, _EXTRA, _PACKAGE
         ) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    return sdk.AsyncOpenAI(**kwargs)
+    return _sealed(sdk.AsyncOpenAI(**_client_kwargs(sdk, api_key=api_key, base_url=base_url)))
 
 

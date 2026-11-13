@@ -1429,24 +1429,59 @@ def _vendor_failure(exc: Exception) -> tuple[TerminalStatus, str]:
     return TerminalStatus.ERROR, f"{type(exc).__name__}: {exc}"
 
 
+#: Where the Gemini API lives when the connection names no ``baseUrl``. Stated
+#: here, and always handed to the constructor, because a constructor given no
+#: base URL reads ``GOOGLE_GEMINI_BASE_URL`` -- and then the connection's key
+#: goes wherever the process environment says (D2). Read off
+#: ``BaseApiClient.__init__``, google-genai 1.73.1, 2026-11-13.
+_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/"
+
+
+def _client_kwargs(*, api_key: str, base_url: str | None) -> dict[str, Any]:
+    """The constructor arguments that leave the SDK nothing to discover (D2).
+
+    What ``google.genai.Client`` decides from the environment when it is not
+    told (google-genai 1.73.1, read 2026-11-13), and what is said instead:
+
+    * ``api_key`` from ``GOOGLE_API_KEY`` / ``GEMINI_API_KEY`` -- always passed.
+    * the base URL from ``GOOGLE_GEMINI_BASE_URL`` (``_base_url.get_base_url``)
+      -- always passed: the connection's own, else the vendor's endpoint by
+      name. It travels in ``http_options``, because this SDK has no
+      ``base_url`` argument of its own; a dict rather than a
+      ``types.HttpOptions``, which the SDK accepts as ``HttpOptionsDict``.
+    * ``vertexai`` from ``GOOGLE_GENAI_USE_VERTEXAI`` -- ``False``, out loud.
+      ``None`` is what triggers the lookup, and a run that lands on Vertex is
+      a different service, a different bill and a different endpoint. With it
+      ``False`` the ambient ``GOOGLE_CLOUD_PROJECT`` / ``GOOGLE_CLOUD_LOCATION``
+      are read onto the client and used for nothing.
+    * ``debug_config`` from ``GOOGLE_GENAI_CLIENT_MODE`` and its two
+      companions, which swap the HTTP client for a record/replay harness --
+      passed with every field ``None``.
+    """
+    kwargs: dict[str, Any] = {
+        "api_key": api_key,
+        "vertexai": False,
+        "http_options": {"base_url": base_url or _DEFAULT_BASE_URL},
+    }
+    debug_config = getattr(importlib.import_module(f"{_MODULE}.client"), "DebugConfig", None)
+    if debug_config is not None:
+        kwargs["debug_config"] = debug_config(
+            client_mode=None, replays_directory=None, replay_id=None
+        )
+    return kwargs
+
+
 def _default_client(*, api_key: str, base_url: str | None) -> Any:
     """``google.genai.Client``, constructed with an explicit key and nothing ambient.
 
-    ``base_url`` travels in ``http_options`` -- this SDK has no ``base_url``
-    argument of its own -- and is passed only when the connection carries one, so
-    a connection without one gets the SDK's own default endpoint rather than a
-    ``None`` the constructor has to interpret. A dict rather than a
-    ``types.HttpOptions``: the SDK accepts ``HttpOptionsDict`` and this way the
-    only vendor symbol this module touches is the client itself.
+    Every argument the SDK would otherwise fill from the process environment is
+    stated here -- see :func:`_client_kwargs`.
     """
     try:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.GOOGLE_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["http_options"] = {"base_url": base_url}
-    return sdk.Client(**kwargs)
+    return sdk.Client(**_client_kwargs(api_key=api_key, base_url=base_url))
 
 
 def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
@@ -1461,7 +1496,4 @@ def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.GOOGLE_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["http_options"] = {"base_url": base_url}
-    return sdk.Client(**kwargs).aio
+    return sdk.Client(**_client_kwargs(api_key=api_key, base_url=base_url)).aio

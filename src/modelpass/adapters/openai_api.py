@@ -1434,21 +1434,64 @@ def _vendor_failure(exc: Exception) -> tuple[TerminalStatus, str]:
     return TerminalStatus.ERROR, f"{type(exc).__name__}: {exc}"
 
 
+#: Where the Responses API lives when the connection names no ``baseUrl``.
+#: Stated here, and always handed to the constructor, because a constructor
+#: given no ``base_url`` reads ``OPENAI_BASE_URL`` -- and then the connection's
+#: key goes wherever the process environment says (D2). Read off
+#: ``openai.OpenAI.__init__``, openai 2.32.0, 2026-11-13.
+_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+
+def _client_kwargs(sdk: Any, *, api_key: str, base_url: str | None) -> dict[str, Any]:
+    """The constructor arguments that leave the SDK nothing to discover (D2).
+
+    The SDK fills these from the environment when they are ``None``
+    (``OpenAI.__init__``, openai 2.32.0, read 2026-11-13):
+
+    * ``api_key`` from ``OPENAI_API_KEY`` -- always passed.
+    * ``base_url`` from ``OPENAI_BASE_URL`` -- always passed: the
+      connection's own, else the vendor's endpoint by name.
+    * ``organization`` / ``project`` from ``OPENAI_ORG_ID`` /
+      ``OPENAI_PROJECT_ID``, sent as the ``OpenAI-Organization`` and
+      ``OpenAI-Project`` headers. The constructor has no value that means
+      "none" (``None`` is what triggers the lookup, and ``""`` sends an empty
+      header), so the *headers* are omitted instead. ``default_headers`` is
+      what survives ``with_options()``/``copy()``, which rebuild the client and
+      read the environment again.
+    """
+    return {
+        "api_key": api_key,
+        "base_url": base_url or _DEFAULT_BASE_URL,
+        "default_headers": {
+            "OpenAI-Organization": sdk.Omit(),
+            "OpenAI-Project": sdk.Omit(),
+        },
+    }
+
+
+def _sealed(client: Any) -> Any:
+    """Drop what the constructor may have picked up from the environment anyway.
+
+    The omitted headers already keep the organization and project off the
+    wire; this keeps them, and ``OPENAI_WEBHOOK_SECRET``, off the object.
+    """
+    client.organization = None
+    client.project = None
+    client.webhook_secret = None
+    return client
+
+
 def _default_client(*, api_key: str, base_url: str | None) -> Any:
     """``openai.OpenAI``, constructed with an explicit key and nothing ambient.
 
-    ``base_url`` is passed only when the connection carries one, so a connection
-    without one gets the SDK's own default endpoint rather than a ``None`` the
-    constructor has to interpret.
+    Every argument the SDK would otherwise fill from the process environment is
+    stated here -- see :func:`_client_kwargs`.
     """
     try:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.OPENAI_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    return sdk.OpenAI(**kwargs)
+    return _sealed(sdk.OpenAI(**_client_kwargs(sdk, api_key=api_key, base_url=base_url)))
 
 
 def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
@@ -1457,7 +1500,4 @@ def _default_async_client(*, api_key: str, base_url: str | None) -> Any:
         sdk = importlib.import_module(_MODULE)
     except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         raise RuntimeNotAvailable(Runtime.OPENAI_API.value, _EXTRA, _PACKAGE) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    return sdk.AsyncOpenAI(**kwargs)
+    return _sealed(sdk.AsyncOpenAI(**_client_kwargs(sdk, api_key=api_key, base_url=base_url)))
