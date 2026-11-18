@@ -34,6 +34,7 @@ __all__ = [
     "InvalidTool",
     "NoSuchConnection",
     "NoSuchGroup",
+    "NoSuchModel",
     "NoSuchSecret",
     "PreflightFailed",
     "QuotaExhausted",
@@ -287,6 +288,16 @@ class InvalidGuards(SubpassError, ValueError):
     argument and ``except SubpassError`` still catches the whole library. A
     contradiction found while *reading a config file* is still an
     :class:`InvalidConnection`: there, the file really is wrong.
+    """
+
+
+class NoSuchModel(SubpassError, ValueError):
+    """A model name or version does not pick a model from a catalogue.
+
+    Raised by :meth:`~modelpass.models.ModelCatalogue.resolve` and
+    :meth:`~modelpass.bridge.Bridge.with_model` (2026-11-18). An argument
+    problem, so also a ``ValueError`` -- nothing in a config file is wrong.
+    The message lists what the catalogue does offer.
     """
 
 

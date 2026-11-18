@@ -1179,6 +1179,24 @@ def test_codex_models_come_from_the_vendor_cache(bench, tmp_path):
     assert 'data-model-exact="yes"' in body
 
 
+def test_the_picker_shows_the_latest_of_each_series_until_asked_for_all(bench, tmp_path):
+    """2026-11-18: one entry per series by default, the whole list on request."""
+    cache = tmp_path / "codex"
+    cache.mkdir()
+    (cache / "models_cache.json").write_text(
+        json.dumps({"models": [{"slug": "gpt-6.2-sol"}, {"slug": "gpt-5.6-sol"}]}),
+        encoding="utf-8",
+    )
+    _, client, _, _ = bench([openai()], codex_root=cache)
+    latest = client.get("/playground").get_data(as_text=True)
+    assert "gpt-6.2-sol" in latest
+    assert "gpt-5.6-sol" not in latest
+    assert "1 older version not shown" in latest
+    everything = client.get("/playground?versions=all").get_data(as_text=True)
+    assert "gpt-6.2-sol" in everything
+    assert "gpt-5.6-sol" in everything
+
+
 def test_a_missing_codex_cache_degrades_to_free_text(bench, tmp_path):
     _, client, _, _ = bench([openai()], codex_root=tmp_path / "absent")
     body = client.get("/playground").get_data(as_text=True)

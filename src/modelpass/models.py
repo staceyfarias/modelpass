@@ -46,6 +46,12 @@ that every model supports a particular workload.
     made-up fact wearing a vendor's name -- the same thing D4's amendment threw
     out for guard defaults.
 
+Series and versions (2026-11-18)
+    ``Bridge.models`` shows the newest version of each series unless asked for
+    ``versions="all"``. The grouping is :func:`parse_model_id`'s reading of the
+    id string -- no vendor says which id supersedes which -- so it is timid: an
+    id it cannot read is never grouped and never hidden.
+
 Either way the caller keeps a free-text field, because model churn in this space
 is constant, and the receipt plus the terminal event are what say which model
 actually applied.
@@ -57,22 +63,32 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .errors import NoSuchModel
 from .runtimes import Runtime
 
 __all__ = [
     "ANTHROPIC_ALIASES",
     "CODEX_MODELS_CACHE",
+    "MODEL_VERSIONS",
     "ModelCatalogue",
     "ModelChoice",
+    "ModelName",
     "codex_home",
     "models_for",
+    "parse_model_id",
 ]
+
+#: The two answers ``Bridge.models(..., versions=)`` takes. ``"latest"`` is the
+#: default since 2026-11-18: one entry per series, the newest. ``"all"`` is the
+#: vendor's whole list, which is what the default was before that date.
+MODEL_VERSIONS: tuple[str, ...] = ("latest", "all")
 
 #: Where the Codex CLI keeps its refreshed model list, relative to the codex home.
 CODEX_MODELS_CACHE = "models_cache.json"
@@ -99,6 +115,82 @@ class ModelChoice:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelName:
+    """A model id read as *series* + *version* (+ dated snapshot), 2026-11-18.
+
+    ``gpt-6.2-sol`` is series ``gpt-sol`` at version ``6.2``;
+    ``claude-opus-4-5-20251101`` is series ``claude-opus`` at ``4.5``, snapshot
+    ``20251101``. This is a reading of the *string*, not vendor metadata: no
+    models endpoint says which id supersedes which, so the grouping is
+    modelpass's own and is deliberately timid. An id it cannot read --
+    ``gpt-4o``, ``o4-mini``, ``llama3.1`` -- has an empty ``series`` and is
+    never grouped with, or hidden behind, anything.
+    """
+
+    id: str
+    #: The id with its version and snapshot removed, or ``""`` when unread.
+    series: str = ""
+    version: tuple[int, ...] = ()
+    #: A trailing date, digits only (``20251101``), or ``""``.
+    snapshot: str = ""
+
+    @property
+    def version_text(self) -> str:
+        return ".".join(str(part) for part in self.version)
+
+    @property
+    def rank(self) -> tuple[tuple[int, ...], bool, str]:
+        """Sort key, newest last: the highest version; then the undated id
+        (the vendor's own moving name for that version) over a dated
+        snapshot; then the newest snapshot."""
+        return (self.version, not self.snapshot, self.snapshot)
+
+
+#: A version token: one or two digits, optionally dotted (``6``, ``6.2``, ``5``).
+#: Longer digit runs -- ``0613``, ``001`` -- are build tags, not versions, and
+#: stay in the series so a tagged build is never mistaken for a newer release.
+_VERSION_TOKEN = re.compile(r"^\d{1,2}(\.\d{1,2})*$")
+_DATE8 = re.compile(r"^\d{8}$")
+
+
+def parse_model_id(model_id: str) -> ModelName:
+    """Read a model id as series + version. Never raises; unread ids say so."""
+    tokens = model_id.split("-")
+    snapshot = ""
+    if len(tokens) > 1 and _DATE8.match(tokens[-1]):
+        snapshot = tokens.pop()
+    elif (
+        len(tokens) > 3
+        and re.fullmatch(r"\d{4}", tokens[-3])
+        and re.fullmatch(r"\d{2}", tokens[-2])
+        and re.fullmatch(r"\d{2}", tokens[-1])
+    ):
+        snapshot = "".join(tokens[-3:])
+        tokens = tokens[:-3]
+    start = next((i for i, t in enumerate(tokens) if _VERSION_TOKEN.match(t)), None)
+    if start is None:
+        return ModelName(id=model_id)
+    end = start
+    while end < len(tokens) and _VERSION_TOKEN.match(tokens[end]):
+        end += 1
+    rest = tokens[:start] + tokens[end:]
+    if not any(rest):
+        return ModelName(id=model_id)
+    version = tuple(int(part) for t in tokens[start:end] for part in t.split("."))
+    return ModelName(
+        id=model_id, series="-".join(rest).lower(), version=version, snapshot=snapshot
+    )
+
+
+def _version_tuple(version: str | int | float) -> tuple[int, ...]:
+    text = str(version).strip().lower().removeprefix("v")
+    parts = [p for p in re.split(r"[.\-_ ]", text) if p]
+    if not parts or not all(p.isdigit() for p in parts):
+        raise NoSuchModel(f"version must look like '6.1' or '5', got {version!r}")
+    return tuple(int(p) for p in parts)
+
+
+@dataclass(frozen=True, slots=True)
 class ModelCatalogue:
     """Models on offer for a runtime, plus an honest account of where they came from."""
 
@@ -117,6 +209,149 @@ class ModelCatalogue:
 
     def __bool__(self) -> bool:
         return bool(self.choices)
+
+    # --- series and versions (2026-11-18) -------------------------------------
+
+    def latest(self) -> ModelCatalogue:
+        """This catalogue with only the newest version of each series.
+
+        The vendor's order is kept. A model whose id does not read as a series
+        (see :class:`ModelName`) is always kept: hiding something on a guess
+        would be the picker lying by omission. What was left out is counted in
+        a note, with the way to get it back.
+        """
+        best: dict[str, ModelName] = {}
+        for choice in self.choices:
+            name = parse_model_id(choice.id)
+            if not name.series:
+                continue
+            held = best.get(name.series)
+            if held is None or name.rank > held.rank:
+                best[name.series] = name
+        keep = {name.id for name in best.values()}
+        kept = tuple(
+            c for c in self.choices if c.id in keep or not parse_model_id(c.id).series
+        )
+        hidden = len(self.choices) - len(kept)
+        if not hidden:
+            return self
+        note = (
+            f"Showing the latest version of each series; {hidden} older "
+            f"version{'s' if hidden != 1 else ''} not shown. Ask for versions='all' "
+            "for the full list."
+        )
+        return ModelCatalogue(
+            runtime=self.runtime, choices=kept, source=self.source, exact=self.exact,
+            problem=self.problem, notes=(*self.notes, note),
+        )
+
+    def series(self) -> tuple[str, ...]:
+        """Every series name in this catalogue, in the vendor's order."""
+        seen: dict[str, None] = {}
+        for choice in self.choices:
+            name = parse_model_id(choice.id).series
+            if name:
+                seen.setdefault(name)
+        return tuple(seen)
+
+    def versions(self, name: str) -> tuple[ModelChoice, ...]:
+        """Every version of one series, newest first.
+
+        ``name`` is a series (``gpt-sol``, ``claude-opus``) or its short form
+        (``sol``, ``opus``). Raises :class:`~modelpass.errors.NoSuchModel` when
+        it names none, or more than one.
+        """
+        series = self._series_named(name)
+        if series is None:
+            raise NoSuchModel(self._unknown(name))
+        rows = [
+            (parse_model_id(c.id), c)
+            for c in self.choices
+            if parse_model_id(c.id).series == series
+        ]
+        rows.sort(key=lambda row: row[0].rank, reverse=True)
+        return tuple(choice for _, choice in rows)
+
+    def resolve(
+        self, name: str, version: str | int | float | None = None
+    ) -> ModelChoice:
+        """The one model ``name`` (and optionally ``version``) picks.
+
+        * An exact id in the list is itself.
+        * A series name with no version is that series' newest.
+        * A series name with a version is exactly that version -- its undated
+          id if there is one, otherwise its newest snapshot.
+
+        When this catalogue is not the vendor's own complete list (``exact`` is
+        false, or it carries a ``problem``), an unknown ``name`` with no
+        ``version`` is passed through as typed, because the list cannot say it
+        is wrong; with a ``version`` it is refused, because modelpass will not
+        assemble an id it has not seen.
+        """
+        wanted = str(name).strip()
+        if not wanted:
+            raise NoSuchModel("a model name is required")
+        authoritative = self.exact and self.problem is None
+        for choice in self.choices:
+            if choice.id.lower() == wanted.lower():
+                if version is None:
+                    return choice
+                if authoritative:
+                    raise NoSuchModel(
+                        f"{choice.id!r} is already an exact model id; drop version="
+                        f"{version!r}, or name the series instead"
+                    )
+                break
+        series = self._series_named(wanted)
+        if series is None:
+            if authoritative:
+                raise NoSuchModel(self._unknown(wanted))
+            if version is None:
+                return ModelChoice(
+                    id=wanted,
+                    label=wanted,
+                    description="as typed; not checked against a vendor list",
+                )
+            why = self.problem or self.source or "this runtime has no model list"
+            raise NoSuchModel(
+                f"cannot pick version {version!r} of {wanted!r}: {why}. "
+                "Pass the exact model id as the name instead"
+            )
+        candidates = self.versions(series)
+        if version is None:
+            return candidates[0]
+        target = _version_tuple(version)
+        for choice in candidates:
+            if parse_model_id(choice.id).version == target:
+                return choice
+        offered = ", ".join(
+            dict.fromkeys(parse_model_id(c.id).version_text for c in candidates)
+        )
+        raise NoSuchModel(
+            f"{series!r} has no version {'.'.join(map(str, target))}; "
+            f"this list offers: {offered}"
+        )
+
+    def _series_named(self, name: str) -> str | None:
+        wanted = name.strip().lower()
+        known = self.series()
+        if wanted in known:
+            return wanted
+        matches = [s for s in known if s.endswith("-" + wanted)]
+        if len(matches) > 1:
+            raise NoSuchModel(
+                f"{name!r} matches more than one series: {', '.join(matches)}. "
+                "Name one of them in full"
+            )
+        return matches[0] if matches else None
+
+    def _unknown(self, name: str) -> str:
+        known = ", ".join(self.series()) or "none"
+        return (
+            f"no model or series named {name!r} in this list "
+            f"({self.source or 'no source'}). Series on offer: {known}. To send an "
+            "id this list does not carry, pass model= on the call itself"
+        )
 
 
 def codex_home(env: dict[str, str] | None = None) -> Path:

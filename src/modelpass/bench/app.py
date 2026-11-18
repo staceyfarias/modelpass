@@ -965,6 +965,11 @@ def create_app(
             catalogue = models_for(
                 runtime, codex_root=app.config["SUBPASS_CODEX_ROOT"]
             )
+            # Latest version of each series by default (2026-11-18);
+            # ``?versions=all`` is the whole list. The free-text field takes
+            # any exact id either way.
+            if request.args.get("versions") != "all":
+                catalogue = catalogue.latest()
             verified_models = connection.verified_capabilities.models
             if verified_models:
                 # The one runtime where a model list is a fact about *this*

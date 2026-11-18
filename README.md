@@ -86,6 +86,33 @@ remain optional extras. Inspect `problem` and `notes`: a list may be partial or
 include models intended for other tasks. Successful discovery does not promise
 that every listed model supports chat, tools or your chosen workload.
 
+The list shows the **latest version of each series** by default: with GPT-6.2,
+6.1, 6 and 5.6 Sol all on offer, you see `gpt-6.2-sol`. A note on the catalogue
+counts what was left out. Ask for everything, or for one series:
+
+```python
+everything = bridge.models("my-account", versions="all")
+everything.series()            # ('gpt-sol', 'gpt-astra', 'gpt-terra', 'gpt-luna')
+everything.versions("sol")     # newest first: gpt-6.2-sol, gpt-6.1-sol, ...
+```
+
+To run on a model picked by name, `with_model` returns a connection set to it.
+The version is optional and reasoning defaults to `medium`:
+
+```python
+sol = bridge.with_model("my-account", "sol")                    # newest Sol, medium
+older = bridge.with_model("my-account", "sol", version="6.1", reasoning="high")
+for event in bridge.chat(connection=older, message="hello"):
+    ...
+```
+
+The result is an ordinary connection held in memory, not saved. For anything
+beyond a model and a reasoning level, configure it yourself as before: `model`
+and `reasoning` on a stored connection, or `model=` and `sampling=` on a call.
+The Claude subscription runtime has no model list, so there a name is one of
+its aliases (`opus`, `sonnet`, `haiku`, `fable`) or an exact model id, and a
+separate `version=` is refused.
+
 ### The subscription half, which is where this started
 
 If you pay for Claude Max or a ChatGPT plan, you are already paying for a lot of model

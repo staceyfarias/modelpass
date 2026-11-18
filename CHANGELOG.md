@@ -5,6 +5,22 @@ work landed.
 
 ## Unreleased
 
+### Changed
+
+- **`Bridge.models` shows the latest version of each series by default**
+  (2026-11-18). `versions="all"` returns the whole list, as the call did before.
+  The bench playground picker follows, with `?versions=all` for everything. A
+  model whose id does not read as a series is never hidden.
+
+### Added
+
+- Picking a model by name (2026-11-18). `Bridge.with_model(connection, name,
+  version=None, reasoning=...)` returns an unsaved connection set to that model,
+  with reasoning defaulting to `medium` where the runtime has an effort control.
+  `ModelCatalogue` gains `latest()`, `series()`, `versions()` and `resolve()`;
+  `modelpass.models.parse_model_id` and the `NoSuchModel` error are new. See
+  "Latest version per series" in `docs/api-and-runtimes.md`.
+
 The entries dated 2026-11-13 below, apart from the credential-store one, come from
 one code review of that date. Each behaviour is held by an offline test. Where a
 claim rests on a real vendor, a real Codex server, or a platform the suite did not

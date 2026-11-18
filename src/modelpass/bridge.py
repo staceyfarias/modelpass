@@ -469,6 +469,11 @@ class _Prepared:
 #: prefix and not a bare name.
 _GROUP_PREFIX = "group:"
 
+#: "The caller said nothing about reasoning" for :meth:`Bridge.with_model`,
+#: which is different from ``None`` ("state nothing"): unsaid means medium
+#: where the runtime has an effort control.
+_DEFAULT_REASONING: Any = object()
+
 
 
 def _with_standing_reasoning(
@@ -706,14 +711,82 @@ class Bridge:
         return self.connection(name)
 
     def models(self, connection: str | Connection, *, refresh: bool = False,
-               timeout: float = 15.0):
+               timeout: float = 15.0, versions: str = "latest"):
         """Return model suggestions for one explicit connection.
 
         Offline by default: subscription catalogues come from local vendor
         state; API results come only from this Bridge's previous explicit
         refresh. refresh=True may request authenticated model metadata, never
         generate, fall back to another account, or write a run receipt.
+
+        ``versions`` (2026-11-18) is ``"latest"`` -- the default: the newest
+        version of each series, with a note counting what was left out -- or
+        ``"all"``, the vendor's whole list. A model whose id does not read as
+        a series is in both. See :meth:`ModelCatalogue.latest
+        <modelpass.models.ModelCatalogue.latest>`.
         """
+        from .models import MODEL_VERSIONS
+        if versions not in MODEL_VERSIONS:
+            raise ValueError(
+                f"versions must be one of: {', '.join(MODEL_VERSIONS)}, got {versions!r}"
+            )
+        catalogue = self._models(connection, refresh=refresh, timeout=timeout)
+        return catalogue.latest() if versions == "latest" else catalogue
+
+    def with_model(
+        self,
+        connection: str | Connection,
+        name: str,
+        *,
+        version: str | int | float | None = None,
+        reasoning: Any = _DEFAULT_REASONING,
+        timeout: float = 15.0,
+    ) -> Connection:
+        """A connection set to one model, picked by name, and one reasoning level.
+
+        ``name`` is a series -- ``"sol"``, ``"opus"``, ``"gpt-sol"`` -- or an
+        exact model id. With no ``version`` a series means its newest; with
+        one (``"6.1"``, ``"5"``) it means exactly that version. ``reasoning``
+        defaults to ``"medium"`` on a runtime that carries an effort control
+        and to nothing on one that does not; a level stated outright on such a
+        runtime is refused, as it is everywhere else. ``None`` states nothing.
+
+        The result is an ordinary :class:`~modelpass.connections.Connection`,
+        built in memory from the one named and **not saved**: pass it wherever
+        a connection goes -- :meth:`chat`, :meth:`ask`, :meth:`new_chat`. A
+        per-call ``model=`` or ``Sampling.reasoning_effort`` still wins over
+        it, as over any connection.
+
+        Nothing is generated. Subscription lists are local vendor state. An
+        API connection whose list this Bridge has not fetched yet is fetched
+        here -- model metadata only, the same request ``models(refresh=True)``
+        makes. Raises :class:`~modelpass.errors.NoSuchModel` when the name or
+        version picks nothing; a group is refused, as for :meth:`models`.
+        """
+        selected = self._resolve_for_models(connection)
+        catalogue = self._models(selected, refresh=False, timeout=timeout)
+        if selected.runtime in API_RUNTIMES and catalogue.source == "not fetched":
+            catalogue = self._models(selected, refresh=True, timeout=timeout)
+        choice = catalogue.resolve(name, version)
+        if reasoning is _DEFAULT_REASONING:
+            supported = (
+                self.registry_for(selected).support(
+                    selected.runtime, Capability.REASONING_EFFORT
+                )
+                is Support.SUPPORTED
+            )
+            reasoning = "medium" if supported else None
+        elif reasoning is not None:
+            reasoning = getattr(reasoning, "value", reasoning)
+        return replace(selected, model=choice.id, reasoning=reasoning)
+
+    def _resolve_for_models(self, connection: str | Connection) -> Connection:
+        if isinstance(connection, str) and connection.startswith(_GROUP_PREFIX):
+            raise ValueError("Model discovery requires a connection, not a group")
+        return self._resolve(connection)
+
+    def _models(self, connection: str | Connection, *, refresh: bool, timeout: float):
+        """The whole catalogue for one connection; :meth:`models` filters it."""
         from .models import ModelCatalogue, models_for
         if not isinstance(refresh, bool):
             raise ValueError("refresh must be true or false")

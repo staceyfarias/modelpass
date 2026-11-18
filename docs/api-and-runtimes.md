@@ -3088,6 +3088,55 @@ timeouts, closure, cache isolation, disabled accounts and sanitized failure.
 No live account calls were made for this change.
 
 
+### Latest version per series, and picking a model by name (2026-11-18)
+
+`Bridge.models(..., versions="latest")` is now the default and returns one
+entry per series, the newest; `versions="all"` returns the whole list, which is
+what the call returned before this date. Any other word raises `ValueError`.
+
+- **A series is a reading of the id string, not vendor metadata.** No models
+  endpoint says which id supersedes which. `modelpass.models.parse_model_id`
+  reads `gpt-6.2-sol` as series `gpt-sol`, version `6.2`, and
+  `claude-opus-4-5-20251101` as series `claude-opus`, version `4.5`, snapshot
+  `20251101`. A version token is one or two digits, optionally dotted; a
+  trailing `YYYYMMDD` or `YYYY-MM-DD` is a snapshot.
+- **An id that does not read as a series is never hidden.** `gpt-4o`,
+  `o4-mini`, `llama3.1` and the Claude aliases appear under both settings. A
+  longer digit run (`gpt-4-0613`, `gemini-2.0-flash-001`) is a build tag and
+  stays in the series name, so a tagged build is its own series.
+- Within one series the highest version wins; at one version the undated id
+  wins over a dated snapshot, then the newest snapshot. The vendor's order is
+  kept. The filtered catalogue keeps `source`, `exact` and `problem`, and adds a
+  note counting what was left out.
+- `ModelCatalogue.latest()`, `.series()`, `.versions(name)` and
+  `.resolve(name, version=None)` are public. A name is a series (`gpt-sol`), its
+  short form (`sol`), or an exact id. A version is matched exactly: `6` is the
+  model called 6, not the newest 6.x. A miss raises `NoSuchModel` (a
+  `SubpassError` and a `ValueError`) naming what the list offers.
+- When a catalogue is not the vendor's complete list (`exact` false, or a
+  `problem`), an unknown name with no version passes through as typed, and a
+  name with a version is refused: modelpass does not assemble an id it has not
+  seen. This is the Claude subscription case, where the list is four aliases.
+- `Bridge.with_model(connection, name, *, version=None, reasoning=<medium>,
+  timeout=15)` returns a copy of the connection with `model` and `reasoning`
+  set. It is not saved. Reasoning left unsaid is `medium` where
+  `reasoning_effort` reads `supported` for the runtime and nothing where it
+  does not; a stated level goes through the connection's existing validation,
+  and `None` states nothing. An API connection whose list this Bridge has not
+  fetched is fetched once, metadata only, as `models(refresh=True)` does. A
+  group is refused.
+- The bench playground picker shows the latest per series; `?versions=all`
+  shows the whole list.
+
+Evidence: ids read on 2026-11-18 from the Codex model cache (written by codex
+0.169.0: ten visible GPT ids across 6.2, 6.1, 6 and 5.6) and from the
+`anthropic-api` models endpoint (15 ids), both metadata only. Offline tests in
+`tests/test_model_versions.py` hold the parsing, the filter, name and version
+resolution and `with_model`. No generation was requested. No capability cell
+changed. The OpenAI API and Gemini lists were not read; their ids are covered
+by parser cases only.
+
+
 ### Subscription desktop-chat verification (2026-11-01)
 
 `tests/test_background.py` checks Windows flags at the private loop boundary and
