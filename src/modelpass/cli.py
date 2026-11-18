@@ -381,6 +381,31 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     )
     disable.add_argument("name", help="connection to disable")
 
+    models = subcommands.add_parser(
+        "models",
+        help="show the models a connection offers",
+        description=(
+            "The newest version of each model series a connection offers, or "
+            "every version with --all. A subscription's list is read from the "
+            "vendor's local state and nothing is launched. An API connection's "
+            "list is requested from its models endpoint with that connection's "
+            "own key: metadata only, no generation and no tokens spent."
+        ),
+    )
+    models.add_argument("name", help="connection whose models to list")
+    models.add_argument(
+        "--all", action="store_true", dest="all_versions",
+        help="every version, not just the newest of each series",
+    )
+    models.add_argument(
+        "--series", metavar="NAME",
+        help="every version of one series, newest first (e.g. sol, opus, gpt-sol)",
+    )
+    models.add_argument(
+        "--timeout", type=float, default=15.0, metavar="SECONDS",
+        help="how long an API connection's list request may take (default 15)",
+    )
+
     secrets = subcommands.add_parser(
         "secrets",
         help="list the stored key entries and which connections reference them",
@@ -439,6 +464,8 @@ def main(
             return _set_groups(args, active, stdout)
         if args.command in {"enable", "disable"}:
             return _set_enabled(args, active, stdout)
+        if args.command == "models":
+            return _models(args, active, stdout)
         if args.command == "secrets":
             return _secrets(args, active, stdout)
         return _check(args, active, stdout)
@@ -1145,6 +1172,60 @@ def _groups(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:
             )
         print("", file=out)
     return EXIT_OK
+
+
+def _models(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:
+    """Print the models one connection offers, and where the list came from.
+
+    A CLI run is one Bridge, so an API list cached by an earlier run does not
+    exist here: an API connection is always asked. That is the request
+    ``Bridge.models(refresh=True)`` makes -- metadata, never a generation.
+    """
+    from .models import parse_model_id
+    from .runtimes import API_RUNTIMES
+
+    connection = bridge.connection(args.name)
+    catalogue = bridge.models(
+        connection,
+        refresh=connection.runtime in API_RUNTIMES,
+        timeout=args.timeout,
+        versions="all",
+    )
+    if args.series:
+        shown = catalogue.versions(args.series)
+        scope = f"every version of {parse_model_id(shown[0].id).series}"
+        notes = catalogue.notes
+    elif args.all_versions:
+        shown, scope, notes = catalogue.choices, "every version", catalogue.notes
+    else:
+        latest = catalogue.latest()
+        shown, scope, notes = latest.choices, "latest version of each series", latest.notes
+
+    print(
+        f"{connection.name} ({connection.runtime.value}): {len(shown)} model(s), {scope}",
+        file=out,
+    )
+    _print_field("source", catalogue.source or "none", out)
+    if not catalogue.exact:
+        _print_field("exact", "no -- this is not the vendor's own model list", out)
+    if catalogue.problem:
+        _print_field("problem", catalogue.problem, out)
+    if shown:
+        print("", file=out)
+    rows = []
+    for choice in shown:
+        name = parse_model_id(choice.id)
+        series = f"{name.series} {name.version_text}" if name.series else "-"
+        rows.append((choice.id, series, "" if choice.label == choice.id else choice.label))
+    wide = [max((len(row[i]) for row in rows), default=0) for i in (0, 1)]
+    for model_id, series, label in rows:
+        line = f"  {model_id:<{wide[0]}}   {series:<{wide[1]}}   {label}"
+        print(line.rstrip(), file=out)
+    if notes:
+        print("", file=out)
+    for note in notes:
+        _print_field("note", note.replace("versions='all'", "--all"), out)
+    return EXIT_OK if shown or not catalogue.problem else EXIT_FAILED
 
 
 def _set_groups(args: argparse.Namespace, bridge: Bridge, out: IO[str]) -> int:

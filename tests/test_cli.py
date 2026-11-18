@@ -1031,3 +1031,100 @@ def test_bench_without_flask_says_so_before_announcing_a_url(cli, monkeypatch):
     assert code == 1
     assert out == ""
     assert "modelpass[bench]" in err
+
+
+# --- models (2026-11-18) -----------------------------------------------------------
+
+
+def _codex_account(store, tmp_path, slugs):
+    import json
+
+    root = tmp_path / "codex-home"
+    root.mkdir()
+    (root / "models_cache.json").write_text(
+        json.dumps({"models": [{"slug": s, "display_name": s.upper()} for s in slugs]}),
+        encoding="utf-8",
+    )
+    store.add(
+        Connection(
+            name="codex",
+            runtime=Runtime.OPENAI_SDK,
+            auth_mode=AuthMode.SUBSCRIPTION,
+            credential_ref=CredentialRef.native_login(),
+            config_dir=str(root),
+        )
+    )
+
+
+_SLUGS = ("gpt-6.2-sol", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-5.6-sol", "gpt-5.6-terra")
+
+
+def test_models_prints_the_latest_of_each_series_and_how_to_see_the_rest(
+    cli, store, tmp_path
+):
+    _codex_account(store, tmp_path, _SLUGS)
+    code, out, err = cli(["models", "codex"])
+    assert (code, err) == (0, "")
+    assert "codex (openai-sdk): 2 model(s), latest version of each series" in out
+    assert "gpt-6.2-sol" in out and "gpt-6.1-terra" in out
+    assert "gpt-6.1-sol" not in out and "gpt-5.6" not in out
+    assert "3 older versions not shown" in out and "--all" in out
+    assert "models_cache.json" in out
+
+
+def test_models_all_prints_every_version(cli, store, tmp_path):
+    _codex_account(store, tmp_path, _SLUGS)
+    code, out, _ = cli(["models", "codex", "--all"])
+    assert code == 0
+    assert "5 model(s), every version" in out
+    assert all(slug in out for slug in _SLUGS)
+    assert "gpt-sol 6.2" in out and "GPT-6.2-SOL" in out
+
+
+def test_models_series_prints_one_series_newest_first(cli, store, tmp_path):
+    _codex_account(store, tmp_path, _SLUGS)
+    code, out, _ = cli(["models", "codex", "--series", "sol"])
+    assert code == 0
+    assert "3 model(s), every version of gpt-sol" in out
+    assert out.index("gpt-6.2-sol") < out.index("gpt-6.1-sol") < out.index("gpt-5.6-sol")
+    assert "terra" not in out
+
+
+def test_models_with_an_unknown_series_or_connection_fails_with_a_message(
+    cli, store, tmp_path
+):
+    _codex_account(store, tmp_path, _SLUGS)
+    code, _, err = cli(["models", "codex", "--series", "opus"])
+    assert code == 1 and "gpt-sol, gpt-terra" in err
+    code, _, err = cli(["models", "nobody"])
+    assert code == 1 and "nobody" in err
+
+
+def test_models_says_when_the_list_is_not_the_vendors_own(cli, store):
+    store.add(
+        Connection(
+            name="claude",
+            runtime=Runtime.ANTHROPIC_SDK,
+            auth_mode=AuthMode.SUBSCRIPTION,
+            credential_ref=CredentialRef.native_login(),
+        )
+    )
+    code, out, _ = cli(["models", "claude"])
+    assert code == 0
+    assert "not the vendor's own model list" in out
+    assert "opus" in out and "Opus (alias)" in out
+
+
+def test_models_with_no_list_to_read_exits_non_zero_and_says_why(cli, store, tmp_path):
+    store.add(
+        Connection(
+            name="codex",
+            runtime=Runtime.OPENAI_SDK,
+            auth_mode=AuthMode.SUBSCRIPTION,
+            credential_ref=CredentialRef.native_login(),
+            config_dir=str(tmp_path / "absent"),
+        )
+    )
+    code, out, _ = cli(["models", "codex"])
+    assert code == 1
+    assert "0 model(s)" in out and "has not written a model cache" in out

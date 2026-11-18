@@ -3127,6 +3127,11 @@ what the call returned before this date. Any other word raises `ValueError`.
   group is refused.
 - The bench playground picker shows the latest per series; `?versions=all`
   shows the whole list.
+- `modelpass models NAME [--all] [--series NAME] [--timeout SECONDS]` prints
+  the same lists. Because a CLI run is one Bridge with an empty cache, an API
+  connection is always asked for its list, as `models(refresh=True)` does; a
+  subscription still reads local state only. Exit status is non-zero only when
+  there is a `problem` and nothing to show. Held by `tests/test_cli.py`.
 
 Evidence: ids read on 2026-11-18 from the Codex model cache (written by codex
 0.169.0: ten visible GPT ids across 6.2, 6.1, 6 and 5.6) and from the

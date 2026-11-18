@@ -20,6 +20,9 @@ work landed.
   `ModelCatalogue` gains `latest()`, `series()`, `versions()` and `resolve()`;
   `modelpass.models.parse_model_id` and the `NoSuchModel` error are new. See
   "Latest version per series" in `docs/api-and-runtimes.md`.
+- `modelpass models NAME` lists a connection's models from the command line
+  (2026-11-18): latest per series by default, `--all` for every version,
+  `--series NAME` for one series.
 
 The entries dated 2026-11-13 below, apart from the credential-store one, come from
 one code review of that date. Each behaviour is held by an offline test. Where a
