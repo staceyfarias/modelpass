@@ -137,6 +137,7 @@ from ..types import (
     UsageScope,
     VendorEvent,
 )
+from ..web import google_evidence, native_web_tools
 from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
 from .base import (
     Adapter,
@@ -1064,6 +1065,8 @@ class GoogleAPIAdapter(Adapter):
         # D13: a schema and tools are never combined. The bridge refuses the
         # combination before an adapter sees it; the two branches here cannot
         # both fire on one request.
+        if request.web is not None:
+            config["tools"] = native_web_tools(self.runtime, request.web)
         config.update(response_format(request))
         params: dict[str, Any] = {
             "model": request.model or request.connection.model,
@@ -1135,6 +1138,8 @@ class GoogleAPIAdapter(Adapter):
                         usage = getattr(chunk, "usage_metadata", None) or usage
                         blocked = blocked or _blocked_reason(chunk)
                         for candidate in candidates(chunk):
+                            if request.web is not None:
+                                yield from google_evidence(candidate)
                             answered = True
                             finish_reason = (
                                 getattr(candidate, "finish_reason", None) or finish_reason
@@ -1320,6 +1325,9 @@ class GoogleAPIAdapter(Adapter):
                         usage = getattr(chunk, "usage_metadata", None) or usage
                         blocked = blocked or _blocked_reason(chunk)
                         for candidate in candidates(chunk):
+                            if request.web is not None:
+                                for evidence in google_evidence(candidate):
+                                    yield evidence
                             answered = True
                             finish_reason = (
                                 getattr(candidate, "finish_reason", None) or finish_reason

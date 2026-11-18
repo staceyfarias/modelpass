@@ -123,6 +123,7 @@ from ..types import (
     UsageScope,
     VendorEvent,
 )
+from ..web import anthropic_evidence, native_web_tools
 from ._mcp_result import (
     ainvoke_handler,
     anthropic_tool_result_content,
@@ -872,6 +873,8 @@ class AnthropicAPIAdapter(Adapter):
             params["messages"] = turn_breakpoint(messages, system, rules.ttl)
         if request.tools:
             params["tools"] = tool_params(request.tools)
+        if request.web is not None:
+            params["tools"] = native_web_tools(self.runtime, request.web)
         config = output_config(request)
         if config is not None:
             # D13: a schema and tools are never combined. The bridge refuses the
@@ -923,6 +926,7 @@ class AnthropicAPIAdapter(Adapter):
 
     def _loop(self, client: Any, request: RunRequest, cancel: RunCancel) -> Iterator[AgentEvent]:
         messages = conversation_param(request)
+        web_documents: list[str | None] = [None] * len(request.documents)
         by_name = {tool.name: tool for tool in request.tools}
         final_text = ""
 
@@ -980,6 +984,14 @@ class AnthropicAPIAdapter(Adapter):
             )
             if text:
                 final_text = text
+
+            if request.web is not None:
+                yield from anthropic_evidence(message, web_documents)
+                if getattr(message, "stop_reason", None) == "pause_turn":
+                    messages.append({
+                        "role": "assistant", "content": [_block_param(b) for b in blocks]
+                    })
+                    continue
 
             calls = [block for block in blocks if getattr(block, "type", None) == "tool_use"]
             # A run that declared no tools has nothing to answer with, and
@@ -1072,6 +1084,7 @@ class AnthropicAPIAdapter(Adapter):
     ) -> AsyncIterator[AgentEvent]:
         """:meth:`_loop` with ``await`` where it blocks. Same rounds, same events."""
         messages = conversation_param(request)
+        web_documents: list[str | None] = [None] * len(request.documents)
         by_name = {tool.name: tool for tool in request.tools}
         final_text = ""
 
@@ -1125,6 +1138,15 @@ class AnthropicAPIAdapter(Adapter):
             )
             if text:
                 final_text = text
+
+            if request.web is not None:
+                for evidence in anthropic_evidence(message, web_documents):
+                    yield evidence
+                if getattr(message, "stop_reason", None) == "pause_turn":
+                    messages.append({
+                        "role": "assistant", "content": [_block_param(b) for b in blocks]
+                    })
+                    continue
 
             calls = [block for block in blocks if getattr(block, "type", None) == "tool_use"]
             stopped_for_tools = getattr(message, "stop_reason", None) == "tool_use"

@@ -23,6 +23,16 @@ work landed.
 - `modelpass models NAME` lists a connection's models from the command line
   (2026-11-18): latest per series by default, `--all` for every version,
   `--series NAME` for one series.
+- Native web options on stateless sync and async calls, with explicit unsupported
+  option refusals, receipt disclosure, web activity and native evidence events,
+  and collected sources and citations (2026-11-17). Adapters cover Anthropic
+  Agent SDK, Codex app-server, Anthropic Messages, OpenAI Responses and Gemini
+  GenerateContent. Hosted API research jobs expose submit, retrieve and cancel
+  through OpenAI Responses and Gemini Interactions. The core retains zero runtime
+  dependencies. Offline tests cover the new wire mappings and lifecycle.
+  **Live verification is pending**, with the requested three smoke checks blocked
+  by the workspace environment. OpenAI API and Gemini were left live-untested.
+  See the native web section in `docs/api-and-runtimes.md`.
 
 The entries dated 2026-11-13 below, apart from the credential-store one, come from
 one code review of that date. Each behaviour is held by an offline test. Where a

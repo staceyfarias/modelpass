@@ -165,6 +165,33 @@ system: guards count tokens from the events a runtime emits, and the vendor's bi
 the truth. And it does not do embeddings — no subscription runtime can embed, so the
 one thing this library is for adds nothing there; embeddings stayed app-owned.
 
+## Native web search and research
+
+Opt into a provider's web tools on a stateless call with `web=WebOptions(...)`.
+The same option works on `chat`, `ask`, `achat` and `aask`.
+
+```python
+from modelpass import Bridge, WebOptions
+
+answer = Bridge().ask(
+    "claude-sub",
+    "Research the current stable Python release and give an official source link.",
+    model="haiku",
+    web=WebOptions(require_search=True),
+)
+print(answer.text)
+```
+
+Native web activity streams as `WebActivityEvent`. Available native sources and
+citations arrive in `WebEvidenceEvent` and on `Answer.sources` and
+`Answer.citations`. An unsupported control raises before execution. Hosted API
+jobs use `start_research`, `get_research` and `cancel_research`.
+
+**Live verification is pending.** The new paths have offline coverage. The
+requested subscription and Anthropic API smoke checks were blocked by the
+verification environment. OpenAI API and Gemini are live-untested. See the
+[web contract and verification record](docs/api-and-runtimes.md#native-web-search-and-hosted-research-2026-11-17).
+
 ## Install
 
 ```

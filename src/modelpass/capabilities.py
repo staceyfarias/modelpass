@@ -61,6 +61,12 @@ class Capability(StrEnum):
     """Things a runtime may or may not be able to do."""
 
     CHAT = "chat"
+    WEB_SEARCH = "web_search"
+    WEB_FETCH = "web_fetch"
+    WEB_CITATIONS = "web_citations"
+    WEB_CACHED = "web_cached"
+    WEB_DOMAINS = "web_domains"
+    RESEARCH_JOBS = "research_jobs"
     STREAMING = "streaming"
     THINKING = "thinking"
     USAGE_TOKENS = "usage_tokens"
@@ -2169,6 +2175,52 @@ def _check_table_coverage() -> None:
             "driven yet."
         )
 
+
+# Native web adapters, 2026-11-17. Support means offline-tested wire handling.
+# Live verification is separately recorded in docs/api-and-runtimes.md.
+# SDK reads: claude-agent-sdk 0.2.180 options and WebSearch/WebFetch blocks,
+# codex app-server webSearch items and config, anthropic 0.97.0 server tools,
+# openai 2.32.0 Responses web search and background methods, google-genai
+# 1.73.1 grounding types and Interactions create/get/cancel.
+_WEB_ROWS = {
+    Runtime.ANTHROPIC_SDK: (_S, _S, _N, _N, _N, _N),
+    Runtime.OPENAI_SDK: (_S, _N, _N, _S, _S, _N),
+    Runtime.ANTHROPIC_API: (_S, _S, _S, _N, _S, _N),
+    Runtime.OPENAI_API: (_S, _N, _S, _S, _S, _S),
+    Runtime.GOOGLE_API: (_S, _S, _S, _N, _N, _S),
+    Runtime.OPENAI_COMPATIBLE: (_N, _N, _N, _N, _N, _N),
+    Runtime.GOOGLE_CLI: (_N, _N, _N, _N, _N, _N),
+    Runtime.GOOGLE_SDK: (_N, _N, _N, _N, _N, _N),
+}
+for _runtime, _cells in _WEB_ROWS.items():
+    for _cap, _support in zip((
+        Capability.WEB_SEARCH, Capability.WEB_FETCH, Capability.WEB_CITATIONS,
+        Capability.WEB_CACHED, Capability.WEB_DOMAINS, Capability.RESEARCH_JOBS,
+    ), _cells, strict=True):
+        STATIC_TABLE[_runtime][_cap] = _support
+        _note = (
+            f"{_support.value}, 2026-11-17. Native web contract, held by "
+            "tests/test_web.py and tests/test_research.py with the installed SDK "
+            "surface read. Live-untested. Codex uses app-server and domain allowlists "
+            "only. Schema/custom-tool combinations and sessions are refused. See "
+            "docs/api-and-runtimes.md, Native web search and hosted research."
+        )
+        if _runtime is Runtime.OPENAI_COMPATIBLE:
+            # A checked absence in modelpass, like this row's document_input and
+            # cache_breakpoints cells (2026-11-18): the adapter sends no native
+            # web tool on this shape and web= is refused before anything is sent
+            # (tests/test_web.py::test_explicit_unsupported_controls_refuse). It
+            # is not a cell `modelpass verify` drives, so the row's prefix says
+            # what refine() is for and this text says why it does not apply here.
+            _note = (
+                f"{_COMPATIBLE_PREFIX}unsupported (2026-11-17), a checked absence "
+                "in modelpass rather than a claim about the endpoint: no portable "
+                "native web tool follows from OpenAI-shaped chat completions, so "
+                "this adapter sends none and web= is refused before anything is "
+                "sent. 'modelpass verify' does not drive this cell; an endpoint's "
+                "own web feature would need its own evidence and contract"
+            )
+        NOTES[_runtime, _cap] = _note
 
 _check_table_coverage()
 

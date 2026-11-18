@@ -157,12 +157,17 @@ from .types import (
     ToolCallEvent,
     ToolResultEvent,
     UsageEvent,
+    WebCitation,
+    WebEvidenceEvent,
+    WebSource,
     normalize_messages,
 )
+from .web import WebOptions, validate_web, web_receipt
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; the import at use is a cycle
     from .conversations import ConversationStore
     from .manage import ConnectionManager
+    from .research import ResearchJob, ResearchSnapshot
 
 __all__ = ["Answer", "Bridge", "ValidationReport", "chat", "default_bridge"]
 
@@ -296,6 +301,9 @@ class Answer:
     reasoning_value: str | None = None
     reasoning_echo: str | None = None
     reasoning_metric: str | None = None
+    sources: tuple[WebSource, ...] | None = None
+    citations: tuple[WebCitation, ...] | None = None
+    web_presentation: Mapping[str, Any] = field(default_factory=dict)
 
 
 #: The cells that together answer "does this runtime hold a conversation of its
@@ -411,7 +419,25 @@ class _Collected:
             reasoning_value=terminal.reasoning_value,
             reasoning_echo=terminal.reasoning_echo,
             reasoning_metric=terminal.reasoning_metric,
+            sources=self._web_values("sources"),
+            citations=self._web_values("citations"),
+            web_presentation={
+                key: value
+                for event in self.events
+                if isinstance(event, WebEvidenceEvent)
+                for key, value in event.presentation.items()
+            },
         )
+
+    def _web_values(self, name: str) -> tuple | None:
+        values = [
+            getattr(event, name)
+            for event in self.events
+            if isinstance(event, WebEvidenceEvent) and getattr(event, name) is not None
+        ]
+        if not values:
+            return None
+        return tuple(dict.fromkeys(item for batch in values for item in batch))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1042,6 +1068,7 @@ class Bridge:
         schema: Mapping[str, Any] | None = None,
         sampling: Sampling | Mapping[str, Any] | None = None,
         verify_identity: bool = False,
+        web: WebOptions | Mapping[str, Any] | None = None,
     ) -> Receipt:
         """Run the full preflight and return the receipt, without starting a run.
 
@@ -1073,12 +1100,20 @@ class Bridge:
         (D20).
         """
         resolved = self._resolve(connection)
+        call_web = WebOptions.coerce(web)
+        validate_web(resolved.runtime, call_web, {})
+        if call_web is not None and schema is not None:
+            raise CapabilityNotSupported(
+                resolved.runtime.value, "web.combinations", "unverified",
+                "web with schema is not verified",
+            )
         request = self._build_request(
             resolved,
             normalize_messages(messages) if messages else (),
             model=model,
             options={},
             sampling=Sampling.coerce(sampling),
+            web=call_web,
             schema=normalize_schema(schema) if schema is not None else None,
         )
         adapter = self.adapter_for(resolved.runtime)
@@ -1095,6 +1130,8 @@ class Bridge:
         receipt = self._with_documents(request, receipt)
         receipt = self._with_reasoning_disclosure(request, receipt)
         receipt = self._with_prompt_cache(request, receipt)
+        if call_web is not None:
+            receipt = replace(receipt, web=web_receipt(resolved.runtime, call_web))
         return self._with_sampling_disclosure(request, receipt)
 
     def refresh_identity(self, connection: Connection | str) -> None:
@@ -1616,6 +1653,7 @@ class Bridge:
         schema: Mapping[str, Any] | None = None,
         schema_name: str | None = None,
         timeout: Timeout | float | None = None,
+        web: WebOptions | Mapping[str, Any] | None = None,
     ) -> Iterator[AgentEvent]:
         """One stateless call: instructions, prior turns, a message, an answer.
 
@@ -1866,6 +1904,7 @@ class Bridge:
                 schema=schema,
                 schema_name=schema_name,
                 timeout=timeout,
+                web=web,
             )
         )
 
@@ -1892,6 +1931,7 @@ class Bridge:
         schema: Mapping[str, Any] | None = None,
         schema_name: str | None = None,
         timeout: Timeout | float | None = None,
+        web: WebOptions | Mapping[str, Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """:meth:`chat`, on a loop (R1)::
 
@@ -1965,6 +2005,7 @@ class Bridge:
             schema=schema,
             schema_name=schema_name,
             timeout=timeout,
+            web=web,
         )
         return self._astream(plan)
 
@@ -1988,6 +2029,7 @@ class Bridge:
         schema: Mapping[str, Any] | None = None,
         schema_name: str | None = None,
         timeout: Timeout | float | None = None,
+        web: WebOptions | Mapping[str, Any] | None = None,
     ) -> Answer:
         """:meth:`ask`, awaited: one call, one :class:`Answer`, no drain loop::
 
@@ -2018,6 +2060,7 @@ class Bridge:
             schema=schema,
             schema_name=schema_name,
             timeout=timeout,
+            web=web,
         ):
             collected.absorb(event)
         return collected.answer(
@@ -2046,6 +2089,7 @@ class Bridge:
         schema: Mapping[str, Any] | None = None,
         schema_name: str | None = None,
         timeout: Timeout | float | None = None,
+        web: WebOptions | Mapping[str, Any] | None = None,
     ) -> Answer:
         """:meth:`chat`, drained: one call, one :class:`Answer` (R11)::
 
@@ -2118,6 +2162,7 @@ class Bridge:
             schema=schema,
             schema_name=schema_name,
             timeout=timeout,
+            web=web,
         ):
             collected.absorb(event)
         return collected.answer(
@@ -3088,6 +3133,7 @@ class Bridge:
         mcp_servers: Mapping[str, Mapping[str, Any]] | None = None,
         schema: Mapping[str, Any] | None = None,
         schema_name: str = "",
+        web: WebOptions | None = None,
     ) -> RunRequest:
         if connection.auth_mode not in runtime_auth_modes(connection.runtime, self.registry):
             raise AuthModeMismatch(
@@ -3119,7 +3165,37 @@ class Bridge:
             schema_name=schema_name,
             cache_notes=cache_notes,
             written_messages=messages,
+            web=web,
         )
+
+    def start_research(
+        self,
+        connection: Connection | str,
+        message: str,
+        *,
+        model: str | None = None,
+        agent: str | None = None,
+        web: WebOptions | Mapping[str, Any] | None = None,
+        timeout: float = 30,
+    ) -> ResearchJob:
+        """Submit a hosted API research job and return its persistable handle."""
+        from .research import start_research
+
+        return start_research(
+            self, connection, message, model=model, agent=agent, web=web, timeout=timeout
+        )
+
+    def get_research(self, job: ResearchJob, *, timeout: float = 30) -> ResearchSnapshot:
+        """Retrieve one hosted job snapshot. A timeout leaves the remote job running."""
+        from .research import get_research
+
+        return get_research(self, job, timeout=timeout)
+
+    def cancel_research(self, job: ResearchJob, *, timeout: float = 30) -> ResearchSnapshot:
+        """Explicitly request remote cancellation and return the provider's snapshot."""
+        from .research import get_research
+
+        return get_research(self, job, timeout=timeout, cancel=True)
 
     def _resolve_failover(
         self,
@@ -3223,6 +3299,7 @@ class Bridge:
         schema: Mapping[str, Any] | None = None,
         schema_name: str | None = None,
         timeout: Timeout | float | None = None,
+        web: WebOptions | Mapping[str, Any] | None = None,
     ) -> _CallPlan:
         """The half of the pipeline that touches nothing outside this process.
 
@@ -3261,6 +3338,21 @@ class Bridge:
         tool_defs = normalize_tools(tools)
         servers = dict(mcp_servers or {})
         call_options = dict(options or {})
+        call_web = WebOptions.coerce(web)
+        validate_web(resolved.runtime, call_web, call_options)
+        if call_web is not None and (tool_defs or servers or schema is not None):
+            raise CapabilityNotSupported(
+                resolved.runtime.value, "web.combinations", "unverified",
+                "web with caller tools, MCP or schema is not verified",
+            )
+        if call_web is not None and call_web.fetch_urls:
+            last = normalized[-1]
+            normalized = (
+                *normalized[:-1],
+                replace(last, content=(
+                    *last.blocks, TextBlock(text="\n" + "\n".join(call_web.fetch_urls))
+                )),
+            )
         call_sampling = Sampling.coerce(sampling)
         # Resolved before the gates because the gates ask it a question (S7a):
         # the registry answers "what can I rely on from this runtime by default",
@@ -3339,6 +3431,9 @@ class Bridge:
         # allowance has just run out.
         failover = self._resolve_failover(resolved, effective_guards, expect_auth_mode)
 
+        if failover is not None:
+            validate_web(failover.runtime, call_web, call_options)
+
         request = self._build_request(
             resolved,
             normalized,
@@ -3349,6 +3444,7 @@ class Bridge:
             mcp_servers=servers,
             schema=normalized_schema,
             schema_name=resolved_schema_name,
+            web=call_web,
         )
 
         return _CallPlan(
@@ -3399,6 +3495,8 @@ class Bridge:
         receipt = self._with_reasoning_disclosure(request, receipt)
         receipt = self._with_prompt_cache(request, receipt)
         receipt = self._with_sampling_disclosure(request, receipt)
+        if request.web is not None:
+            receipt = replace(receipt, web=web_receipt(request.runtime, request.web))
         return receipt
 
     def _stream(self, prepared: _Prepared) -> Iterator[AgentEvent]:
@@ -3833,6 +3931,7 @@ class Bridge:
                     primary.options,
                     target_registry,
                 )
+            validate_web(target.runtime, primary.web, primary.options)
             request = self._build_request(
                 target,
                 primary.written_messages or primary.messages,
@@ -3843,6 +3942,7 @@ class Bridge:
                 mcp_servers=primary.mcp_servers,
                 schema=primary.schema,
                 schema_name=primary.schema_name,
+                web=primary.web,
             )
             # The same decoration the first leg's receipt gets, so the second
             # receipt and the second ledger line answer the same questions.

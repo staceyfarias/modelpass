@@ -1192,6 +1192,7 @@ class Receipt:
     #: which is what
     #: an unreported drop costs in practice (validation 2026-09-13, §1c).
     sampling_notes: tuple[str, ...] = ()
+    web: Mapping[str, Any] | None = None
 
     @classmethod
     def from_plan(cls, plan: PreflightPlan, **overrides: object) -> Receipt:
@@ -1403,6 +1404,7 @@ class Receipt:
             "sampling_requested": dict(self.sampling_requested),
             "sampling_applied": dict(self.sampling_applied),
             "sampling_notes": list(self.sampling_notes),
+            "web": dict(self.web) if self.web is not None else None,
             "ok": self.ok,
             "problem": self.problem,
             "summary": self.summary(),

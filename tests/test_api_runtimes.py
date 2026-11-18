@@ -281,7 +281,20 @@ def test_an_api_runtime_takes_a_key_and_not_a_subscription(runtime):
 #: a checked absence in modelpass's own adapters, which render content as text.
 EXPECTED_UNSUPPORTED_BY_RUNTIME = {
     Runtime.OPENAI_API: {Capability.CACHE_BREAKPOINTS, Capability.DOCUMENT_INPUT},
-    Runtime.OPENAI_COMPATIBLE: {Capability.CACHE_BREAKPOINTS, Capability.DOCUMENT_INPUT},
+    # The six native-web cells join it here (2026-11-18): the adapter sends no
+    # web tool on this shape and ``web=`` is refused before anything is sent
+    # (tests/test_web.py::test_explicit_unsupported_controls_refuse), so these
+    # are modelpass's own absences, not questions about the endpoint.
+    Runtime.OPENAI_COMPATIBLE: {
+        Capability.CACHE_BREAKPOINTS,
+        Capability.DOCUMENT_INPUT,
+        Capability.WEB_SEARCH,
+        Capability.WEB_FETCH,
+        Capability.WEB_CITATIONS,
+        Capability.WEB_CACHED,
+        Capability.WEB_DOMAINS,
+        Capability.RESEARCH_JOBS,
+    },
     Runtime.GOOGLE_API: {Capability.CACHE_BREAKPOINTS, Capability.DOCUMENT_INPUT},
 }
 

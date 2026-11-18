@@ -2199,6 +2199,19 @@ _ISOLATION_OVERRIDES: tuple[tuple[str, str], ...] = (
 )
 
 
+def web_config_overrides(request: RunRequest) -> list[str]:
+    """Explicit web settings override chat's disabled default on this child only."""
+    web = request.web
+    if web is None:
+        return []
+    mode = {"provider_default": "cached", "off": "disabled"}.get(web.search, web.search)
+    args = ["-c", f"web_search={json.dumps(mode)}"]
+    if web.search_allowed_domains:
+        domains = json.dumps(list(web.search_allowed_domains))
+        args.extend(["-c", "tools.web_search.allowed_domains=" + domains])
+    return args
+
+
 def isolation_overrides() -> list[str]:
     """``-c`` arguments that keep a stateless app-server run to what the caller sent.
 
@@ -4418,6 +4431,7 @@ class OpenAIAdapter(Adapter):
             config_overrides=(
                 *(() if request.native_tools else chat_tool_overrides()),
                 *isolation_overrides(),
+                *web_config_overrides(request),
             ),
         )
         turn = AppServerTurn()

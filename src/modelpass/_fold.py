@@ -376,6 +376,31 @@ class RunFold(EventFold):
 
     stateless = True
 
+    def __init__(self, *, web=None, **kwargs) -> None:
+        from .web import WebState
+
+        super().__init__(**kwargs)
+        self.web = WebState(web) if web is not None else None
+
+    def feed(self, event: AgentEvent) -> list[AgentEvent]:
+        if self.web is None:
+            return super().feed(event)
+        observed = self.web.observe(event)
+        if isinstance(event, TerminalEvent):
+            reason = self.web.failure(event)
+            if reason:
+                event = replace(event, status=TerminalStatus.ERROR, reason=reason)
+        forwarded = super().feed(event)
+        return [*observed, *forwarded] if forwarded else []
+
+    def finish(self) -> TerminalEvent:
+        terminal = super().finish()
+        reason = self.web.failure(terminal) if self.web is not None else None
+        if reason:
+            terminal = replace(terminal, status=TerminalStatus.ERROR, reason=reason)
+            self.stopped = terminal
+        return terminal
+
     def _vendor_terminal(self, exc: VendorRunFailed) -> TerminalEvent:
         code, after = vendor_error_facts(exc)
         return self.terminal(
@@ -525,6 +550,7 @@ class CallFold:
             guards=leg.guards,
             tracker=GuardTracker(leg.guards, leg.request.connection.name),
             deadline=self.deadline,
+            web=leg.request.web,
         )
 
     # --- the pump's three questions ---------------------------------------------

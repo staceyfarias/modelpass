@@ -141,6 +141,7 @@ from .prompt_cache import (
     PromptCachePlan,
     plan_prompt_cache,
 )
+from .research import ResearchJob, ResearchResult, ResearchSnapshot
 from .retry import RetryVerdict, classify_error, classify_terminal
 from .runlog import RunLog, RunRecord, run_log_for
 from .runtimes import Runtime
@@ -186,7 +187,12 @@ from .types import (
     UsageEvent,
     UsageScope,
     VendorEvent,
+    WebActivityEvent,
+    WebCitation,
+    WebEvidenceEvent,
+    WebSource,
 )
+from .web import WebOptions
 
 __version__ = "0.2.2"
 
@@ -276,6 +282,9 @@ __all__ = [
     "ReceiptEvent",
     "RemoveResult",
     "RenameResult",
+    "ResearchJob",
+    "ResearchResult",
+    "ResearchSnapshot",
     "RetryVerdict",
     "Retryable",
     "Role",
@@ -324,6 +333,11 @@ __all__ = [
     "VendorRunFailed",
     "VerifiedCapabilities",
     "VerifyReport",
+    "WebActivityEvent",
+    "WebCitation",
+    "WebEvidenceEvent",
+    "WebOptions",
+    "WebSource",
     "WorkerSession",
     "__version__",
     "chat",

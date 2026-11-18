@@ -154,6 +154,7 @@ from ..types import (
     UsageScope,
     VendorEvent,
 )
+from ..web import native_web_tools, openai_evidence
 from ._mcp_result import ainvoke_handler, flatten_mcp_result, mcp_result_payload
 from .base import (
     Adapter,
@@ -1202,6 +1203,9 @@ class OpenAIAPIAdapter(Adapter):
         # combination before an adapter sees it; the two branches here cannot
         # both fire on one request, and unlike anthropic-api's output_config
         # these two live in different parameters anyway.
+        if request.web is not None:
+            params["tools"] = native_web_tools(self.runtime, request.web)
+            params["include"] = ["web_search_call.action.sources"]
         text = text_param(request)
         if text is not None:
             params["text"] = text
@@ -1299,6 +1303,9 @@ class OpenAIAPIAdapter(Adapter):
                     TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
                 )
                 return
+
+            if request.web is not None:
+                yield from openai_evidence(response)
 
             text = response_text(response)
             if text:
@@ -1454,6 +1461,10 @@ class OpenAIAPIAdapter(Adapter):
                     TerminalStatus.CANCELLED, "cancelled by caller", self.runtime
                 )
                 return
+
+            if request.web is not None:
+                for evidence in openai_evidence(response):
+                    yield evidence
 
             text = response_text(response)
             if text:

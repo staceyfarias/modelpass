@@ -3159,3 +3159,140 @@ deselected** (pytest exit 0). `ruff check src tests` passed. The offline samplin
 fixture now explicitly marks its already-injected fake API transport available,
 so the run-log test does not depend on an optional installed vendor SDK. Its
 sampling/run-log assertions remain unchanged. No live vendor requests were made.
+
+## Native web search and hosted research (2026-11-17)
+
+`Bridge.chat`, `ask`, `achat`, `aask` and `preflight` accept
+`web=WebOptions(...)` or a mapping with the same keys. This is an explicit
+request to enable native remote web tools. No local HTTP fetching is added.
+
+```python
+from modelpass import Bridge, WebOptions
+
+bridge = Bridge()
+answer = bridge.ask(
+    "claude-api",
+    "Research the latest Python release using official sources.",
+    model="claude-haiku-4-5",
+    web=WebOptions(require_search=True, require_citations=True),
+    allow_failover=False,
+    timeout=120,
+)
+print(answer.text)
+for citation in answer.citations or ():
+    print(citation.url, citation.title)
+```
+
+`WebOptions` has `search` (`provider_default`, `live`, `cached`, `off`),
+`fetch_urls`, `search_allowed_domains`, `search_blocked_domains`,
+`require_search` and `require_citations`. Sequences become immutable tuples.
+Malformed values raise locally. A fetch URL is appended to the current user
+message and enables the runtime's native URL-reading tool. Offering a URL
+does not guarantee that the model reads it. `live` permits external access
+without promising cache bypass or freshness.
+
+| Runtime | Search | Cache-only | URL tool | Search domains | Native answer citations | Hosted jobs |
+| --- | --- | --- | --- | --- | --- | --- |
+| `anthropic-sdk` | Yes | Refused | WebFetch | Refused | Refused | Refused |
+| `openai-sdk` | Yes, app-server | Yes | Refused as a separate option | Allowlist | Refused | Refused |
+| `anthropic-api` | Yes | Refused | Web fetch | Allowlist or blocklist | Yes | Refused |
+| `openai-api` | Yes | Yes | Refused as a separate option | Allowlist or blocklist | Yes | Responses background |
+| `google-api` | Yes | Refused | URL Context | Refused | Yes | Interactions |
+| `openai-compatible` | Refused | Refused | Refused | Refused | Refused | Refused |
+
+This table describes implemented mappings held by offline tests. All new
+paths remain **live-unverified**. The capability cells report adapter
+implementation with dated SDK evidence. `receipt.web` includes requested
+options, effective search mode and the separate live-verification status.
+Support still depends on the chosen model, account policy and installed runtime.
+Unknown vendor restrictions become the existing error terminal when discovered.
+
+Explicit unsupported controls raise `CapabilityNotSupported` before preflight.
+Codex `transport="exec"`, session web options, and web combined with caller
+functions, MCP or schemas are outside this initial contract. Other built-in
+tools remain disabled on the isolated subscription call paths. A configured
+failover target must accept the same web options before the primary starts.
+
+`require_search=True` requires an observed completed native search. A model
+answering without invoking the tool ends with an error terminal. Search
+completion can have zero useful results and proves no answer's correctness.
+`require_citations=True` requires native answer citation evidence. Tool result
+URLs and model-written Markdown links alone cannot satisfy it. Non-OK outcomes
+keep their original status. `ask` and `aask` raise on a failed requirement.
+
+`WebActivityEvent` reports native search/fetch/open/find observations where
+available. `WebEvidenceEvent` carries sources, citations, errors and provider
+presentation data. `Answer.sources` and `Answer.citations` deduplicate these
+records, with `None` meaning unavailable and `()` meaning a supported collection
+was empty. Sources carry a URL and optional title. Citations also carry cited
+text when supplied. Offsets are deliberately absent from the initial shape.
+Gemini search suggestions remain in `web_presentation`. Preserve the provider's
+links and presentation requirements when rendering a grounded answer.
+
+Anthropic Messages uses `web_search_20250305` and `web_fetch_20250910`, which
+avoid introducing code execution. Server `pause_turn` continues with the
+assistant content intact. Tool errors remain available in web evidence. Fetch
+document citations resolve through the native document index, accounting for
+input documents. A completed search observation is distinct from a billable
+query count. Existing token guards retain their existing scope and cannot cap
+remote search fees.
+
+Hosted jobs use a separate lifecycle, available on the two API connections
+shown in the table. These backends are explicitly **live-untested**.
+
+```python
+from modelpass import ResearchJob
+
+job = bridge.start_research(
+    "gemini-api",
+    "Research the current distribution options for an independent musician.",
+    agent="deep-research-preview-04-2026",
+)
+saved = job.to_dict()  # Persist this in the application's own storage.
+snapshot = bridge.get_research(ResearchJob.from_dict(saved))
+if snapshot.status == "completed":
+    print(snapshot.result.text)
+# bridge.cancel_research(job) explicitly requests remote cancellation.
+```
+
+`start_research` returns `ResearchJob`, with an initial receipt, and requires an
+OpenAI `model=` (or a configured model) or an explicit Gemini `agent=`.
+`get_research` and `cancel_research` return `ResearchSnapshot`, with normalized
+and original statuses, receipt, available partial result and usage metadata.
+Each method's positive finite `timeout=` bounds that API operation. Polling
+timeout leaves the remote job running. There is no automatic polling loop.
+
+Job handles serialize without credentials or receipts. Retrieval and cancellation
+stay on the original named connection and verify the runtime, endpoint and
+credential fingerprint. Renaming or materially changing that connection can
+prevent retrieval. Jobs never fail over or retry. A failed submission without a
+returned ID reports an unknown remote outcome. Local token guards are refused
+for detached jobs. Provider retention controls how long a job is retrievable.
+Gemini gets an explicit search/URL Context tool list. Both backends use provider
+storage for background work. Gemini's secondary Interactions client's retries
+are explicitly disabled because google-genai 1.73.1 maps its one-attempt
+GenerateContent setting to a one-retry Interactions setting.
+
+Verification record dated 2026-11-17 follows.
+
+| Surface | Evidence and result |
+| --- | --- |
+| Offline web and job contracts | `tests/test_web.py`, `tests/test_research.py` and serialization tests. Fake transports verify native tool wire mappings, required evidence, fetch citation indices, refusals, job identity binding, polling, cancellation and submission ambiguity. |
+| SDK surfaces read | Claude Agent SDK 0.2.180 tool options and result blocks, Anthropic 0.97.0 search/fetch parameter types, OpenAI 2.32.0 Responses methods, google-genai 1.73.1 grounding/URL types and Interactions methods. Codex's documented app-server webSearch items and configuration are linked in `web-research-design.md`. |
+| Anthropic subscription, Haiku | Attempted. Windows asyncio loop initialization hung inside `socket.socketpair` before a web run could be verified. The attempt was interrupted. |
+| OpenAI subscription, Luna | Attempted with `gpt-6-luna`. Codex app-server failed to initialize its SQLite state under its account directory because workspace write access was denied. |
+| Anthropic API, Haiku | Attempted with `claude-haiku-4-5`. The SDK client constructor failed with a permission error on the environment's TLS key-log path before a request could be verified. |
+| OpenAI API and Gemini | Intentionally left live-untested at the owner's request. Offline coverage only, including their hosted job lifecycles. |
+| Full test suite | Attempted. It hung in an existing async-handler test while Windows initialized the event loop's loopback socket. A faulthandler trace identified the environment block. Focused synchronous checks were run separately. |
+
+The opt-in smoke tests in `tests/live/test_web_live.py` use existing configured
+connections and the low-cost Haiku and Luna models. The test is excluded from
+normal runs and checks actual native tool evidence. Run it from an environment
+with the required account-directory and network access. Select the connection
+names with the corresponding `MODELPASS_WEB_*_CONNECTION` variables when needed.
+
+```powershell
+$env:SUBPASS_LIVE_TESTS = '1'
+$env:MODELPASS_WEB_ANTHROPIC_API_CONNECTION = 'claude-api'
+python -m pytest -m live tests/live/test_web_live.py
+```

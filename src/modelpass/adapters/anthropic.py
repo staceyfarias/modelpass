@@ -170,6 +170,7 @@ from ..types import (
     UsageScope,
     VendorEvent,
 )
+from ..web import sdk_web_tools
 from ._mcp_result import mcp_result_payload
 from .base import (
     Adapter,
@@ -2714,6 +2715,15 @@ class AnthropicAdapter(Adapter):
             "permission_mode": "default",
         }
         options_kwargs.update(_tool_options(sdk, request))
+        if request.web is not None:
+            web_tools = sdk_web_tools(request.web)
+            options_kwargs.update(
+                tools=web_tools,
+                allowed_tools=web_tools,
+                disallowed_tools=[name for name in _BUILTIN_TOOLS if name not in web_tools],
+                max_turns=None,
+            )
+
         # The stated effort, in this runtime's own spelling (2026-09-21).
         # claude-agent-sdk 0.2.148 types ClaudeAgentOptions.effort as
         # Literal["low","medium","high","xhigh","max"]. This runtime is wired

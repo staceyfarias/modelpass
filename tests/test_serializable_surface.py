@@ -83,6 +83,7 @@ def _sample_event(cls: type):
     from modelpass.types import TerminalStatus
 
     defaults = {
+        "action": "search",
         "text": "hello",
         "usage": TokenUsage(1, 2, 3),
         "cumulative": TokenUsage(1, 2, 3),

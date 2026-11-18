@@ -69,6 +69,10 @@ __all__ = [
     "UsageEvent",
     "UsageScope",
     "VendorEvent",
+    "WebActivityEvent",
+    "WebCitation",
+    "WebEvidenceEvent",
+    "WebSource",
     "count_cache_breakpoints",
     "normalize_content",
     "normalize_messages",
@@ -1598,6 +1602,47 @@ class VendorEvent(_Event):
     data: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class WebSource:
+    """A source URL reported by a native web tool."""
+
+    url: str
+    title: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WebCitation:
+    """Native citation evidence. Spans are absent unless offsets were verified."""
+
+    url: str
+    title: str | None = None
+    cited_text: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WebActivityEvent(_Event):
+    """An observed native search, fetch, open or find operation."""
+
+    type: ClassVar[str] = "web_activity"
+    action: str
+    status: str
+    id: str = ""
+    query: str | None = None
+    url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WebEvidenceEvent(_Event):
+    """Native web evidence, with unavailable collections represented by None."""
+
+    type: ClassVar[str] = "web_evidence"
+    sources: tuple[WebSource, ...] | None = None
+    citations: tuple[WebCitation, ...] | None = None
+    searches: int = 0
+    errors: tuple[str, ...] = ()
+    presentation: Mapping[str, Any] = field(default_factory=dict)
+
+
 AgentEvent = (
     ReceiptEvent
     | TextDeltaEvent
@@ -1611,6 +1656,8 @@ AgentEvent = (
     | FailoverEvent
     | TerminalEvent
     | VendorEvent
+    | WebActivityEvent
+    | WebEvidenceEvent
 )
 
 #: Every event class, keyed by wire discriminator.
@@ -1629,5 +1676,7 @@ EVENT_TYPES: dict[str, type] = {
         FailoverEvent,
         TerminalEvent,
         VendorEvent,
+        WebActivityEvent,
+        WebEvidenceEvent,
     )
 }

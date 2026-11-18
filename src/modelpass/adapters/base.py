@@ -109,6 +109,7 @@ from ..types import (
     SessionKind,
     TextBlock,
 )
+from ..web import WebOptions
 
 __all__ = [
     "Adapter",
@@ -236,6 +237,7 @@ class RunRequest:
     #: The messages as the caller wrote them, markers and all. A failover target
     #: arranges these for itself: ``messages`` are arranged for this connection.
     written_messages: tuple[Message, ...] = ()
+    web: WebOptions | None = None
 
     @property
     def runtime(self) -> Runtime:
