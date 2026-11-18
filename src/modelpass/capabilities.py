@@ -2182,6 +2182,138 @@ def _check_table_coverage() -> None:
 # codex app-server webSearch items and config, anthropic 0.97.0 server tools,
 # openai 2.32.0 Responses web search and background methods, google-genai
 # 1.73.1 grounding types and Interactions create/get/cancel.
+_WEB_NO_ADAPTER = "modelpass's adapter for this runtime carries no native web tool."
+_T = "tests/test_web.py::"
+_WEB_EVIDENCE: dict[tuple[Runtime, Capability], str] = {
+    (Runtime.ANTHROPIC_SDK, Capability.WEB_SEARCH): (
+        f"Claude Code's WebSearch, enabled through ClaudeAgentOptions tools and "
+        f"allowed_tools (claude-agent-sdk 0.2.180). Held by {_T}test_the_agent_sdk_"
+        "run_allows_search_and_fetch_from_the_supplied_hosts_only and, for sources, "
+        "test_claude_code_search_results_printed_as_prose_still_yield_sources."
+    ),
+    (Runtime.ANTHROPIC_SDK, Capability.WEB_FETCH): (
+        "Claude Code's WebFetch, which runs in the local process and is allowed "
+        f"per supplied host as WebFetch(domain:<host>). Held by {_T}test_the_agent_"
+        "sdk_run_allows_search_and_fetch_from_the_supplied_hosts_only. Whether a "
+        "redirect off that host is followed is unverified."
+    ),
+    (Runtime.ANTHROPIC_SDK, Capability.WEB_CITATIONS): (
+        "the Agent SDK reports sources, not native answer citations."
+    ),
+    (Runtime.ANTHROPIC_SDK, Capability.WEB_CACHED): (
+        "Claude Code has no cache-only search control."
+    ),
+    (Runtime.ANTHROPIC_SDK, Capability.WEB_DOMAINS): (
+        "domain lists are tool-call inputs the model writes, which modelpass "
+        "cannot enforce."
+    ),
+    (Runtime.OPENAI_SDK, Capability.WEB_SEARCH): (
+        "the app-server transport only, by a web_search config override whose "
+        "values are in codex-cli 0.151.0's enum. Held by "
+        f"{_T}test_codex_overrides_are_explicit_and_off_means_disabled and, for the "
+        "webSearch item (shape read from `codex app-server generate-json-schema`), "
+        "test_a_codex_web_search_item_is_read_as_its_schema_defines_it."
+    ),
+    (Runtime.OPENAI_SDK, Capability.WEB_CACHED): (
+        f"web_search=cached, which is also this runtime's default. Held by {_T}"
+        "test_codex_overrides_are_explicit_and_off_means_disabled."
+    ),
+    (Runtime.OPENAI_SDK, Capability.WEB_DOMAINS): (
+        "an allowlist only, sent as tools.web_search.allowed_domains; codex-cli "
+        f"0.151.0 type-checks that key. Held by {_T}test_codex_overrides_are_"
+        "explicit_and_off_means_disabled. That Codex enforces the list is "
+        "unverified."
+    ),
+    (Runtime.OPENAI_SDK, Capability.WEB_FETCH): (
+        "Codex opens pages as part of a search and has no separate URL tool."
+    ),
+    (Runtime.OPENAI_SDK, Capability.WEB_CITATIONS): (
+        "Codex has no verified native answer citation schema."
+    ),
+    (Runtime.ANTHROPIC_API, Capability.WEB_SEARCH): (
+        "the web_search_20250305 server tool (anthropic 0.97.0 "
+        f"WebSearchTool20250305Param). Held by {_T}test_anthropic_api_fetch_and_"
+        "blocklist_reach_the_wire."
+    ),
+    (Runtime.ANTHROPIC_API, Capability.WEB_FETCH): (
+        "the web_fetch_20250910 server tool with citations enabled (anthropic "
+        f"0.97.0 WebFetchTool20250910Param). Held by {_T}test_anthropic_api_fetch_"
+        "and_blocklist_reach_the_wire."
+    ),
+    (Runtime.ANTHROPIC_API, Capability.WEB_CITATIONS): (
+        f"citations on text blocks. Held by {_T}test_anthropic_native_evidence_"
+        "distinguishes_errors_and_citations and test_a_fetched_document_citation_"
+        "keeps_its_document_title."
+    ),
+    (Runtime.ANTHROPIC_API, Capability.WEB_DOMAINS): (
+        f"allowed_domains or blocked_domains on the search tool. Held by {_T}"
+        "test_api_wire_tools_are_opt_in_and_keep_specific_controls and "
+        "test_anthropic_api_fetch_and_blocklist_reach_the_wire."
+    ),
+    (Runtime.ANTHROPIC_API, Capability.WEB_CACHED): (
+        "the Messages search tool has no cache-only control."
+    ),
+    (Runtime.OPENAI_API, Capability.WEB_SEARCH): (
+        f"the Responses web_search tool. Held by {_T}test_openai_says_nothing_about_"
+        "access_unless_the_caller_named_a_mode."
+    ),
+    (Runtime.OPENAI_API, Capability.WEB_CITATIONS): (
+        f"url_citation annotations on output text. Held by {_T}test_openai_native_"
+        "sources_and_citations_are_distinct."
+    ),
+    (Runtime.OPENAI_API, Capability.WEB_CACHED): (
+        "external_web_access=false, from the vendor's web search guide (read "
+        "2026-11-18); the field is not in openai 2.32.0's WebSearchToolParam, "
+        f"which passes it through untyped. Held by {_T}test_openai_says_nothing_"
+        "about_access_unless_the_caller_named_a_mode. Server acceptance is "
+        "unverified."
+    ),
+    (Runtime.OPENAI_API, Capability.WEB_DOMAINS): (
+        "filters.allowed_domains (typed in openai 2.32.0) or "
+        "filters.blocked_domains (in the vendor's guide, read 2026-11-18, not in "
+        f"the SDK types). Held by {_T}test_openai_says_nothing_about_access_unless_"
+        "the_caller_named_a_mode. Server acceptance of the blocklist is unverified."
+    ),
+    (Runtime.OPENAI_API, Capability.RESEARCH_JOBS): (
+        "Responses background mode: create, retrieve and cancel (openai 2.32.0). "
+        "Held by tests/test_research.py::test_submit_restore_poll_and_cancel_"
+        "original_job, whose fake accepts any keyword, so parameter names rest on "
+        "the SDK read."
+    ),
+    (Runtime.OPENAI_API, Capability.WEB_FETCH): (
+        "Responses opens pages as part of a search and has no separate URL tool."
+    ),
+    (Runtime.GOOGLE_API, Capability.WEB_SEARCH): (
+        f"google_search grounding on GenerateContent (google-genai 1.73.1). Held by "
+        f"{_T}test_api_wire_tools_are_opt_in_and_keep_specific_controls."
+    ),
+    (Runtime.GOOGLE_API, Capability.WEB_FETCH): (
+        f"the url_context tool, which reads URLs in the prompt. Held by {_T}"
+        "test_api_wire_tools_are_opt_in_and_keep_specific_controls."
+    ),
+    (Runtime.GOOGLE_API, Capability.WEB_CITATIONS): (
+        f"grounding supports resolved to their chunks. Held by {_T}test_google_"
+        "metadata_keeps_search_presentation_and_citation_links and test_google_"
+        "evidence_survives_the_nulls_a_dumped_sdk_object_carries."
+    ),
+    (Runtime.GOOGLE_API, Capability.RESEARCH_JOBS): (
+        "Interactions create, get and cancel with an explicit agent (google-genai "
+        "1.73.1). Held by tests/test_research.py::test_submit_restore_poll_and_"
+        "cancel_original_job and test_installed_sdk_job_output_shapes_are_the_ones_"
+        "the_snapshot_reads. That the agent honours the explicit tool list is "
+        "unverified."
+    ),
+    (Runtime.GOOGLE_API, Capability.WEB_CACHED): (
+        "GenerateContent grounding has no cache-only control."
+    ),
+    (Runtime.GOOGLE_API, Capability.WEB_DOMAINS): (
+        "the Gemini Developer API has no search domain restriction."
+    ),
+}
+_WEB_RESEARCH_ABSENT = (
+    "hosted research jobs run only on openai-api and google-api; "
+    "start_research refuses this runtime."
+)
 _WEB_ROWS = {
     Runtime.ANTHROPIC_SDK: (_S, _S, _N, _N, _N, _N),
     Runtime.OPENAI_SDK: (_S, _N, _N, _S, _S, _N),
@@ -2198,13 +2330,26 @@ for _runtime, _cells in _WEB_ROWS.items():
         Capability.WEB_CACHED, Capability.WEB_DOMAINS, Capability.RESEARCH_JOBS,
     ), _cells, strict=True):
         STATIC_TABLE[_runtime][_cap] = _support
-        _note = (
-            f"{_support.value}, 2026-11-17. Native web contract, held by "
-            "tests/test_web.py and tests/test_research.py with the installed SDK "
-            "surface read. Live-untested. Codex uses app-server and domain allowlists "
-            "only. Schema/custom-tool combinations and sessions are refused. See "
-            "docs/api-and-runtimes.md, Native web search and hosted research."
-        )
+        # One note per cell (2026-11-18). The first version wrote the same
+        # sentence into all 48, which told a reader nothing about the cell they
+        # had asked about. A supported cell names the test that holds its wire
+        # shape and the surface it was read from; an unsupported one names the
+        # refusal. Every one of them is live-untested and says so.
+        _evidence = _WEB_EVIDENCE.get((_runtime, _cap))
+        if _evidence is None and _cap is Capability.RESEARCH_JOBS:
+            _evidence = _WEB_RESEARCH_ABSENT
+        if _support is Support.SUPPORTED:
+            _note = (
+                f"supported, 2026-11-17, live-untested: an offline-tested wire "
+                f"mapping, not a vendor run. {_evidence} See "
+                "docs/api-and-runtimes.md, Native web search and hosted research"
+            )
+        else:
+            _note = (
+                f"unsupported, 2026-11-17: {_evidence or _WEB_NO_ADAPTER} web= "
+                "asking for it is refused before anything is sent "
+                "(tests/test_web.py::test_the_capability_table_and_the_refusals_agree)"
+            )
         if _runtime is Runtime.OPENAI_COMPATIBLE:
             # A checked absence in modelpass, like this row's document_input and
             # cache_breakpoints cells (2026-11-18): the adapter sends no native

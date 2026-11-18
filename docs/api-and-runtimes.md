@@ -3326,13 +3326,64 @@ before:
 - **Research submission.** A client with no job interface reports that nothing
   was submitted, where it reported an unknown remote outcome.
 
-Still open from that review, none changed here: the capability notes for these
-cells are one shared sentence rather than per-cell evidence; the refusals in
-`validate_web` do not read the capability table; `receipt.web` carries a fixed
-`live_verification: "untested"`; Codex's enforcement of
-`tools.web_search.allowed_domains` and the shape of its `webSearch` item are
-unverified; and whether a Gemini research agent honours the explicit tool list
-is unproven. Nothing in this section has been run against a live vendor.
+### What a failure looks like (2026-11-18)
+
+These paths have not met a live vendor, so the contract for failure matters
+more than usual. Every failure on them is one of the following, and none is a
+bare `TypeError`, `AttributeError` or `KeyError`:
+
+| What went wrong | What is raised or returned |
+| --- | --- |
+| A malformed `WebOptions` value, an unknown option key, a non-public fetch host, a malformed saved `ResearchJob` | `ValueError`, naming the field or key, before anything is sent |
+| An option this runtime cannot honour, or web combined with caller tools, MCP or a schema | `CapabilityNotSupported`, before anything is sent |
+| The vendor rejects the request or the run fails | the existing error terminal; `ask`/`aask` raise `VendorRunFailed` |
+| `require_search` or `require_citations` not met | the same error terminal, with the reason |
+| **The vendor's response has a shape modelpass cannot read** | **`WebEvidenceUnreadable`** |
+| Research submission fails after the request left | `VendorRunFailed`, "remote submission outcome may be unknown" |
+| Research submission fails before anything left | `VendorRunFailed`, "nothing was submitted" |
+| A job's connection was removed, or its endpoint or credential changed | `NoSuchConnection`, `InvalidConnection` |
+
+`WebEvidenceUnreadable` is new. It is an `AdapterFailed`, and so a
+`SubpassError`: it means modelpass misread a vendor, which is a bug to report.
+Its message names the runtime, the part of the response, the underlying error
+and the response's top-level keys. It never includes a query, a URL or any text
+from the response. **The run or job may have completed and been billed**: only
+reading its web evidence failed. It carries `runtime`, `what` and `shape`.
+
+It is raised by one boundary around each reader rather than by guards on each
+field, so a shape nobody anticipated is still covered. A sweep of malformed
+shapes through every reader, the fold-side observer and the job snapshot found
+raw errors at 23 sites before this change and none after;
+`tests/test_web.py::test_a_malformed_vendor_response_is_never_a_bare_python_error`
+and `tests/test_research.py::test_an_unreadable_job_response_names_the_job_and_is_not_a_bare_error`
+hold a part of that sweep.
+
+Also settled on 2026-11-18:
+
+- **The refusals and the capability table agree, and a test holds it.**
+  `validate_web` still gives the specific reason where one is known, and now
+  ends by refusing any option whose capability cell is not `supported`.
+  `google-cli` and `google-sdk` read unsupported but were not refused; they are
+  now. `test_the_capability_table_and_the_refusals_agree` checks every runtime
+  against every option.
+- **Each web capability cell has its own note**, naming the test that holds
+  its wire shape and the surface it was read from, or the refusal. The first
+  version wrote one sentence into all 48.
+- **Codex's `webSearch` item is read as its schema defines it.** Read from
+  `codex app-server generate-json-schema` (codex-cli 0.151.0), which runs
+  locally: `id`, `query`, a nullable `action` of type `search`, `openPage`,
+  `findInPage` or `other`, and an opaque `results` array. Action names are put
+  into Responses' spelling (`open_page`, `find_in_page`) so
+  `WebActivityEvent.action` is one vocabulary, and `results` now feeds
+  `Answer.sources`.
+
+Still open, and not answerable offline: `receipt.web` carries a fixed
+`live_verification: "untested"`; whether Codex enforces
+`tools.web_search.allowed_domains`; whether a Gemini research agent honours the
+explicit tool list; whether Claude Code follows a redirect off an allowed fetch
+host; and whether the OpenAI server accepts `external_web_access` and
+`filters.blocked_domains` as its guide documents them. Nothing in this section
+has been run against a live vendor.
 
 The opt-in smoke tests in `tests/live/test_web_live.py` use existing configured
 connections and the low-cost Haiku and Luna models. The test is excluded from

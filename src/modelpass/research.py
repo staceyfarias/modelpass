@@ -14,11 +14,17 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from .errors import CapabilityNotSupported, InvalidConnection, SubpassError, VendorRunFailed
+from .errors import (
+    CapabilityNotSupported,
+    InvalidConnection,
+    SubpassError,
+    VendorRunFailed,
+    WebEvidenceUnreadable,
+)
 from .preflight import Receipt
 from .runtimes import Runtime
 from .types import WebCitation, WebEvidenceEvent, WebSource
-from .web import WebOptions, openai_evidence, web_receipt
+from .web import WebOptions, _shape, openai_evidence, web_receipt
 
 if TYPE_CHECKING:
     from .bridge import Bridge
@@ -55,6 +61,19 @@ class ResearchJob:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ResearchJob:
+        """Restore a saved handle. A malformed one is a ``ValueError`` that says how."""
+        if not isinstance(value, Mapping):
+            raise ValueError("a saved research job must be a mapping, as to_dict() returns")
+        known = ("id", "connection", "runtime", "identity", "web", "model")
+        unknown = sorted(str(key) for key in value if key not in known)
+        missing = [key for key in known[:5] if key not in value]
+        if unknown or missing:
+            problems = []
+            if missing:
+                problems.append(f"missing {', '.join(missing)}")
+            if unknown:
+                problems.append(f"unknown {', '.join(unknown)}")
+            raise ValueError(f"saved research job is malformed: {'; '.join(problems)}")
         return cls(**value)
 
 
@@ -224,8 +243,12 @@ def start_research(
         if getattr(adapter, "_owns_clients", True):
             with suppress(Exception):
                 client.close()
-    data = _data(value)
-    if not isinstance(data.get("id"), str) or not data["id"]:
+    try:
+        data = _data(value)
+        job_id = data.get("id")
+    except Exception:
+        job_id = None
+    if not isinstance(job_id, str) or not job_id:
         raise VendorRunFailed("research submission returned no job ID; remote outcome is unknown")
     return ResearchJob(
         data["id"],
@@ -282,7 +305,7 @@ def get_research(
         if getattr(plan.adapter, "_owns_clients", True):
             with suppress(Exception):
                 client.close()
-    return _snapshot(job, receipt, _data(value))
+    return _snapshot(job, receipt, value)
 
 
 def _data(value: Any) -> dict[str, Any]:
@@ -291,7 +314,32 @@ def _data(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
-def _snapshot(job: ResearchJob, receipt: Receipt, data: dict[str, Any]) -> ResearchSnapshot:
+def _snapshot(job: ResearchJob, receipt: Receipt, value: Any) -> ResearchSnapshot:
+    """Read one provider response into a snapshot, or say that it could not be read.
+
+    The job was reached; reading what came back is a separate failure. A
+    response in an unexpected shape leaves here as
+    :class:`~modelpass.errors.WebEvidenceUnreadable` naming the job, never as a
+    bare ``TypeError`` from inside the parser (2026-11-18).
+    """
+    try:
+        return _read_snapshot(job, receipt, _data(value))
+    except WebEvidenceUnreadable as exc:
+        # A shared evidence reader failed. Say it again with the job named,
+        # because the job id is what a caller needs in order to look again.
+        cause = exc.__cause__ or exc
+    except SubpassError:
+        raise
+    except Exception as exc:
+        cause = exc
+    raise WebEvidenceUnreadable(
+        job.runtime, f"the response for research job {job.id}", cause, _shape(value)
+    ) from cause
+
+
+def _read_snapshot(
+    job: ResearchJob, receipt: Receipt, data: dict[str, Any]
+) -> ResearchSnapshot:
     vendor_status = data.get("status", "unknown")
     status = {
         "queued": "pending",

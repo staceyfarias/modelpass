@@ -45,6 +45,16 @@ work landed.
   `WebOptions(search="off")` with no URLs is refused. OpenAI Responses sends
   `external_web_access` only when a mode is stated. See "Review fixes" in
   `docs/api-and-runtimes.md`.
+- **A vendor web or research response modelpass cannot read raises
+  `WebEvidenceUnreadable`**, never a bare `TypeError` (2026-11-18). It is an
+  `AdapterFailed`; its message names the runtime, what could not be read and
+  the response's keys, and no content. An unknown `WebOptions` key and a
+  malformed saved `ResearchJob` are `ValueError`s that name the problem.
+  `web=` on `google-cli` and `google-sdk` is refused rather than ignored, and
+  the refusals now follow the capability table. Codex web search actions are
+  reported as `open_page` and `find_in_page`, matching `openai-api`, and Codex
+  search results feed `Answer.sources`. See "What a failure looks like" in
+  `docs/api-and-runtimes.md`.
 
 The entries dated 2026-11-13 below, apart from the credential-store one, come from
 one code review of that date. Each behaviour is held by an offline test. Where a

@@ -12,6 +12,8 @@ from dataclasses import replace
 import pytest
 
 from modelpass import (
+    AdapterFailed,
+    Capability,
     CapabilityNotSupported,
     Connection,
     CredentialRef,
@@ -22,6 +24,7 @@ from modelpass import (
     VendorRunFailed,
     WebCitation,
     WebEvidenceEvent,
+    WebEvidenceUnreadable,
     WebOptions,
     WebSource,
 )
@@ -509,3 +512,184 @@ def test_the_agent_sdk_run_allows_search_and_fetch_from_the_supplied_hosts_only(
     assert options["tools"] == ["WebFetch"]
     assert options["allowed_tools"] == ["WebFetch(domain:example.org)"]
     assert "WebSearch" in options["disallowed_tools"]
+
+
+# --- typed errors and the capability table, 2026-11-18 ----------------------------------
+#
+# These paths are live-unverified, so the failure to plan for is a vendor
+# response in a shape nobody here has seen. What a caller gets then must be one
+# typed error that says what could not be read -- never a bare TypeError.
+
+JUNK = [1, "x", [None], [1], ["x"], [[]], {"a": None}]
+
+
+def _malformed():
+    for junk in JUNK:
+        yield anthropic_evidence, {"content": junk}
+        yield anthropic_evidence, {"content": [{"type": "web_search_tool_result", "content": junk}]}
+        yield anthropic_evidence, {"content": [{"type": "text", "citations": junk}]}
+        yield openai_evidence, {"output": junk}
+        yield openai_evidence, {"output": [{"type": "web_search_call", "action": junk}]}
+        yield openai_evidence, {"output": [{"type": "message", "content": junk}]}
+        yield google_evidence, {"grounding_metadata": junk}
+        yield google_evidence, {"grounding_metadata": {"grounding_chunks": junk}}
+        yield google_evidence, {"grounding_metadata": {"grounding_supports": junk}}
+        yield google_evidence, {"url_context_metadata": junk}
+
+
+def test_a_malformed_vendor_response_is_never_a_bare_python_error():
+    """Each reader either copes or raises the one typed error. Nothing else."""
+    raised = 0
+    for reader, payload in _malformed():
+        try:
+            reader(payload)
+        except WebEvidenceUnreadable:
+            raised += 1
+    assert raised > 20
+
+
+def test_the_typed_error_says_what_could_not_be_read_and_shows_no_content():
+    payload = {
+        "id": "resp_1",
+        "output": [{"type": "web_search_call", "action": "secret query text"}],
+    }
+    with pytest.raises(WebEvidenceUnreadable) as caught:
+        openai_evidence(payload)
+    error = caught.value
+    assert isinstance(error, AdapterFailed)
+    assert error.runtime == "openai-api"
+    message = str(error)
+    assert "the web search items of a Responses response could not be read" in message
+    assert "AttributeError" in message
+    assert "Response keys: id, output" in message
+    assert "may have completed and been billed" in message
+    assert "secret query text" not in message
+
+
+def test_an_unreadable_response_reaches_the_caller_of_ask_as_the_typed_error(store):
+    """Through the real adapter and the real bridge, not just the reader."""
+    from test_adapter_anthropic_api import Factory, bridge_for, text_round
+    from test_adapter_anthropic_api import connection as api_connection
+
+    broken = text_round("Answer.")
+    broken.message.content.append({"type": "web_search_tool_result", "content": "not a list"})
+    bridge, adapter = bridge_for(api_connection(), Factory([broken]), store)
+    adapter.is_available = lambda: True
+    with pytest.raises(WebEvidenceUnreadable, match="anthropic-api: the web search/fetch blocks"):
+        bridge.ask("claude-key", "research", web=WebOptions())
+
+
+def test_an_unreadable_tool_event_is_the_typed_error_too(tmp_path):
+    from modelpass.types import VendorEvent
+
+    broken = VendorEvent(
+        runtime=Runtime.OPENAI_SDK,
+        name="item/completed",
+        data={"item": {"type": "webSearch", "id": "w1", "query": "q", "action": "search"}},
+    )
+    bridge, _, _ = fake_bridge(
+        connections=[connection(Runtime.OPENAI_SDK)],
+        script=[broken, TextDeltaEvent("answer")],
+        home=tmp_path,
+        runtime=Runtime.OPENAI_SDK,
+    )
+    with pytest.raises(WebEvidenceUnreadable, match="openai-sdk: the web activity in a vendor"):
+        bridge.ask("web-test", "look it up", web=WebOptions())
+
+
+def test_a_codex_web_search_item_is_read_as_its_schema_defines_it(tmp_path):
+    """WebSearchThreadItem, from `codex app-server generate-json-schema` (0.151.0)."""
+    from modelpass.types import VendorEvent
+
+    def item(action, **extra):
+        return VendorEvent(
+            runtime=Runtime.OPENAI_SDK,
+            name="item/completed",
+            data={"item": {"type": "webSearch", "id": "w1", "query": "python", **extra,
+                           "action": action}},
+        )
+
+    bridge, _, _ = fake_bridge(
+        connections=[connection(Runtime.OPENAI_SDK)],
+        script=[
+            item({"type": "search", "query": "python", "queries": ["python"]},
+                 results=[{"url": "https://www.python.org", "title": "Python"}]),
+            item({"type": "openPage", "url": "https://www.python.org"}),
+            item({"type": "findInPage", "url": "https://www.python.org", "pattern": "3.14"}),
+            item(None, results=None),
+            TextDeltaEvent("answer"),
+        ],
+        home=tmp_path,
+        runtime=Runtime.OPENAI_SDK,
+    )
+    answer = bridge.ask("web-test", "look it up", web=WebOptions(require_search=True))
+    activity = [e for e in answer.events if e.type == "web_activity"]
+    assert [e.action for e in activity] == ["search", "open_page", "find_in_page", "search"]
+    assert activity[1].url == "https://www.python.org"
+    assert answer.sources == (WebSource("https://www.python.org", "Python"),)
+
+
+def _every_option():
+    yield "web.search", WebOptions()
+    yield "web.cached", WebOptions(search="cached")
+    yield "web.fetch_urls", WebOptions(search="off", fetch_urls=("https://example.org",))
+    yield "web.domains", WebOptions(search_allowed_domains=("example.org",))
+    yield "web.citations", WebOptions(require_citations=True)
+
+
+@pytest.mark.parametrize("runtime", list(Runtime))
+def test_the_capability_table_and_the_refusals_agree(runtime):
+    """One source of truth: a cell that is not `supported` is always refused,
+    and a refusal never contradicts a cell that says `supported`."""
+    from modelpass.capabilities import STATIC_TABLE, Support
+    from modelpass.web import web_capabilities
+
+    for feature, web in _every_option():
+        cells = [STATIC_TABLE[runtime][cap] for cap, _ in web_capabilities(web)]
+        supported = all(cell is Support.SUPPORTED for cell in cells)
+        try:
+            validate_web(runtime, web, {})
+            accepted = True
+        except CapabilityNotSupported:
+            accepted = False
+        assert accepted == supported, (runtime.value, feature)
+
+
+@pytest.mark.parametrize("runtime", [Runtime.GOOGLE_CLI, Runtime.GOOGLE_SDK])
+def test_a_runtime_with_no_web_adapter_refuses_instead_of_ignoring(runtime):
+    with pytest.raises(CapabilityNotSupported, match="web_search reads unsupported"):
+        validate_web(runtime, WebOptions(), {})
+
+
+def test_every_web_capability_cell_has_its_own_note():
+    from modelpass.capabilities import CapabilityRegistry, Support
+
+    registry = CapabilityRegistry()
+    web_cells = [c for c in Capability if c.value.startswith("web_") or c.value == "research_jobs"]
+    for runtime in Runtime:
+        for capability in web_cells:
+            note = registry.note(runtime, capability) or ""
+            support = registry.support(runtime, capability)
+            assert support.value in note, (runtime.value, capability.value)
+            if support is Support.SUPPORTED:
+                assert "live-untested" in note and "Held by" in note
+            else:
+                assert "refused" in note or "refuses" in note
+    supported_notes = {
+        registry.note(r, c)
+        for r in Runtime
+        for c in web_cells
+        if registry.support(r, c) is Support.SUPPORTED
+    }
+    assert len(supported_notes) == sum(
+        registry.support(r, c) is Support.SUPPORTED for r in Runtime for c in web_cells
+    )
+
+
+def test_a_mistyped_web_option_is_a_value_error_that_names_it():
+    with pytest.raises(ValueError, match=r"unknown web option.*serach.*Known options: search"):
+        WebOptions.coerce({"serach": "live"})
+    with pytest.raises(ValueError, match=r"web.search must be"):
+        WebOptions(search=["live"])
+    with pytest.raises(ValueError, match="WebOptions, a mapping, or None"):
+        WebOptions.coerce("live")

@@ -106,6 +106,7 @@ from .errors import (
     SubpassError,
     UnsafeLaunch,
     VendorRunFailed,
+    WebEvidenceUnreadable,
 )
 from .guards import GuardTracker
 from .manage import (
@@ -336,6 +337,7 @@ __all__ = [
     "WebActivityEvent",
     "WebCitation",
     "WebEvidenceEvent",
+    "WebEvidenceUnreadable",
     "WebOptions",
     "WebSource",
     "WorkerSession",

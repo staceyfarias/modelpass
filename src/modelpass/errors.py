@@ -49,6 +49,7 @@ __all__ = [
     "SubpassError",
     "UnsafeLaunch",
     "VendorRunFailed",
+    "WebEvidenceUnreadable",
 ]
 
 
@@ -607,6 +608,36 @@ class AdapterFailed(SubpassError):
 
     Seeing this is a bug report, not a runtime condition to handle.
     """
+
+
+class WebEvidenceUnreadable(AdapterFailed):
+    """A vendor's web or research response had a shape modelpass could not read.
+
+    Added 2026-11-18. The native web paths are live-unverified, so the first
+    real response in an unexpected shape used to surface as a bare
+    ``TypeError`` or ``AttributeError`` from inside a parser, naming a line and
+    nothing a caller could act on. This says which runtime, which part of the
+    response, what went wrong, and the top-level keys that did arrive (keys
+    only: never a query, a URL or any text).
+
+    It is an :class:`AdapterFailed` because that is what it is -- modelpass
+    misreading a vendor, a bug to report -- so ``except AdapterFailed`` and
+    ``except SubpassError`` both still catch it. **The run or job itself may
+    have completed and been billed**; what failed is reading the evidence.
+    """
+
+    def __init__(self, runtime: str, what: str, cause: BaseException, shape: str = "") -> None:
+        self.runtime = runtime
+        self.what = what
+        self.shape = shape
+        seen = f" Response keys: {shape}." if shape else ""
+        super().__init__(
+            f"{runtime}: {what} could not be read "
+            f"({type(cause).__name__}: {cause}).{seen} The vendor returned a shape "
+            "this version of modelpass does not understand. The run or job may "
+            "have completed and been billed; only reading its web evidence "
+            "failed. This is a modelpass bug: please report it with this message"
+        )
 
 
 class VendorRunFailed(SubpassError):

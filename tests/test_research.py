@@ -21,6 +21,7 @@ from modelpass import (
     ResearchJob,
     Runtime,
     VendorRunFailed,
+    WebEvidenceUnreadable,
     WebOptions,
 )
 from modelpass.adapters.google_api import GoogleAPIAdapter
@@ -213,3 +214,65 @@ def test_installed_sdk_job_output_shapes_are_the_ones_the_snapshot_reads():
     assert "result" in types.GoogleSearchResultContent.model_fields
     assert "search_suggestions" in types.GoogleSearchResult.model_fields
     assert types.TextContent.model_fields["annotations"].default is None
+
+
+@pytest.mark.parametrize("runtime", [Runtime.OPENAI_API, Runtime.GOOGLE_API])
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"id": "job-1", "status": "completed", "output": 7, "outputs": 7},
+        {"id": "job-1", "status": ["completed"]},
+        {"id": "job-1", "status": "completed",
+         "output": [{"type": "message", "content": 5}],
+         "outputs": [{"type": "text", "text": 5, "annotations": "x"}]},
+        "not a response",
+    ],
+)
+def test_an_unreadable_job_response_names_the_job_and_is_not_a_bare_error(
+    tmp_path, runtime, response
+):
+    bridge, resource, _ = setup_bridge(tmp_path, runtime)
+    selector = {"agent": "deep-research-preview-04-2026"} if runtime is Runtime.GOOGLE_API else {}
+    job = bridge.start_research("research", "brief", **selector)
+    resource.retrieve = resource.get = lambda identifier, **params: response
+    with pytest.raises(WebEvidenceUnreadable) as caught:
+        bridge.get_research(job)
+    message = str(caught.value)
+    assert f"{runtime.value}: the response for research job job-1 could not be read" in message
+    assert "may have completed and been billed" in message
+
+
+@pytest.mark.parametrize(
+    "saved,problem",
+    [
+        ("job-1", "must be a mapping"),
+        ({"id": "job-1"}, "missing connection, runtime, identity, web"),
+        ({"id": "j", "connection": "c", "runtime": "openai-api", "identity": "i", "web": {},
+          "receipt": {}}, "unknown receipt"),
+        ({"id": "j", "connection": "c", "runtime": "openai-api", "identity": "i",
+          "web": {"serach": "live"}}, "unknown web option"),
+        ({"id": "j", "connection": "c", "runtime": "anthropic-api", "identity": "i", "web": {}},
+         "unknown hosted research runtime"),
+    ],
+)
+def test_a_malformed_saved_job_is_a_value_error_that_says_how(saved, problem):
+    with pytest.raises(ValueError, match=problem):
+        ResearchJob.from_dict(saved)
+
+
+def test_get_research_refuses_anything_that_is_not_a_job(tmp_path):
+    bridge, resource, _ = setup_bridge(tmp_path, Runtime.OPENAI_API)
+    with pytest.raises(ValueError, match=r"use ResearchJob.from_dict"):
+        bridge.get_research({"id": "job-1"})
+    assert not resource.calls
+
+
+def test_a_job_whose_connection_was_removed_says_so(tmp_path):
+    from modelpass.errors import NoSuchConnection
+
+    bridge, resource, _ = setup_bridge(tmp_path, Runtime.OPENAI_API)
+    job = bridge.start_research("research", "brief")
+    bridge.store.remove("research")
+    with pytest.raises(NoSuchConnection, match="research"):
+        bridge.get_research(job)
+    assert len(resource.calls) == 1

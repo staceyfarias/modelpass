@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from .errors import CapabilityNotSupported
+from .capabilities import STATIC_TABLE, Capability, Support
+from .errors import CapabilityNotSupported, SubpassError, WebEvidenceUnreadable
 from .runtimes import Runtime
 from .types import (
     AgentEvent,
@@ -37,7 +39,9 @@ class WebOptions:
     require_citations: bool = False
 
     def __post_init__(self) -> None:
-        if self.search not in {"off", "provider_default", "live", "cached"}:
+        if not isinstance(self.search, str) or self.search not in {
+            "off", "provider_default", "live", "cached",
+        }:
             raise ValueError("web.search must be off, provider_default, live or cached")
         for name in ("fetch_urls", "search_allowed_domains", "search_blocked_domains"):
             value = getattr(self, name)
@@ -90,6 +94,15 @@ class WebOptions:
         if value is None or isinstance(value, cls):
             return value
         if isinstance(value, Mapping):
+            known = [f.name for f in fields(cls)]
+            unknown = sorted(str(key) for key in value if key not in known)
+            if unknown:
+                # A ValueError that names the key, not the TypeError a bare
+                # ``cls(**value)`` raises for a typo like ``serach``.
+                raise ValueError(
+                    f"unknown web option(s): {', '.join(unknown)}. "
+                    f"Known options: {', '.join(known)}"
+                )
             return cls(**value)
         raise ValueError("web must be WebOptions, a mapping, or None")
 
@@ -151,6 +164,37 @@ def validate_web(runtime: Runtime, web: WebOptions | None, options: Mapping[str,
             "web.citations",
             "the Agent SDK exposes sources without native answer citations",
         )
+    # The capability table is the backstop (2026-11-18). The checks above give
+    # the precise reason where one is known; this makes sure that a cell
+    # reading anything but ``supported`` is never silently accepted -- which is
+    # what happened to ``google-cli`` and ``google-sdk``, whose cells read
+    # unsupported while nothing here refused them. tests/test_web.py holds the
+    # two in agreement for every runtime and option.
+    for capability, feature in web_capabilities(web):
+        support = STATIC_TABLE[runtime].get(capability, Support.UNSUPPORTED)
+        if support is not Support.SUPPORTED:
+            raise CapabilityNotSupported(
+                runtime.value,
+                feature,
+                support.value,
+                f"{capability.value} reads {support.value} for this runtime",
+            )
+
+
+def web_capabilities(web: WebOptions) -> list[tuple[Capability, str]]:
+    """The capability cells a set of options needs, with the feature each names."""
+    needed: list[tuple[Capability, str]] = []
+    if web.search != "off":
+        needed.append((Capability.WEB_SEARCH, "web.search"))
+    if web.search == "cached":
+        needed.append((Capability.WEB_CACHED, "web.cached"))
+    if web.fetch_urls:
+        needed.append((Capability.WEB_FETCH, "web.fetch_urls"))
+    if web.search_allowed_domains or web.search_blocked_domains:
+        needed.append((Capability.WEB_DOMAINS, "web.domains"))
+    if web.require_citations:
+        needed.append((Capability.WEB_CITATIONS, "web.citations"))
+    return needed
 
 
 def web_receipt(runtime: Runtime, web: WebOptions) -> dict[str, Any]:
@@ -231,6 +275,46 @@ def sdk_web_permissions(web: WebOptions | None) -> list[str]:
     return rules
 
 
+def _shape(value: Any) -> str:
+    """Top-level keys of a response, for an error message. Keys only, no values."""
+    try:
+        value = _dict(value)
+    except Exception:
+        return type(value).__name__
+    if isinstance(value, Mapping):
+        return ", ".join(sorted(str(key) for key in value)[:20]) or "none"
+    return type(value).__name__
+
+
+def _reads(runtime: Runtime | str, what: str):
+    """Turn any failure inside an evidence reader into one typed, explained error.
+
+    These readers walk vendor JSON that nothing here has seen live, so a field
+    arriving as ``None``, a string or a list where a mapping was expected is the
+    failure to plan for. Rather than guard every ``.get`` and still miss one,
+    the reader is the boundary: whatever goes wrong inside it leaves as
+    :class:`~modelpass.errors.WebEvidenceUnreadable`, never as a bare
+    ``TypeError`` (2026-11-18).
+    """
+    name = runtime.value if isinstance(runtime, Runtime) else runtime
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(*args: Any, **kwargs: Any):
+            try:
+                return fn(*args, **kwargs)
+            except SubpassError:
+                raise
+            except Exception as exc:
+                raise WebEvidenceUnreadable(
+                    name, what, exc, _shape(args[0] if args else None)
+                ) from exc
+
+        return inner
+
+    return wrap
+
+
 def _dict(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
@@ -241,6 +325,7 @@ def _dict(value: Any) -> Any:
     return value
 
 
+@_reads(Runtime.ANTHROPIC_API, "the web search/fetch blocks of a Messages response")
 def anthropic_evidence(
     message: Any, document_urls: list[str | None] | None = None
 ) -> list[AgentEvent]:
@@ -314,6 +399,7 @@ def anthropic_evidence(
     return events
 
 
+@_reads(Runtime.OPENAI_API, "the web search items of a Responses response")
 def openai_evidence(response: Any) -> list[AgentEvent]:
     value = _dict(response)
     if not isinstance(value, dict):
@@ -347,6 +433,7 @@ def openai_evidence(response: Any) -> list[AgentEvent]:
     return events
 
 
+@_reads(Runtime.GOOGLE_API, "the grounding metadata of a GenerateContent candidate")
 def google_evidence(candidate: Any) -> list[AgentEvent]:
     value = _dict(candidate)
     if not isinstance(value, dict):
@@ -408,6 +495,20 @@ class WebState:
         self.citations = 0
 
     def observe(self, event: AgentEvent) -> list[AgentEvent]:
+        try:
+            return self._observe(event)
+        except SubpassError:
+            raise
+        except Exception as exc:
+            runtime = getattr(event, "runtime", None)
+            raise WebEvidenceUnreadable(
+                runtime.value if isinstance(runtime, Runtime) else "web",
+                f"the web activity in a {event.type} event",
+                exc,
+                _shape(getattr(event, "data", None)),
+            ) from exc
+
+    def _observe(self, event: AgentEvent) -> list[AgentEvent]:
         out: list[AgentEvent] = []
         if isinstance(event, WebEvidenceEvent):
             self.searches += event.searches
@@ -442,16 +543,30 @@ class WebState:
             if sources:
                 out.append(WebEvidenceEvent(sources=sources))
         elif isinstance(event, VendorEvent) and event.runtime is Runtime.OPENAI_SDK:
-            item = event.data.get("item", {})
+            item = event.data.get("item") or {}
             if item.get("type") == "webSearch" and event.name.startswith("item/completed"):
+                # Shape read from ``codex app-server generate-json-schema``
+                # (codex-cli 0.151.0, 2026-11-18): ``WebSearchThreadItem`` has
+                # ``id``, ``query``, a nullable ``action`` whose ``type`` is
+                # search | openPage | findInPage | other, and an opaque
+                # ``results`` array. The action names are put into the spelling
+                # Responses uses, so ``WebActivityEvent.action`` is one
+                # vocabulary on both OpenAI runtimes.
                 action = item.get("action") or {}
-                kind = action.get("type", "search")
+                kind = _CODEX_ACTIONS.get(action.get("type", "search"), action.get("type"))
                 self.searches += int(kind == "search")
                 out.append(
                     WebActivityEvent(
-                        kind, "completed", item.get("id", ""), item.get("query"), action.get("url")
+                        kind,
+                        "completed",
+                        item.get("id") or "",
+                        item.get("query") or action.get("query"),
+                        action.get("url"),
                     )
                 )
+                sources = tuple(dict.fromkeys(_source_values(item.get("results"))))
+                if sources:
+                    out.append(WebEvidenceEvent(sources=sources))
         return out
 
     def failure(self, event: TerminalEvent) -> str | None:
@@ -462,6 +577,16 @@ class WebState:
         if self.options.require_citations and not self.citations:
             return "web.require_citations was requested but no native answer citation was returned"
         return None
+
+
+#: Codex app-server spells web search actions in camelCase; Responses, and
+#: :class:`~modelpass.types.WebActivityEvent`, in snake_case.
+_CODEX_ACTIONS = {
+    "search": "search",
+    "openPage": "open_page",
+    "findInPage": "find_in_page",
+    "other": "other",
+}
 
 
 def _links_values(text: Any) -> list[Any]:
