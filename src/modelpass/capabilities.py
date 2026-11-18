@@ -2221,8 +2221,7 @@ _WEB_EVIDENCE: dict[tuple[Runtime, Capability], str] = {
     (Runtime.OPENAI_SDK, Capability.WEB_DOMAINS): (
         "an allowlist only, sent as tools.web_search.allowed_domains; codex-cli "
         f"0.151.0 type-checks that key. Held by {_T}test_codex_overrides_are_"
-        "explicit_and_off_means_disabled. That Codex enforces the list is "
-        "unverified."
+        "explicit_and_off_means_disabled."
     ),
     (Runtime.OPENAI_SDK, Capability.WEB_FETCH): (
         "Codex opens pages as part of a search and has no separate URL tool."
@@ -2310,6 +2309,47 @@ _WEB_EVIDENCE: dict[tuple[Runtime, Capability], str] = {
         "the Gemini Developer API has no search domain restriction."
     ),
 }
+#: What a real vendor run showed, per cell, on 2026-11-18 (owner-instructed
+#: drive; claude-haiku-4-5, the ``haiku`` alias, and gpt-5.6-luna through
+#: codex-cli 0.151.0). A cell absent from here has not met a vendor.
+_WEB_LIVE: dict[tuple[Runtime, Capability], str] = {
+    (Runtime.ANTHROPIC_API, Capability.WEB_SEARCH): (
+        "one search, nine sources and an answer on claude-haiku-4-5."
+    ),
+    (Runtime.ANTHROPIC_API, Capability.WEB_FETCH): (
+        "one supplied URL fetched and cited; the page cost about 39,000 input "
+        "tokens, which no token guard caps before it is spent."
+    ),
+    (Runtime.ANTHROPIC_API, Capability.WEB_CITATIONS): (
+        "native citations with title and cited text returned for search and for "
+        "a fetched document, and require_citations passed."
+    ),
+    (Runtime.ANTHROPIC_API, Capability.WEB_DOMAINS): (
+        "an allowlist of python.org on an unrelated query returned python.org "
+        "sources only, and a blocklist of wikipedia.org returned none from it."
+    ),
+    (Runtime.ANTHROPIC_SDK, Capability.WEB_SEARCH): (
+        "two searches and 22 sources on the haiku alias; the result arrived as "
+        "the prose-with-Links form the reader expects."
+    ),
+    (Runtime.ANTHROPIC_SDK, Capability.WEB_FETCH): (
+        "a supplied URL was fetched, and a fetch of a host that was not supplied "
+        "was denied by the permission rule."
+    ),
+    (Runtime.OPENAI_SDK, Capability.WEB_SEARCH): (
+        "one search and 16 sources on gpt-5.6-luna; the webSearch item matched "
+        "the schema it is read by."
+    ),
+    (Runtime.OPENAI_SDK, Capability.WEB_CACHED): (
+        "cached and live modes each ran and searched. That cached mode made no "
+        "live request cannot be observed from here."
+    ),
+    (Runtime.OPENAI_SDK, Capability.WEB_DOMAINS): (
+        "an allowlist of python.org on an unrelated query returned python.org "
+        "search results only. It does not cover pages the model opens: the same "
+        "run opened two pages on other hosts."
+    ),
+}
 _WEB_RESEARCH_ABSENT = (
     "hosted research jobs run only on openai-api and google-api; "
     "start_research refuses this runtime."
@@ -2338,7 +2378,13 @@ for _runtime, _cells in _WEB_ROWS.items():
         _evidence = _WEB_EVIDENCE.get((_runtime, _cap))
         if _evidence is None and _cap is Capability.RESEARCH_JOBS:
             _evidence = _WEB_RESEARCH_ABSENT
-        if _support is Support.SUPPORTED:
+        if _support is Support.SUPPORTED and (_runtime, _cap) in _WEB_LIVE:
+            _note = (
+                f"supported, 2026-11-17, live-verified 2026-11-18: "
+                f"{_WEB_LIVE[_runtime, _cap]} {_evidence} See "
+                "docs/api-and-runtimes.md, Native web search and hosted research"
+            )
+        elif _support is Support.SUPPORTED:
             _note = (
                 f"supported, 2026-11-17, live-untested: an offline-tested wire "
                 f"mapping, not a vendor run. {_evidence} See "

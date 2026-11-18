@@ -30,12 +30,20 @@ work landed.
   GenerateContent. Hosted API research jobs expose submit, retrieve and cancel
   through OpenAI Responses and Gemini Interactions. The core retains zero runtime
   dependencies. Offline tests cover the new wire mappings and lifecycle.
-  **Live verification is pending**, with the requested three smoke checks blocked
-  by the workspace environment. OpenAI API and Gemini were left live-untested.
+  **Live-verified 2026-11-18** on the Claude subscription, Codex subscription
+  and Anthropic API. OpenAI API, Gemini and hosted research jobs are
+  live-untested.
   See the native web section in `docs/api-and-runtimes.md`.
 
 ### Fixed
 
+- From the first live web drive (2026-11-18): a completed URL fetch on the
+  Claude subscription runtime now names its URL in `Answer.sources`; reading an
+  Anthropic web response no longer prints serializer warnings to stderr;
+  `receipt.web` reports each runtime's own live status (`verified 2026-11-18`
+  or `untested`) in place of a fixed `untested`. A search domain list is
+  documented as a search-result filter: Codex can still open pages off the
+  list. See "Live verification record" in `docs/api-and-runtimes.md`.
 - Native web and research defects found in review before release (2026-11-18).
   Gemini research snapshots crashed on uncited text and always failed
   `require_search`; Gemini chat evidence crashed on null grounding fields; a

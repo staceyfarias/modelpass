@@ -3200,16 +3200,27 @@ without promising cache bypass or freshness.
 | Runtime | Search | Cache-only | URL tool | Search domains | Native answer citations | Hosted jobs |
 | --- | --- | --- | --- | --- | --- | --- |
 | `anthropic-sdk` | Yes | Refused | WebFetch | Refused | Refused | Refused |
-| `openai-sdk` | Yes, app-server | Yes | Refused as a separate option | Allowlist | Refused | Refused |
+| `openai-sdk` | Yes, app-server | Yes | Refused as a separate option | Allowlist, search results only | Refused | Refused |
 | `anthropic-api` | Yes | Refused | Web fetch | Allowlist or blocklist | Yes | Refused |
 | `openai-api` | Yes | Yes | Refused as a separate option | Allowlist or blocklist | Yes | Responses background |
 | `google-api` | Yes | Refused | URL Context | Refused | Yes | Interactions |
 | `openai-compatible` | Refused | Refused | Refused | Refused | Refused | Refused |
 
-This table describes implemented mappings held by offline tests. All new
-paths remain **live-unverified**. The capability cells report adapter
-implementation with dated SDK evidence. `receipt.web` includes requested
-options, effective search mode and the separate live-verification status.
+This table describes implemented mappings held by offline tests. **The
+`anthropic-sdk`, `openai-sdk` and `anthropic-api` rows were driven against the
+vendors on 2026-11-18** (record below). The `openai-api` and `google-api` rows,
+and both hosted-job backends, remain **live-unverified**. The capability cells
+report adapter implementation with dated SDK evidence, and each says whether it
+has met a vendor. `receipt.web` includes requested options, effective search
+mode and that runtime's live-verification status (`verified 2026-11-18` or
+`untested`).
+
+A search domain list restricts **search results**, as the option's name says.
+It is not a network boundary. On `openai-sdk` the model can also open pages, and
+an opened page is not checked against the list: in the live drive an allowlist
+of `python.org` returned only `python.org` search results, and the same run then
+opened pages on two other hosts. Opened pages are reported in `Answer.sources`
+and as `open_page` activity, so a caller can see it happen.
 Support still depends on the chosen model, account policy and installed runtime.
 Unknown vendor restrictions become the existing error terminal when discovered.
 
@@ -3285,11 +3296,50 @@ Verification record dated 2026-11-17 follows.
 | --- | --- |
 | Offline web and job contracts | `tests/test_web.py`, `tests/test_research.py` and serialization tests. Fake transports verify native tool wire mappings, required evidence, fetch citation indices, refusals, job identity binding, polling, cancellation and submission ambiguity. |
 | SDK surfaces read | Claude Agent SDK 0.2.180 tool options and result blocks, Anthropic 0.97.0 search/fetch parameter types, OpenAI 2.32.0 Responses methods, google-genai 1.73.1 grounding/URL types and Interactions methods. Codex's documented app-server webSearch items and configuration are linked in `web-research-design.md`. |
-| Anthropic subscription, Haiku | Attempted. Windows asyncio loop initialization hung inside `socket.socketpair` before a web run could be verified. The attempt was interrupted. |
-| OpenAI subscription, Luna | Attempted with `gpt-6-luna`. Codex app-server failed to initialize its SQLite state under its account directory because workspace write access was denied. |
-| Anthropic API, Haiku | Attempted with `claude-haiku-4-5`. The SDK client constructor failed with a permission error on the environment's TLS key-log path before a request could be verified. |
-| OpenAI API and Gemini | Intentionally left live-untested at the owner's request. Offline coverage only, including their hosted job lifecycles. |
-| Full test suite | Attempted. It hung in an existing async-handler test while Windows initialized the event loop's loopback socket. A faulthandler trace identified the environment block. Focused synchronous checks were run separately. |
+| Anthropic subscription, Haiku | Attempted on 2026-11-17 and blocked by that workspace before a run. **Driven 2026-11-18**, below. |
+| OpenAI subscription, Luna | Attempted on 2026-11-17 and blocked by that workspace before a run. **Driven 2026-11-18**, below. |
+| Anthropic API, Haiku | Attempted on 2026-11-17 and blocked by that workspace before a request. **Driven 2026-11-18**, below. |
+| OpenAI API and Gemini | Left live-untested at the owner's request, again on 2026-11-18: no OpenAI API credit and no Gemini key. Offline coverage only, including their hosted job lifecycles. |
+| Full test suite | Hung in the 2026-11-17 workspace. Run to completion on 2026-11-18. |
+
+### Live verification record (2026-11-18)
+
+Driven at the owner's instruction, one stateless call per row, through
+`Bridge.chat` with `allow_failover=False`. Models: `claude-haiku-4-5` on
+`anthropic-api`, the `haiku` alias on `anthropic-sdk`, `gpt-5.6-luna` on
+`openai-sdk` through codex-cli 0.151.0. Every row ended with an `ok` terminal
+unless it says otherwise.
+
+| Runtime | What was asked | What came back |
+| --- | --- | --- |
+| `anthropic-api` | search, `require_search` and `require_citations` | One search, 9 sources, 1 native citation with title and cited text. 10,782 tokens, 5 s. |
+| `anthropic-api` | search with `search_allowed_domains=("python.org",)` | On-topic query: 10 sources, all `python.org` hosts. Unrelated query (Olympic history): 3 searches, the only source was `mail.python.org`, and the model said it could not answer. The list is enforced. |
+| `anthropic-api` | search with `search_blocked_domains=("wikipedia.org",)` | 9 sources, none from `wikipedia.org`. |
+| `anthropic-api` | `search="off"`, one `fetch_urls` entry, `require_citations` | Fetch started and completed, 1 source, 1 citation carrying the document title. **39,275 tokens for one page**: a fetched page is billed as input, and no token guard caps it before it is spent. |
+| `anthropic-sdk` | search, `require_search` | 2 searches, 22 sources. The result arrived as `Web search results for query: "..."` then `Links: [...]`, the form the reader parses. |
+| `anthropic-sdk` | `search="off"`, one `fetch_urls` entry | Fetch started and completed; the fetched URL is the source. |
+| `anthropic-sdk` | the same, with the prompt asking for a fetch of `example.com` instead | The tool result was an error, "Claude requested permissions to use WebFetch, but you haven't granted it yet", and the activity read `failed`. The per-host rule holds. |
+| `openai-sdk` | search, `require_search` (default mode, `cached`) | 1 search, 16 sources from the item's `results`. The `webSearch` item matched the schema it is read by. |
+| `openai-sdk` | `search="live"` | 1 search, 16 sources; `receipt.web` reported `live`. |
+| `openai-sdk` | search with `search_allowed_domains=("python.org",)` on an unrelated query | 3 searches whose results were `python.org` hosts only, one of them empty; then 2 `open_page` actions on `olympics.com` and `en.wikipedia.org`. Search results are restricted; opened pages are not. |
+| `openai-sdk` | search with `model="gpt-6-luna"` | Error terminal carrying the vendor's 400: "The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account". Nothing was spent. The same connection ran `gpt-5.6-luna`. |
+
+What the drive changed in the code, each held by a test in `tests/test_web.py`:
+
+- A completed Claude Code `WebFetch` now names its URL as a source. It returned
+  the page text and no source record, so `Answer.sources` was empty.
+- Reading an Anthropic response no longer prints a
+  `PydanticSerializationUnexpectedValue` warning per block to stderr.
+- `receipt.web` reports each runtime's own live status in place of a fixed
+  `untested`.
+- The capability notes say `live-verified 2026-11-18` on the cells above and
+  `live-untested` on the rest.
+
+Not exercised, and still unverified on the driven runtimes: that `cached` mode
+on Codex makes no live request (it cannot be observed from the client); whether
+Claude Code follows a redirect off an allowed fetch host; `require_search`
+failing against a model that declines to search; and async calls, which share
+the adapters' code paths but were not driven.
 
 ### Review fixes (2026-11-18)
 
@@ -3377,16 +3427,16 @@ Also settled on 2026-11-18:
   `WebActivityEvent.action` is one vocabulary, and `results` now feeds
   `Answer.sources`.
 
-Still open, and not answerable offline: `receipt.web` carries a fixed
-`live_verification: "untested"`; whether Codex enforces
-`tools.web_search.allowed_domains`; whether a Gemini research agent honours the
-explicit tool list; whether Claude Code follows a redirect off an allowed fetch
-host; and whether the OpenAI server accepts `external_web_access` and
-`filters.blocked_domains` as its guide documents them. Nothing in this section
-has been run against a live vendor.
+Still open after the 2026-11-18 live drive, all on runtimes that were not
+driven: whether the OpenAI server accepts `external_web_access` and
+`filters.blocked_domains` as its guide documents them; whether a Gemini
+research agent honours the explicit tool list; and both hosted-job backends end
+to end. Whether Claude Code follows a redirect off an allowed fetch host is
+open on a driven runtime.
 
 The opt-in smoke tests in `tests/live/test_web_live.py` use existing configured
-connections and the low-cost Haiku and Luna models. The test is excluded from
+connections and the low-cost Haiku and Luna models (`gpt-5.6-luna` by default,
+the Luna that codex-cli 0.151.0 will run). The test is excluded from
 normal runs and checks actual native tool evidence. Run it from an environment
 with the required account-directory and network access. Select the connection
 names with the corresponding `MODELPASS_WEB_*_CONNECTION` variables when needed.

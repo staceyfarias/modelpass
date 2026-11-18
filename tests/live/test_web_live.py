@@ -23,7 +23,10 @@ pytestmark = pytest.mark.live
     "vendor,default_connection,default_model",
     [
         ("ANTHROPIC_SUB", "claude-sub", "haiku"),
-        ("OPENAI_SUB", "openai-sub", "gpt-6-luna"),
+        # gpt-5.6-luna, not gpt-6-luna: on 2026-11-18 the latter came back
+        # "not supported when using Codex with a ChatGPT account" through
+        # codex-cli 0.151.0. Override with MODELPASS_WEB_OPENAI_SUB_MODEL.
+        ("OPENAI_SUB", "openai-sub", "gpt-5.6-luna"),
         ("ANTHROPIC_API", "claude-api", "claude-haiku-4-5"),
     ],
 )

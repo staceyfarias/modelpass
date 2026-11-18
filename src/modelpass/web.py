@@ -197,15 +197,31 @@ def web_capabilities(web: WebOptions) -> list[tuple[Capability, str]]:
     return needed
 
 
+#: The runtimes whose web path has completed a real vendor run, and the day it
+#: did. Driven by the owner's instruction on 2026-11-18 with Haiku and Luna:
+#: search on all three; URL fetch on both Anthropic runtimes; citations and
+#: allow/block lists on ``anthropic-api``; live and cached modes on
+#: ``openai-sdk``. ``openai-api`` and ``google-api`` have not been driven, and a
+#: receipt for them says so. The record is in docs/api-and-runtimes.md.
+WEB_LIVE_VERIFIED: dict[Runtime, str] = {
+    Runtime.ANTHROPIC_API: "2026-11-18",
+    Runtime.ANTHROPIC_SDK: "2026-11-18",
+    Runtime.OPENAI_SDK: "2026-11-18",
+}
+
+
 def web_receipt(runtime: Runtime, web: WebOptions) -> dict[str, Any]:
     effective = web.search
     if effective == "provider_default":
         effective = "cached" if runtime is Runtime.OPENAI_SDK else "live"
+    verified = WEB_LIVE_VERIFIED.get(runtime)
     return {
         "requested": web.to_dict(),
         "search": effective,
-        "verification": "offline",
-        "live_verification": "untested",
+        # Was a fixed "offline"/"untested" pair on every receipt, which went
+        # stale the day the first runtime was driven (2026-11-18).
+        "verification": "live" if verified else "offline",
+        "live_verification": f"verified {verified}" if verified else "untested",
     }
 
 
@@ -317,7 +333,14 @@ def _reads(runtime: Runtime | str, what: str):
 
 def _dict(value: Any) -> Any:
     if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
+        # ``warnings=False``: a streamed anthropic message holds ParsedTextBlock
+        # objects, and dumping it printed a PydanticSerializationUnexpectedValue
+        # warning per block to the caller's stderr on every web call (seen live,
+        # 2026-11-18). The dump itself is correct.
+        try:
+            return value.model_dump(mode="json", warnings=False)
+        except TypeError:
+            return value.model_dump(mode="json")
     if isinstance(value, Mapping):
         return dict(value)
     if is_dataclass(value):
@@ -535,11 +558,19 @@ class WebState:
                     event.id or "",
                 )
             )
-            try:
-                content = json.loads(event.content)
-            except (ValueError, TypeError):
-                content = _links_values(event.content)
-            sources = tuple(dict.fromkeys(_source_values(content)))
+            if call.name == "WebFetch":
+                # Claude Code's WebFetch returns the page's text, not a source
+                # record, so a completed fetch used to leave ``Answer.sources``
+                # empty (seen live, 2026-11-18). The URL the tool was run on is
+                # the source. A failed fetch names none.
+                url = call.arguments.get("url")
+                sources = (WebSource(url),) if success and isinstance(url, str) and url else ()
+            else:
+                try:
+                    content = json.loads(event.content)
+                except (ValueError, TypeError):
+                    content = _links_values(event.content)
+                sources = tuple(dict.fromkeys(_source_values(content)))
             if sources:
                 out.append(WebEvidenceEvent(sources=sources))
         elif isinstance(event, VendorEvent) and event.runtime is Runtime.OPENAI_SDK:

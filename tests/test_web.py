@@ -672,7 +672,8 @@ def test_every_web_capability_cell_has_its_own_note():
             support = registry.support(runtime, capability)
             assert support.value in note, (runtime.value, capability.value)
             if support is Support.SUPPORTED:
-                assert "live-untested" in note and "Held by" in note
+                assert "Held by" in note
+                assert ("live-verified 2026-11-18" in note) != ("live-untested" in note)
             else:
                 assert "refused" in note or "refuses" in note
     supported_notes = {
@@ -693,3 +694,81 @@ def test_a_mistyped_web_option_is_a_value_error_that_names_it():
         WebOptions(search=["live"])
     with pytest.raises(ValueError, match="WebOptions, a mapping, or None"):
         WebOptions.coerce("live")
+
+
+# --- after the first live drive, 2026-11-18 ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "runtime,status",
+    [
+        (Runtime.ANTHROPIC_API, "verified 2026-11-18"),
+        (Runtime.ANTHROPIC_SDK, "verified 2026-11-18"),
+        (Runtime.OPENAI_SDK, "verified 2026-11-18"),
+        (Runtime.OPENAI_API, "untested"),
+        (Runtime.GOOGLE_API, "untested"),
+    ],
+)
+def test_the_receipt_says_whether_this_runtimes_web_path_has_met_a_vendor(runtime, status):
+    from modelpass.web import web_receipt
+
+    receipt = web_receipt(runtime, WebOptions())
+    assert receipt["live_verification"] == status
+    assert receipt["verification"] == ("offline" if status == "untested" else "live")
+
+
+def test_only_the_driven_runtimes_have_live_verified_cells():
+    """A cell says live-verified only on a runtime the receipt also calls verified."""
+    from modelpass.capabilities import CapabilityRegistry
+    from modelpass.web import WEB_LIVE_VERIFIED
+
+    registry = CapabilityRegistry()
+    for runtime in Runtime:
+        for capability in Capability:
+            note = registry.note(runtime, capability) or ""
+            if "live-verified 2026-11-18" in note:
+                assert runtime in WEB_LIVE_VERIFIED, (runtime.value, capability.value)
+    for capability in (Capability.WEB_SEARCH, Capability.RESEARCH_JOBS):
+        for runtime in (Runtime.OPENAI_API, Runtime.GOOGLE_API):
+            assert "live-untested" in registry.note(runtime, capability)
+
+
+def test_a_completed_claude_code_fetch_names_its_url_as_a_source(tmp_path):
+    def run(is_error):
+        bridge, _, _ = fake_bridge(
+            connections=[connection()],
+            script=[
+                *tool_exchange(
+                    "WebFetch",
+                    {"url": "https://www.python.org/downloads/", "prompt": "heading?"},
+                    "The heading is Download Python.",
+                    is_error=is_error,
+                ),
+                TextDeltaEvent("answer"),
+            ],
+            home=tmp_path / str(is_error),
+        )
+        web = WebOptions(search="off", fetch_urls=("https://www.python.org/downloads/",))
+        return bridge.ask("web-test", "read it", web=web)
+
+    assert run(False).sources == (WebSource("https://www.python.org/downloads/"),)
+    assert run(True).sources is None
+
+
+def test_dumping_a_vendor_object_does_not_print_serializer_warnings():
+    """Seen live: one warning per block on stderr for every anthropic web call."""
+    import warnings
+
+    from modelpass.web import _dict
+
+    class Dumped:
+        def model_dump(self, *, mode, warnings=True):
+            if warnings:
+                import warnings as w
+
+                w.warn("PydanticSerializationUnexpectedValue", UserWarning, stacklevel=1)
+            return {"content": []}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _dict(Dumped()) == {"content": []}

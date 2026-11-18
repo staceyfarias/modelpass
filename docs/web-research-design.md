@@ -1,11 +1,33 @@
 # Web search and research in ModelPass
 
-Implementation status as of 2026-11-17. The stateless web interface and hosted
-OpenAI/Gemini job interfaces are implemented with offline tests. The requested
-subscription and Anthropic API live checks encountered environment restrictions.
-OpenAI API and Gemini remain live-untested. The implemented contract and exact
+Implementation status as of 2026-11-18. The stateless web interface and hosted
+OpenAI/Gemini job interfaces are implemented with offline tests. The Claude
+subscription, Codex subscription and Anthropic API paths were driven against
+the vendors on 2026-11-18 and work. OpenAI API, Gemini and both hosted-job
+backends remain live-untested. The implemented contract and exact
 verification status are in [api-and-runtimes.md](api-and-runtimes.md#native-web-search-and-hosted-research-2026-11-17).
 The original proposal below records design rationale and candidate extensions.
+
+**Design review after the live drive (2026-11-18).** The design held: opting in
+per call, mapping onto each vendor's own tools rather than fetching locally,
+refusing what a runtime cannot honour before anything is sent, and reporting
+evidence as events all behaved as written on three runtimes. Four things the
+drive settled or changed:
+
+- *Domain lists are search-result filters, not a network boundary.* The
+  proposal already scoped them to "search-result restrictions only"; Codex
+  showed why that wording matters, by opening off-list pages in a run whose
+  search results were all on-list. The contract now says so in those words.
+- *A fetched URL is a source.* Claude Code's fetch returns text and no source
+  record, so the adapter names the URL itself.
+- *Verification status belongs to the runtime, not to the feature.* The
+  receipt's fixed `untested` is now per runtime.
+- *Fetch cost is the open design question.* One fetched page cost about 39,000
+  input tokens on Anthropic Messages, and the existing guards count tokens
+  after they are spent. A `fetch_max_tokens` option mapped to the vendor's
+  `max_content_tokens` would bound it there; it is not implemented, because no
+  other runtime has an equivalent and the proposal's rule is to add a control
+  only with a verifiable mapping.
 
 Design proposal based on vendor documentation and SDK surfaces reviewed on
 2026-11-17. The table describes vendor capabilities and implementation
