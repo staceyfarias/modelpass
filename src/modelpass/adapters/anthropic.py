@@ -170,7 +170,7 @@ from ..types import (
     UsageScope,
     VendorEvent,
 )
-from ..web import sdk_web_tools
+from ..web import sdk_web_permissions, sdk_web_tools
 from ._mcp_result import mcp_result_payload
 from .base import (
     Adapter,
@@ -2719,7 +2719,9 @@ class AnthropicAdapter(Adapter):
             web_tools = sdk_web_tools(request.web)
             options_kwargs.update(
                 tools=web_tools,
-                allowed_tools=web_tools,
+                # Rules, not bare names: fetch is allowed for the hosts the
+                # caller supplied and no others (2026-11-18).
+                allowed_tools=sdk_web_permissions(request.web),
                 disallowed_tools=[name for name in _BUILTIN_TOOLS if name not in web_tools],
                 max_turns=None,
             )

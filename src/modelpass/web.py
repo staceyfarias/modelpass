@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
@@ -54,6 +55,9 @@ class WebOptions:
             self.require_search or self.search_allowed_domains or self.search_blocked_domains
         ):
             raise ValueError("web search options require search to be enabled")
+        if self.search == "off" and not self.fetch_urls:
+            # 2026-11-18: this used to reach the API runtimes as ``tools: []``.
+            raise ValueError("web requires search or fetch_urls; pass web=None for neither")
         for url in self.fetch_urls:
             parsed = urlsplit(url)
             if (
@@ -62,6 +66,14 @@ class WebOptions:
                 or parsed.username is not None
             ):
                 raise ValueError("web.fetch_urls requires HTTP(S) URLs without credentials")
+            if not _public_host(parsed.hostname):
+                # 2026-11-18. On anthropic-sdk the URL tool runs on this
+                # machine, so a loopback or private address is a request to
+                # read the caller's own network, which this option is not for.
+                raise ValueError(
+                    "web.fetch_urls requires public hosts, not localhost or a "
+                    "private, loopback or link-local address"
+                )
         for domain in (*self.search_allowed_domains, *self.search_blocked_domains):
             parsed = urlsplit("https://" + domain)
             if (
@@ -86,6 +98,22 @@ class WebOptions:
             key: list(value) if isinstance(value, tuple) else value
             for key, value in asdict(self).items()
         }
+
+
+def _public_host(host: str) -> bool:
+    """Whether a URL host is one a remote tool could be meant to read.
+
+    A literal check only: a public name that *resolves* to a private address is
+    not caught here, and nothing is resolved to find out.
+    """
+    name = host.lower().rstrip(".")
+    if name == "localhost" or name.endswith((".localhost", ".local", ".internal")):
+        return False
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return "." in name
+    return address.is_global
 
 
 def refuse(runtime: Runtime, feature: str, reason: str) -> None:
@@ -149,7 +177,14 @@ def native_web_tools(runtime: Runtime, web: WebOptions | None) -> list[dict[str,
             if web.search_blocked_domains:
                 tool["blocked_domains"] = list(web.search_blocked_domains)
         elif runtime is Runtime.OPENAI_API:
-            tool = {"type": "web_search", "external_web_access": web.search != "cached"}
+            # ``external_web_access`` and ``filters.blocked_domains`` are in the
+            # vendor's web search guide (read 2026-11-18: "Default is true (live
+            # access) if you do not set it") and absent from openai 2.32.0's
+            # WebSearchToolParam, which is a TypedDict and passes them through.
+            # So the access field is sent only when the caller stated a mode.
+            tool = {"type": "web_search"}
+            if web.search in {"live", "cached"}:
+                tool["external_web_access"] = web.search == "live"
             filters = {}
             if web.search_allowed_domains:
                 filters["allowed_domains"] = list(web.search_allowed_domains)
@@ -177,6 +212,23 @@ def sdk_web_tools(web: WebOptions | None) -> list[str]:
     if web.fetch_urls:
         names.append("WebFetch")
     return names
+
+
+def sdk_web_permissions(web: WebOptions | None) -> list[str]:
+    """Permission rules for those tools: fetch only from the supplied hosts.
+
+    2026-11-18. Claude Code's WebFetch runs in the local process and takes any
+    URL the model writes. Allowing the bare tool name let a run fetch anything;
+    ``WebFetch(domain:<host>)`` is Claude Code's own rule syntax (read from the
+    CLI bundled with claude-agent-sdk 0.2.180) and allows one host each. Whether
+    a redirect off that host is followed is the CLI's behaviour, not checked.
+    """
+    if web is None:
+        return []
+    rules = ["WebSearch"] if web.search != "off" else []
+    hosts = dict.fromkeys(urlsplit(url).hostname for url in web.fetch_urls)
+    rules.extend(f"WebFetch(domain:{host})" for host in hosts)
+    return rules
 
 
 def _dict(value: Any) -> Any:
@@ -231,7 +283,8 @@ def anthropic_evidence(
                 )
             )
         if kind == "web_fetch_tool_result":
-            content = block.get("content", {})
+            content = block.get("content")
+            content = content if isinstance(content, dict) else {}
             if content.get("url"):
                 title = (content.get("content") or {}).get("title")
                 sources.append(WebSource(content["url"], title))
@@ -253,9 +306,10 @@ def anthropic_evidence(
                 if url is None and isinstance(index, int) and 0 <= index < len(documents):
                     url = documents[index]
                 if url:
-                    citations.append(
-                        WebCitation(url, citation.get("title"), citation.get("cited_text"))
-                    )
+                    # A search citation names its page ``title``; a fetched
+                    # document's citation names it ``document_title``.
+                    title = citation.get("title") or citation.get("document_title")
+                    citations.append(WebCitation(url, title, citation.get("cited_text")))
     events.append(WebEvidenceEvent(tuple(sources), tuple(citations), searches, tuple(errors)))
     return events
 
@@ -297,21 +351,27 @@ def google_evidence(candidate: Any) -> list[AgentEvent]:
     value = _dict(candidate)
     if not isinstance(value, dict):
         return []
+    if value.get("grounding_metadata") is None and value.get("url_context_metadata") is None:
+        # Most streamed chunks carry no web metadata at all. Saying nothing for
+        # them keeps one answer from emitting an empty evidence event per chunk.
+        return []
     meta = value.get("grounding_metadata") or {}
-    sources = tuple(
-        WebSource(chunk["web"]["uri"], chunk["web"].get("title"))
-        for chunk in (meta.get("grounding_chunks", []) or [])
-        if chunk.get("web", {}).get("uri")
-    )
+    # A dumped SDK object writes ``"web": None`` on a chunk that is not a web
+    # chunk and ``"segment": None`` on a support without one (2026-11-18), so
+    # every nested read here is ``or {}``, never a ``.get`` default.
+    chunks = [(chunk or {}).get("web") or {} for chunk in meta.get("grounding_chunks") or []]
+    sources = tuple(WebSource(web["uri"], web.get("title")) for web in chunks if web.get("uri"))
     citations = []
-    chunks = meta.get("grounding_chunks") or []
-    for support in meta.get("grounding_supports", []) or []:
-        for index in support.get("grounding_chunk_indices", []) or []:
-            if 0 <= index < len(chunks) and chunks[index].get("web", {}).get("uri"):
-                source = chunks[index]["web"]
+    for support in meta.get("grounding_supports") or []:
+        support = support or {}
+        for index in support.get("grounding_chunk_indices") or []:
+            if 0 <= index < len(chunks) and chunks[index].get("uri"):
+                source = chunks[index]
                 citations.append(
                     WebCitation(
-                        source["uri"], source.get("title"), support.get("segment", {}).get("text")
+                        source["uri"],
+                        source.get("title"),
+                        (support.get("segment") or {}).get("text"),
                     )
                 )
     queries = meta.get("web_search_queries") or []
@@ -377,8 +437,8 @@ class WebState:
             try:
                 content = json.loads(event.content)
             except (ValueError, TypeError):
-                content = None
-            sources = tuple(_source_values(content))
+                content = _links_values(event.content)
+            sources = tuple(dict.fromkeys(_source_values(content)))
             if sources:
                 out.append(WebEvidenceEvent(sources=sources))
         elif isinstance(event, VendorEvent) and event.runtime is Runtime.OPENAI_SDK:
@@ -402,6 +462,33 @@ class WebState:
         if self.options.require_citations and not self.citations:
             return "web.require_citations was requested but no native answer citation was returned"
         return None
+
+
+def _links_values(text: Any) -> list[Any]:
+    """The JSON lists Claude Code's WebSearch result prints after ``Links:``.
+
+    The CLI bundled with claude-agent-sdk 0.2.180 returns the result as prose:
+    a ``Web search results for query: "..."`` line, then ``Links: [...]`` with
+    one JSON list of ``{"title", "url"}`` per result block (2026-11-18). Only
+    those lists are read. A URL in the surrounding prose is the model's own
+    writing and is not a source.
+    """
+    if not isinstance(text, str):
+        return []
+    found: list[Any] = []
+    decoder = json.JSONDecoder()
+    position = text.find("Links:")
+    while position != -1:
+        start = position + len("Links:")
+        start += len(text[start:]) - len(text[start:].lstrip())
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            value = None
+        if isinstance(value, list):
+            found.append(value)
+        position = text.find("Links:", start)
+    return found
 
 
 def _source_values(value: Any):

@@ -69,7 +69,17 @@ class Resource:
             "id": identifier,
             "status": "completed",
             "outputs": [
-                {"type": "google_search_call", "queries": ["query"]},
+                # The shapes google-genai 1.73.1 dumps (read 2026-11-18): the
+                # queries sit under ``arguments``, suggestions under each
+                # ``result`` entry, and a text block with no citations carries
+                # an explicit ``"annotations": None``.
+                {"type": "google_search_call", "id": "s1", "arguments": {"queries": ["query"]}},
+                {
+                    "type": "google_search_result",
+                    "call_id": "s1",
+                    "result": [{"search_suggestions": "<div>Search</div>"}],
+                },
+                {"type": "text", "text": "A ", "annotations": None},
                 {
                     "type": "text",
                     "text": "report",
@@ -136,7 +146,9 @@ def test_submit_restore_poll_and_cancel_original_job(tmp_path, runtime):
     assert "fake-key" not in str(job.to_dict())
     snapshot = bridge.get_research(restored)
     assert snapshot.status == "completed"
-    assert snapshot.result.text == "report"
+    assert snapshot.result.text == ("A report" if runtime is Runtime.GOOGLE_API else "report")
+    if runtime is Runtime.GOOGLE_API:
+        assert snapshot.result.presentation == {"search_suggestions": ["<div>Search</div>"]}
     assert snapshot.result.citations[0].url == "https://example.org"
     assert bridge.cancel_research(restored).status == "cancelled"
     assert [call[0] for call in resource.calls] == ["create", "get", "cancel"]
@@ -182,3 +194,22 @@ def test_a_completed_job_without_report_is_a_failed_snapshot(tmp_path):
     assert snapshot.status == "failed"
     assert snapshot.result is None
     assert "no text report" in snapshot.reason
+
+
+def test_a_client_with_no_job_interface_says_nothing_was_submitted(tmp_path):
+    """A local failure is not an unknown remote outcome (2026-11-18)."""
+    bridge, resource, client = setup_bridge(tmp_path, Runtime.GOOGLE_API)
+    del client._nextgen_client
+    with pytest.raises(VendorRunFailed, match="nothing was submitted"):
+        bridge.start_research("research", "brief", agent="deep-research-preview-04-2026")
+    assert not resource.calls
+
+
+def test_installed_sdk_job_output_shapes_are_the_ones_the_snapshot_reads():
+    """Ties the fixture above to the installed SDK instead of to the code."""
+    types = pytest.importorskip("google.genai._interactions.types")
+    assert "arguments" in types.GoogleSearchCallContent.model_fields
+    assert "queries" not in types.GoogleSearchCallContent.model_fields
+    assert "result" in types.GoogleSearchResultContent.model_fields
+    assert "search_suggestions" in types.GoogleSearchResult.model_fields
+    assert types.TextContent.model_fields["annotations"].default is None

@@ -34,6 +34,18 @@ work landed.
   by the workspace environment. OpenAI API and Gemini were left live-untested.
   See the native web section in `docs/api-and-runtimes.md`.
 
+### Fixed
+
+- Native web and research defects found in review before release (2026-11-18).
+  Gemini research snapshots crashed on uncited text and always failed
+  `require_search`; Gemini chat evidence crashed on null grounding fields; a
+  fetched document's citation lost its title; Claude subscription runs never
+  returned sources. `WebFetch` on the Claude subscription runtime is now allowed
+  only for the hosts in `fetch_urls`, and `fetch_urls` refuses non-public hosts.
+  `WebOptions(search="off")` with no URLs is refused. OpenAI Responses sends
+  `external_web_access` only when a mode is stated. See "Review fixes" in
+  `docs/api-and-runtimes.md`.
+
 The entries dated 2026-11-13 below, apart from the credential-store one, come from
 one code review of that date. Each behaviour is held by an offline test. Where a
 claim rests on a real vendor, a real Codex server, or a platform the suite did not

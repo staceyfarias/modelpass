@@ -119,6 +119,14 @@ def test_explicit_unsupported_controls_refuse(runtime, options, web):
         {"fetch_urls": ("file:///tmp/a",)},
         {"search_allowed_domains": ("https://example.org",)},
         {"require_search": "yes"},
+        {"search": "off"},
+        {"fetch_urls": ("http://localhost:8080/admin",)},
+        {"fetch_urls": ("http://127.0.0.1/",)},
+        {"fetch_urls": ("http://169.254.169.254/latest/meta-data",)},
+        {"fetch_urls": ("http://10.0.0.5/",)},
+        {"fetch_urls": ("http://[::1]/",)},
+        {"fetch_urls": ("http://intranet/",)},
+        {"fetch_urls": ("https://build.internal/",)},
         {"search_allowed_domains": ("example.org",), "search_blocked_domains": ("other.org",)},
     ],
 )
@@ -165,9 +173,14 @@ def test_codex_overrides_are_explicit_and_off_means_disabled():
     conn = connection(Runtime.OPENAI_SDK)
     req = RunRequest(conn, (), plan_launch(conn, {}), web=WebOptions(search="live"))
     assert web_config_overrides(req) == ["-c", 'web_search="live"']
-    assert web_config_overrides(replace(req, web=WebOptions(search="off"))) == [
+    off = WebOptions(search="off", fetch_urls=("https://example.org",))
+    assert web_config_overrides(replace(req, web=off)) == ["-c", 'web_search="disabled"']
+    allowed = WebOptions(search_allowed_domains=("example.org", "docs.example.org"))
+    assert web_config_overrides(replace(req, web=allowed)) == [
         "-c",
-        'web_search="disabled"',
+        'web_search="cached"',
+        "-c",
+        'tools.web_search.allowed_domains=["example.org", "docs.example.org"]',
     ]
     assert web_config_overrides(replace(req, web=None)) == []
 
@@ -350,3 +363,149 @@ def test_messages_server_pause_continues_without_losing_web_evidence(store):
     assert calls[1]["messages"][-1]["content"][-1]["tool_use_id"] == "search-1"
     assert answer.text == "Planning. Answer."
     assert answer.sources[0].url == "https://example.org"
+
+
+# --- review fixes, 2026-11-18 --------------------------------------------------------
+#
+# Each of these failed before the fix. The payloads are the shapes the installed
+# SDKs produce -- ``model_dump`` writes an absent optional field as an explicit
+# ``None`` -- which is what the first round of fixtures left out.
+
+
+def test_google_evidence_survives_the_nulls_a_dumped_sdk_object_carries():
+    evidence = google_evidence(
+        {
+            "grounding_metadata": {
+                "grounding_chunks": [
+                    {"web": None, "retrieved_context": {"uri": "gs://bucket/doc"}},
+                    {"web": {"uri": "https://example.org", "title": "Example"}},
+                ],
+                "grounding_supports": [
+                    {"grounding_chunk_indices": [0, 1], "segment": None},
+                    {"grounding_chunk_indices": None, "segment": {"text": "unused"}},
+                ],
+            }
+        }
+    )[-1]
+    assert evidence.sources == (WebSource("https://example.org", "Example"),)
+    assert evidence.citations == (WebCitation("https://example.org", "Example", None),)
+
+
+def test_a_google_chunk_with_no_web_metadata_emits_nothing():
+    assert google_evidence({"content": {"parts": [{"text": "hello"}]}}) == []
+    assert google_evidence({"grounding_metadata": None, "url_context_metadata": None}) == []
+
+
+def test_a_fetched_document_citation_keeps_its_document_title():
+    evidence = anthropic_evidence(
+        {
+            "content": [
+                {
+                    "type": "web_fetch_tool_result",
+                    "content": {"url": "https://example.org", "content": {"title": "Page"}},
+                },
+                {
+                    "type": "text",
+                    "citations": [
+                        {
+                            "type": "char_location",
+                            "document_index": 0,
+                            "document_title": "Page",
+                            "cited_text": "proof",
+                        }
+                    ],
+                },
+            ]
+        }
+    )[-1]
+    assert evidence.citations == (WebCitation("https://example.org", "Page", "proof"),)
+
+
+def test_a_failed_fetch_result_is_an_error_not_a_crash():
+    error = {"type": "web_fetch_tool_result_error", "error_code": "url_not_allowed"}
+    events = anthropic_evidence(
+        {
+            "content": [
+                {"type": "web_fetch_tool_result", "tool_use_id": "f1", "content": error},
+                {"type": "web_fetch_tool_result", "tool_use_id": "f2", "content": None},
+            ]
+        }
+    )
+    assert [e.status for e in events[:-1]] == ["failed", "failed"]
+    assert events[-1].errors == ("url_not_allowed",)
+
+
+def test_openai_says_nothing_about_access_unless_the_caller_named_a_mode():
+    def tool(web):
+        req = request(Runtime.OPENAI_API, web)
+        return OpenAIAPIAdapter().request_params(req, [])["tools"][0]
+
+    assert tool(WebOptions()) == {"type": "web_search"}
+    assert tool(WebOptions(search="live"))["external_web_access"] is True
+    assert tool(WebOptions(search="cached"))["external_web_access"] is False
+    blocked = tool(WebOptions(search_blocked_domains=("spam.example",)))
+    assert blocked["filters"] == {"blocked_domains": ["spam.example"]}
+
+
+def test_anthropic_api_fetch_and_blocklist_reach_the_wire():
+    web = WebOptions(
+        search_blocked_domains=("spam.example",), fetch_urls=("https://example.org/a",)
+    )
+    tools = AnthropicAPIAdapter().request_params(request(Runtime.ANTHROPIC_API, web), [])["tools"]
+    assert tools == [
+        {"type": "web_search_20250305", "name": "web_search", "blocked_domains": ["spam.example"]},
+        {"type": "web_fetch_20250910", "name": "web_fetch", "citations": {"enabled": True}},
+    ]
+
+
+def test_claude_code_search_results_printed_as_prose_still_yield_sources(tmp_path):
+    """The CLI prints ``Links: [...]`` inside prose; the list is the evidence."""
+    result = (
+        'Web search results for query: "python release"\n\n'
+        'Links: [{"title": "Python 3.14", "url": "https://www.python.org/downloads/"}, '
+        '{"title": "PEP 745", "url": "https://peps.python.org/pep-0745/"}]\n\n'
+        "The latest release is described at https://not-a-source.example/blog.\n\n"
+        "REMINDER: You MUST include the sources above in your response."
+    )
+    bridge, _, _ = fake_bridge(
+        connections=[connection()],
+        script=[
+            *tool_exchange("WebSearch", {"query": "python release"}, result),
+            TextDeltaEvent("answer"),
+        ],
+        home=tmp_path,
+    )
+    answer = bridge.ask("web-test", "look it up", web=WebOptions(require_search=True))
+    assert answer.sources == (
+        WebSource("https://www.python.org/downloads/", "Python 3.14"),
+        WebSource("https://peps.python.org/pep-0745/", "PEP 745"),
+    )
+
+
+def test_the_agent_sdk_run_allows_search_and_fetch_from_the_supplied_hosts_only(monkeypatch):
+    """The options the real adapter launches with, not a mirror of them.
+
+    WebFetch runs on this machine, so the permission rule is what keeps a run
+    that was handed one URL from fetching any other host.
+    """
+    from test_anthropic_adapter import launch_options
+
+    conn = connection()
+    web = WebOptions(fetch_urls=("https://example.org/a", "https://docs.example.org/b"))
+    req = RunRequest(conn, (Message("user", "read these"),), plan_launch(conn, {}), web=web)
+    options = launch_options(monkeypatch, req)
+    assert options["tools"] == ["WebSearch", "WebFetch"]
+    assert options["allowed_tools"] == [
+        "WebSearch",
+        "WebFetch(domain:example.org)",
+        "WebFetch(domain:docs.example.org)",
+    ]
+    assert "Bash" in options["disallowed_tools"]
+    assert not {"WebSearch", "WebFetch"} & set(options["disallowed_tools"])
+    assert options["max_turns"] is None
+
+    fetch_only = replace(req, web=WebOptions(search="off", fetch_urls=("https://example.org/a",)))
+    options = launch_options(monkeypatch, fetch_only)
+    assert options["tools"] == ["WebFetch"]
+    assert options["allowed_tools"] == ["WebFetch(domain:example.org)"]
+    assert "WebSearch" in options["disallowed_tools"]

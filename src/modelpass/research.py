@@ -182,7 +182,16 @@ def start_research(
     adapter = plan.adapter
     client = _client(adapter, resolved)
     try:
-        resource = _resource(client, resolved.runtime)
+        # Everything up to ``create`` is local. A failure there sent nothing,
+        # and is reported as that rather than as an unknown remote outcome
+        # (2026-11-18).
+        try:
+            resource = _resource(client, resolved.runtime)
+        except Exception as exc:
+            raise VendorRunFailed(
+                f"research client has no job interface ({type(exc).__name__}); "
+                "nothing was submitted"
+            ) from exc
         if resolved.runtime is Runtime.OPENAI_API:
             from .adapters.openai_api import input_items
 
@@ -204,12 +213,13 @@ def start_research(
                 "store": True,
                 "timeout": timeout,
             }
-        value = resource.create(**params)
-    except Exception as exc:
-        raise VendorRunFailed(
-            f"research submission failed ({type(exc).__name__}); remote submission outcome "
-            "may be unknown. No automatic retry was attempted"
-        ) from exc
+        try:
+            value = resource.create(**params)
+        except Exception as exc:
+            raise VendorRunFailed(
+                f"research submission failed ({type(exc).__name__}); remote submission "
+                "outcome may be unknown. No automatic retry was attempted"
+            ) from exc
     finally:
         if getattr(adapter, "_owns_clients", True):
             with suppress(Exception):
@@ -308,17 +318,28 @@ def _snapshot(job: ResearchJob, receipt: Receipt, data: dict[str, Any]) -> Resea
         citations: list[WebCitation] = []
         searches = 0
         presentation = {}
+        # Shapes read from google-genai 1.73.1 on 2026-11-18. A search call
+        # carries its queries under ``arguments``; a search result carries a
+        # ``result`` list whose entries each hold ``search_suggestions``; and a
+        # dumped text block writes ``"annotations": None`` when it has none.
+        suggestions: list[Any] = []
         for item in data.get("outputs") or []:
             if item.get("type") == "google_search_result":
-                presentation["search_suggestions"] = item.get("search_suggestions")
+                suggestions.extend(
+                    entry["search_suggestions"]
+                    for entry in item.get("result") or []
+                    if isinstance(entry, dict) and entry.get("search_suggestions")
+                )
             if item.get("type") == "google_search_call":
-                searches += len(item.get("queries", []))
+                searches += len((item.get("arguments") or {}).get("queries") or [])
             if item.get("type") == "text":
-                text.append(item.get("text", ""))
-                for citation in item.get("annotations", []):
+                text.append(item.get("text") or "")
+                for citation in item.get("annotations") or []:
                     if citation.get("type") == "url_citation" and citation.get("url"):
                         citations.append(WebCitation(citation["url"], citation.get("title")))
                         sources.append(WebSource(citation["url"], citation.get("title")))
+        if suggestions:
+            presentation["search_suggestions"] = suggestions
         events = [
             WebEvidenceEvent(tuple(sources), tuple(citations), searches, presentation=presentation)
         ]

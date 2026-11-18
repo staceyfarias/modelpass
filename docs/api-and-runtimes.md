@@ -3164,7 +3164,13 @@ sampling/run-log assertions remain unchanged. No live vendor requests were made.
 
 `Bridge.chat`, `ask`, `achat`, `aask` and `preflight` accept
 `web=WebOptions(...)` or a mapping with the same keys. This is an explicit
-request to enable native remote web tools. No local HTTP fetching is added.
+request to enable the runtime's own web tools. modelpass itself fetches
+nothing. On the API runtimes and Codex the tools run on the vendor's side. On
+`anthropic-sdk` they are Claude Code's `WebSearch` and `WebFetch`, and
+**`WebFetch` runs in the local Claude Code process**: it is permitted only for
+the hosts of the URLs in `fetch_urls` (`WebFetch(domain:<host>)` rules), and
+`fetch_urls` refuses `localhost`, single-label and `.local`/`.internal` names,
+and private, loopback or link-local addresses on every runtime.
 
 ```python
 from modelpass import Bridge, WebOptions
@@ -3284,6 +3290,49 @@ Verification record dated 2026-11-17 follows.
 | Anthropic API, Haiku | Attempted with `claude-haiku-4-5`. The SDK client constructor failed with a permission error on the environment's TLS key-log path before a request could be verified. |
 | OpenAI API and Gemini | Intentionally left live-untested at the owner's request. Offline coverage only, including their hosted job lifecycles. |
 | Full test suite | Attempted. It hung in an existing async-handler test while Windows initialized the event loop's loopback socket. A faulthandler trace identified the environment block. Focused synchronous checks were run separately. |
+
+### Review fixes (2026-11-18)
+
+A review of this section's code against the installed SDKs found the offline
+fixtures had mirrored the implementation rather than the vendors' shapes. Fixed,
+each with a test in `tests/test_web.py` or `tests/test_research.py` that failed
+before:
+
+- **Gemini research snapshots.** A text output with no citations raised
+  `TypeError` (the SDK dumps `"annotations": None`). Search queries were read
+  from `queries` instead of `arguments.queries`, so the search count was always
+  zero and every `require_search=True` job read as failed. Search suggestions
+  were read from the wrong level and are now kept from each `result` entry.
+  Shapes read from google-genai 1.73.1.
+- **Gemini GenerateContent evidence.** A grounding chunk that is not a web
+  chunk, or a support without a segment, raised `AttributeError` and ended the
+  run as a failure. A chunk with no web metadata now emits no evidence event,
+  where it emitted an empty one per streamed chunk.
+- **OpenAI Responses.** `external_web_access` is sent only when the caller
+  states `live` or `cached`; `provider_default` sends a bare `web_search` tool.
+  That field and `filters.blocked_domains` are in the vendor's web search guide
+  (read 2026-11-18) and absent from openai 2.32.0's `WebSearchToolParam`, which
+  passes them through untyped. Server acceptance is live-unverified.
+- **Anthropic Messages.** A fetched document's citation keeps its
+  `document_title`. A failed or empty fetch result is an error entry, not a
+  crash.
+- **Claude Agent SDK.** WebSearch results arrive as prose with a JSON list
+  after `Links:`; that list is now read, so `Answer.sources` is populated where
+  it was always `None`. Format read from the CLI bundled with claude-agent-sdk
+  0.2.180. `WebFetch` is allowed per supplied host instead of unrestricted.
+- **`WebOptions`.** `search="off"` with no `fetch_urls` is refused; it used to
+  reach the API runtimes as an empty tool list. Non-public fetch hosts are
+  refused.
+- **Research submission.** A client with no job interface reports that nothing
+  was submitted, where it reported an unknown remote outcome.
+
+Still open from that review, none changed here: the capability notes for these
+cells are one shared sentence rather than per-cell evidence; the refusals in
+`validate_web` do not read the capability table; `receipt.web` carries a fixed
+`live_verification: "untested"`; Codex's enforcement of
+`tools.web_search.allowed_domains` and the shape of its `webSearch` item are
+unverified; and whether a Gemini research agent honours the explicit tool list
+is unproven. Nothing in this section has been run against a live vendor.
 
 The opt-in smoke tests in `tests/live/test_web_live.py` use existing configured
 connections and the low-cost Haiku and Luna models. The test is excluded from
