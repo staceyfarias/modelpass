@@ -3178,7 +3178,13 @@ class Bridge:
         web: WebOptions | Mapping[str, Any] | None = None,
         timeout: float = 30,
     ) -> ResearchJob:
-        """Submit a hosted API research job and return its persistable handle."""
+        """Submit a hosted API research job and return its persistable handle.
+
+        **Unimplemented (2026-11-18): a draft that has never run against a
+        vendor.** See "Research options and their status" in
+        docs/api-and-runtimes.md. For research today, ask on an ordinary web
+        search call.
+        """
         from .research import start_research
 
         return start_research(

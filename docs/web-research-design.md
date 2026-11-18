@@ -140,6 +140,11 @@ can be handed to a documented native surface with observable semantics.
 
 ## Hosted research jobs
 
+**Status, 2026-11-18: unimplemented.** The interface below was written and
+offline-tested for OpenAI Responses and Gemini Interactions, and has never run
+against either. It is recorded as a draft; see "Research options and their
+status" in [api-and-runtimes.md](api-and-runtimes.md).
+
 An ordinary web-enabled turn can already take a research brief and produce a
 report. Add a hosted-job interface when a caller needs to leave and come back
 to a run that the provider continues executing. Start with Gemini Interactions

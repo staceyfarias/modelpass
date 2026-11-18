@@ -3202,8 +3202,8 @@ without promising cache bypass or freshness.
 | `anthropic-sdk` | Yes | Refused | WebFetch | Refused | Refused | Refused |
 | `openai-sdk` | Yes, app-server | Yes | Refused as a separate option | Allowlist, search results only | Refused | Refused |
 | `anthropic-api` | Yes | Refused | Web fetch | Allowlist or blocklist | Yes | Refused |
-| `openai-api` | Yes | Yes | Refused as a separate option | Allowlist or blocklist | Yes | Responses background |
-| `google-api` | Yes | Refused | URL Context | Refused | Yes | Interactions |
+| `openai-api` | Yes | Yes | Refused as a separate option | Allowlist or blocklist | Yes | Unimplemented (Responses background) |
+| `google-api` | Yes | Refused | URL Context | Refused | Yes | Unimplemented (Interactions) |
 | `openai-compatible` | Refused | Refused | Refused | Refused | Refused | Refused |
 
 This table describes implemented mappings held by offline tests. **The
@@ -3254,8 +3254,36 @@ input documents. A completed search observation is distinct from a billable
 query count. Existing token guards retain their existing scope and cannot cap
 remote search fees.
 
-Hosted jobs use a separate lifecycle, available on the two API connections
-shown in the table. These backends are explicitly **live-untested**.
+### Research options and their status (2026-11-18)
+
+**Hosted research jobs are unimplemented.** `start_research`, `get_research`
+and `cancel_research` exist and have offline tests, but neither backend has
+ever completed a real job: there is no OpenAI API credit and no Gemini key to
+drive them with, and this was the part of the web work where review found the
+most defects. Until one has been driven, treat the three methods as a draft,
+not as a feature. Their `research_jobs` capability cells read `unverified`,
+not `supported`, and nothing else in the library depends on them.
+
+| Research option | Status |
+| --- | --- |
+| A research-style question on an ordinary web search call (`ask(..., web=WebOptions(...))`) | **Supported** on `anthropic-sdk`, `openai-sdk` and `anthropic-api`, live-verified 2026-11-18. The model runs several searches and opens pages in one blocking call. |
+| The same on `openai-api` and `google-api` | Offline-tested, live-untested. |
+| Hosted research jobs on `openai-api` (Responses background mode) | **Unimplemented.** Code exists and is offline-tested; it has never run against the vendor. |
+| Hosted research jobs on `google-api` (Interactions Deep Research agents) | **Unimplemented.** As above. |
+| Hosted research jobs on `anthropic-sdk`, `openai-sdk`, `anthropic-api` | **Not supported.** Refused before anything is sent. No hosted job surface is wired for them. |
+| Anything on `openai-compatible`, `google-cli`, `google-sdk` | **Not supported.** Refused. |
+| The vendors' consumer research products (Claude Research, ChatGPT Deep Research) | **Not supported.** Neither is reachable through a subscription runtime or an API modelpass drives. |
+
+What works today for research is the first row: an ordinary web search call.
+In the live drive the Claude subscription ran two searches and Codex ran three
+searches and opened two pages before answering, with no job interface involved.
+It blocks until the answer is ready, so give it a generous `timeout=`.
+
+The rest of this subsection describes the draft job interface as written.
+
+Hosted jobs use a separate lifecycle, on the two API connections shown in the
+table. These backends are **unimplemented in the sense above**: written,
+offline-tested, never run.
 
 ```python
 from modelpass import ResearchJob

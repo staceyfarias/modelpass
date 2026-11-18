@@ -184,13 +184,27 @@ print(answer.text)
 
 Native web activity streams as `WebActivityEvent`. Available native sources and
 citations arrive in `WebEvidenceEvent` and on `Answer.sources` and
-`Answer.citations`. An unsupported control raises before execution. Hosted API
-jobs use `start_research`, `get_research` and `cancel_research`.
+`Answer.citations`. An unsupported control raises before execution.
 
-**Live verification is pending.** The new paths have offline coverage. The
-requested subscription and Anthropic API smoke checks were blocked by the
-verification environment. OpenAI API and Gemini are live-untested. See the
+**Web search is live-verified** (2026-11-18) on the Claude subscription, the
+Codex subscription and the Anthropic API. OpenAI API and Gemini are
+live-untested. See the
 [web contract and verification record](docs/api-and-runtimes.md#native-web-search-and-hosted-research-2026-11-17).
+
+**Hosted research jobs are unimplemented.** `start_research`, `get_research`
+and `cancel_research` exist as a draft with offline tests, but have never run
+against a vendor. For research today, ask a research-style question on an
+ordinary web search call, as above.
+
+| Research option | Status |
+| --- | --- |
+| A research-style question on an ordinary web search call (`ask(..., web=WebOptions(...))`) | **Supported** on `anthropic-sdk`, `openai-sdk` and `anthropic-api`, live-verified 2026-11-18. The model runs several searches and opens pages in one blocking call. |
+| The same on `openai-api` and `google-api` | Offline-tested, live-untested. |
+| Hosted research jobs on `openai-api` (Responses background mode) | **Unimplemented.** Code exists and is offline-tested; it has never run against the vendor. |
+| Hosted research jobs on `google-api` (Interactions Deep Research agents) | **Unimplemented.** As above. |
+| Hosted research jobs on `anthropic-sdk`, `openai-sdk`, `anthropic-api` | **Not supported.** Refused before anything is sent. No hosted job surface is wired for them. |
+| Anything on `openai-compatible`, `google-cli`, `google-sdk` | **Not supported.** Refused. |
+| The vendors' consumer research products (Claude Research, ChatGPT Deep Research) | **Not supported.** Neither is reachable through a subscription runtime or an API modelpass drives. |
 
 ## Install
 

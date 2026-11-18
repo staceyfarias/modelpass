@@ -1,4 +1,10 @@
-"""Explicit hosted research jobs. OpenAI and Gemini backends are live-untested.
+"""Explicit hosted research jobs. **Status: unimplemented** (2026-11-18).
+
+This module is a draft. It has offline tests and has never completed a real job
+on either backend, so it is not a supported feature: the ``research_jobs``
+capability cells read ``unverified``, and docs/api-and-runtimes.md ("Research
+options and their status") says what to use instead -- an ordinary web search
+call, which is live-verified on three runtimes.
 
 Submission, polling and remote cancellation are separate operations. No operation
 retries, changes connection, or starts a local worker to impersonate a hosted job.

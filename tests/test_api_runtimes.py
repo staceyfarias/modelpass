@@ -360,6 +360,13 @@ def test_every_cell_that_is_not_unverified_carries_dated_evidence(runtime):
         assert re.search(r"20\d\d-\d\d-\d\d", note), note
         if registry.support(runtime, capability) is not Support.UNVERIFIED:
             continue
+        if capability is Capability.RESEARCH_JOBS:
+            # No numbered ticket stands behind this one (2026-11-18): hosted
+            # research is a draft recorded as unimplemented, and its note says
+            # what would move it the same way the ticketed cells do.
+            assert "unimplemented" in note
+            assert "recorded live drive" in note
+            continue
         if runtime in DRIVEN:
             # These rows have an adapter, so "nobody has driven it" is no longer
             # the reason any of their cells is open. Each one names its own

@@ -2358,8 +2358,11 @@ _WEB_ROWS = {
     Runtime.ANTHROPIC_SDK: (_S, _S, _N, _N, _N, _N),
     Runtime.OPENAI_SDK: (_S, _N, _N, _S, _S, _N),
     Runtime.ANTHROPIC_API: (_S, _S, _S, _N, _S, _N),
-    Runtime.OPENAI_API: (_S, _N, _S, _S, _S, _S),
-    Runtime.GOOGLE_API: (_S, _S, _S, _N, _N, _S),
+    # research_jobs reads unverified on both, not supported (2026-11-18): the
+    # job code is a draft that has never run against either vendor, and the
+    # feature is recorded as unimplemented.
+    Runtime.OPENAI_API: (_S, _N, _S, _S, _S, _U),
+    Runtime.GOOGLE_API: (_S, _S, _S, _N, _N, _U),
     Runtime.OPENAI_COMPATIBLE: (_N, _N, _N, _N, _N, _N),
     Runtime.GOOGLE_CLI: (_N, _N, _N, _N, _N, _N),
     Runtime.GOOGLE_SDK: (_N, _N, _N, _N, _N, _N),
@@ -2383,6 +2386,14 @@ for _runtime, _cells in _WEB_ROWS.items():
                 f"supported, 2026-11-17, live-verified 2026-11-18: "
                 f"{_WEB_LIVE[_runtime, _cap]} {_evidence} See "
                 "docs/api-and-runtimes.md, Native web search and hosted research"
+            )
+        elif _support is Support.UNVERIFIED:
+            _note = (
+                "unverified, 2026-11-18: unimplemented. A draft exists and is "
+                f"offline-tested, and has never run against the vendor. {_evidence} "
+                "The cell moves with a recorded live drive of a submitted job, "
+                "not before. See docs/api-and-runtimes.md, Research options and "
+                "their status"
             )
         elif _support is Support.SUPPORTED:
             _note = (

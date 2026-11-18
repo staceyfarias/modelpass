@@ -35,6 +35,15 @@ work landed.
   live-untested.
   See the native web section in `docs/api-and-runtimes.md`.
 
+### Changed
+
+- **Hosted research jobs are recorded as unimplemented** (2026-11-18).
+  `start_research`, `get_research` and `cancel_research` remain as a draft with
+  offline tests, but neither backend has run against a vendor, so the
+  `research_jobs` capability cells for `openai-api` and `google-api` now read
+  `unverified` instead of `supported`. The README and the contract list each
+  research option as supported, unimplemented or not supported.
+
 ### Fixed
 
 - From the first live web drive (2026-11-18): a completed URL fetch on the

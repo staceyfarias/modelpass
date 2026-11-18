@@ -674,6 +674,9 @@ def test_every_web_capability_cell_has_its_own_note():
             if support is Support.SUPPORTED:
                 assert "Held by" in note
                 assert ("live-verified 2026-11-18" in note) != ("live-untested" in note)
+            elif support is Support.UNVERIFIED:
+                assert capability is Capability.RESEARCH_JOBS
+                assert "unimplemented" in note
             else:
                 assert "refused" in note or "refuses" in note
     supported_notes = {
@@ -728,9 +731,22 @@ def test_only_the_driven_runtimes_have_live_verified_cells():
             note = registry.note(runtime, capability) or ""
             if "live-verified 2026-11-18" in note:
                 assert runtime in WEB_LIVE_VERIFIED, (runtime.value, capability.value)
-    for capability in (Capability.WEB_SEARCH, Capability.RESEARCH_JOBS):
-        for runtime in (Runtime.OPENAI_API, Runtime.GOOGLE_API):
-            assert "live-untested" in registry.note(runtime, capability)
+    for runtime in (Runtime.OPENAI_API, Runtime.GOOGLE_API):
+        assert "live-untested" in registry.note(runtime, Capability.WEB_SEARCH)
+
+
+def test_hosted_research_is_recorded_as_unimplemented_everywhere():
+    """2026-11-18: a draft that has never run is not a supported capability."""
+    from modelpass.capabilities import CapabilityRegistry, Support
+
+    registry = CapabilityRegistry()
+    for runtime in Runtime:
+        support = registry.support(runtime, Capability.RESEARCH_JOBS)
+        assert support is not Support.SUPPORTED, runtime.value
+        drafted = runtime in (Runtime.OPENAI_API, Runtime.GOOGLE_API)
+        assert support is (Support.UNVERIFIED if drafted else Support.UNSUPPORTED)
+        if drafted:
+            assert "unimplemented" in registry.note(runtime, Capability.RESEARCH_JOBS)
 
 
 def test_a_completed_claude_code_fetch_names_its_url_as_a_source(tmp_path):
