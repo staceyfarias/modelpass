@@ -106,7 +106,21 @@ for event in bridge.chat(connection=older, message="hello"):
     ...
 ```
 
-The result is an ordinary connection held in memory, not saved. For anything
+On the two OpenAI runtimes you can also write `sol`, `astra`, `terra` or `luna`
+wherever a model id goes, on a call or on a connection, in any case:
+
+```python
+bridge.ask("my-account", "hello", model="Sol")                  # newest Sol
+```
+
+It is read against that connection's model list each time, so a connection saved
+with `sol` moves to a newer Sol when the vendor lists one, and the receipt says
+which id was sent. A managed conversation keeps the id it was created with. These
+names set the model only; reasoning stays as the connection or call says. If the
+list cannot answer, the call is refused with `NoSuchModel`. Any other string is
+sent as typed.
+
+The result of `with_model` is an ordinary connection held in memory, not saved. For anything
 beyond a model and a reasoning level, configure it yourself as before: `model`
 and `reasoning` on a stored connection, or `model=` and `sampling=` on a call.
 The Claude subscription runtime has no model list, so there a name is one of

@@ -246,6 +246,9 @@ class ConversationStore:
         """
         selected = self.bridge.store.get(_text(connection, "connection"))
         chosen_model = _text(model if model is not None else selected.model, "model")
+        # A short name is read once, here: a conversation keeps one model for
+        # its life, so a release between two turns must not move it.
+        chosen_model = self.bridge._resolve_model_name(selected, chosen_model)
         _text(title, "title")
         if scope is not None:
             _text(scope, "scope")

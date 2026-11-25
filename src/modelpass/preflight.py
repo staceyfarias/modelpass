@@ -416,6 +416,10 @@ class PreflightPlan:
     #: vendor's own configured default, which is knowledge only the adapter has.
     model: str | None = None
     model_source: str = ""
+    #: What was written where :attr:`model` came from, when modelpass read it as
+    #: a different id (``"sol"`` -> ``"gpt-6.2-sol"``, 2026-11-25). ``""`` when
+    #: the model is sent as written.
+    model_named: str = ""
     #: Whether the connection has any spend threshold in force. Carried on the
     #: plan so the receipt can say "no spend guards configured" without needing
     #: the connection object (D4 amendment, 2026-08-17).

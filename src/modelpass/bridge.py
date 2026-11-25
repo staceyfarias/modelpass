@@ -112,10 +112,12 @@ from .errors import (
     InvalidSchema,
     InvalidSession,
     NoSuchGroup,
+    NoSuchModel,
     RuntimeNotAvailable,
     SubpassError,
     VendorRunFailed,
 )
+from .models import codex_home, models_for, openai_full_id, openai_series
 from .preflight import PreflightPlan, Receipt, plan_launch
 from .prompt_cache import (
     PROMPT_CACHE_MARKER,
@@ -850,6 +852,95 @@ class Bridge:
             cache[key] = result
         return result
 
+    # --- short model names (2026-11-25) ----------------------------------------
+
+    def _resolve_model_name(
+        self,
+        connection: Connection,
+        name: str,
+        options: Mapping[str, Any] | None = None,
+    ) -> str:
+        """The model id to send for what was written where a model goes.
+
+        On the two OpenAI runtimes ``sol``, ``astra``, ``terra`` and ``luna``
+        (any case, also as ``gpt-sol``) mean the newest id of that series in
+        this connection's own model list, and a versioned id of one of them is
+        lower-cased. Everything else, and every other runtime, is returned as
+        written.
+
+        The subscription list is a local file. An API list this Bridge has not
+        fetched is requested here, model metadata only; a disabled connection is
+        asked nothing and keeps the name. Raises
+        :class:`~modelpass.errors.NoSuchModel` when the list cannot say which id
+        the name means, before anything runs.
+        """
+        if connection.runtime not in (Runtime.OPENAI_SDK, Runtime.OPENAI_API):
+            return name
+        series = openai_series(name)
+        if series is None:
+            return openai_full_id(name) or name
+        if connection.runtime is Runtime.OPENAI_SDK:
+            root = (
+                (options or {}).get("codex_home")
+                or connection.config_dir
+                or codex_home(dict(self.env))
+            )
+            catalogue = models_for(connection.runtime, codex_root=root)
+        else:
+            if not connection.enabled and self._needs_model_list(connection, name):
+                return name
+            catalogue = self._models(connection, refresh=False, timeout=15.0)
+            if catalogue.source == "not fetched":
+                catalogue = self._models(connection, refresh=True, timeout=15.0)
+        if series not in catalogue.series():
+            why = catalogue.problem or f"{catalogue.source} lists no {series} model"
+            raise NoSuchModel(
+                f"{name!r} means the newest {series} model, and none could be "
+                f"picked: {why}. Pass the full model id instead"
+            )
+        return catalogue.resolve(series).id
+
+    def _needs_model_list(self, connection: Connection, name: str | None) -> bool:
+        """Whether reading ``name`` would take a request to the vendor."""
+        return (
+            connection.runtime is Runtime.OPENAI_API
+            and openai_series(name or "") is not None
+            and repr(connection) not in getattr(self, "_model_catalogues", {})
+        )
+
+    def _with_resolved_model(
+        self,
+        connection: Connection,
+        plan: PreflightPlan,
+        options: Mapping[str, Any] | None,
+    ) -> tuple[Connection, PreflightPlan]:
+        """The request's connection and plan, both carrying the id to be sent.
+
+        The plan remembers what was written, for the receipt and for a failover.
+        The connection here is this request's copy; the stored one keeps the
+        name, so a later run picks up a newer release.
+        """
+        written = plan.model
+        if not written:
+            return connection, plan
+        resolved = self._resolve_model_name(connection, written, options)
+        if resolved == written:
+            return connection, plan
+        if connection.model == written:
+            connection = replace(connection, model=resolved)
+        return connection, replace(plan, model=resolved, model_named=written)
+
+    @staticmethod
+    def _with_model_name_disclosure(
+        request: RunRequest | SessionRequest, receipt: Receipt
+    ) -> Receipt:
+        written, sent = request.plan.model_named, request.plan.model
+        if not written:
+            return receipt
+        newest = ", the newest in its series" if openai_series(written) else ""
+        note = f"model {written!r} was read as {sent!r}{newest}"
+        return replace(receipt, notes=(*receipt.notes, note))
+
     def groups(self) -> tuple[Group, ...]:
         """Every group, with its membership, in name order.
 
@@ -1033,6 +1124,12 @@ class Bridge:
         )
         plan = plan_launch(resolved, self.env)
         chosen = model or plan.model
+        unread = ""
+        try:
+            if chosen:
+                chosen = self._resolve_model_name(resolved, chosen)
+        except NoSuchModel as exc:
+            unread = str(exc)
         request = RunRequest(connection=resolved, messages=(), plan=plan, model=chosen)
         answer = partial(
             InputSupport,
@@ -1041,6 +1138,8 @@ class Bridge:
             model=chosen,
             carries_files=carries_files,
         )
+        if unread:
+            return answer(queried=False, detail=unread)
         try:
             inputs = adapter.input_modalities(request)
         except Exception as exc:
@@ -1125,6 +1224,7 @@ class Bridge:
             receipt = self._with_recorded_identity(
                 resolved, adapter.preflight(request)
             )
+        receipt = self._with_model_name_disclosure(request, receipt)
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
         receipt = self._with_documents(request, receipt)
@@ -2006,6 +2106,7 @@ class Bridge:
             schema_name=schema_name,
             timeout=timeout,
             web=web,
+            defer_model_list=True,
         )
         return self._astream(plan)
 
@@ -2466,6 +2567,8 @@ class Bridge:
             tools=(),
             mcp_servers={},
             options=listing_options,
+            # A listing runs no model, so a name is not looked up for it.
+            read_model_name=False,
         )
         return list(adapter.list_sessions(request))
 
@@ -2678,6 +2781,7 @@ class Bridge:
         # above: a worker's prefix starts with the runtime's own preset, and
         # only the session request carries the prompt semantics that say so.
         receipt = self._with_recorded_identity(resolved, receipt)
+        receipt = self._with_model_name_disclosure(request, receipt)
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
         receipt = self._with_reasoning_disclosure(request, receipt)
@@ -2975,6 +3079,7 @@ class Bridge:
         resume_id: str | None = None,
         schema: Mapping[str, Any] | None = None,
         schema_name: str = "",
+        read_model_name: bool = True,
     ) -> SessionRequest:
         """The session analogue of :meth:`_build_request`, with the same guarantees.
 
@@ -2993,6 +3098,8 @@ class Bridge:
         plan.require_credential()
         if model:
             plan = replace(plan, model=model, model_source="requested for this session")
+        if read_model_name:
+            connection, plan = self._with_resolved_model(connection, plan, options)
         markers = (system_prompt or "").count(PROMPT_CACHE_MARKER)
         return SessionRequest(
             connection=connection,
@@ -3134,6 +3241,7 @@ class Bridge:
         schema: Mapping[str, Any] | None = None,
         schema_name: str = "",
         web: WebOptions | None = None,
+        read_model_name: bool = True,
     ) -> RunRequest:
         if connection.auth_mode not in runtime_auth_modes(connection.runtime, self.registry):
             raise AuthModeMismatch(
@@ -3149,6 +3257,8 @@ class Bridge:
             # point of putting a model on the receipt is that a rejected model is
             # diagnosable from what was printed before the run.
             plan = replace(plan, model=model, model_source=_CALL_MODEL_SOURCE)
+        if read_model_name:
+            connection, plan = self._with_resolved_model(connection, plan, options)
         connection, sampling = _with_call_reasoning(connection, sampling, self.registry)
         sampling = _with_standing_reasoning(connection, sampling)
         arranged, cache_notes = arrange_prompt_cache(messages, connection, self.registry)
@@ -3306,14 +3416,19 @@ class Bridge:
         schema_name: str | None = None,
         timeout: Timeout | float | None = None,
         web: WebOptions | Mapping[str, Any] | None = None,
+        defer_model_list: bool = False,
     ) -> _CallPlan:
-        """The half of the pipeline that touches nothing outside this process.
+        """The half of the pipeline that starts nothing outside this process.
 
         Resolution, the enabled check, message assembly, tool normalisation, the
         capability gates, schema normalisation, the auth-mode assertion, the
         call's guards and its failover target, and the request itself. Every
         refusal here is a caller mistake, and a caller mistake should never
         reach the point of launching a runtime.
+
+        One exception since 2026-11-25: a short model name on an ``openai-api``
+        connection whose list is not cached needs that list. ``achat`` passes
+        ``defer_model_list`` and reads it off the loop instead.
         """
         resolved = self._resolve(connection)
         # Before anything else: a connection taken out of service refuses runs,
@@ -3451,6 +3566,10 @@ class Bridge:
             schema=normalized_schema,
             schema_name=resolved_schema_name,
             web=call_web,
+            read_model_name=not (
+                defer_model_list
+                and self._needs_model_list(resolved, model or resolved.model)
+            ),
         )
 
         return _CallPlan(
@@ -3495,6 +3614,7 @@ class Bridge:
         _note = self._option_note(adapter, request.options)
         if _note is not None:
             receipt = replace(receipt, notes=(*receipt.notes, _note))
+        receipt = self._with_model_name_disclosure(request, receipt)
         receipt = self._with_cache_disclosure(adapter, request, receipt)
         receipt = self._with_cache_breakpoints(request, receipt)
         receipt = self._with_documents(request, receipt)
@@ -3634,6 +3754,18 @@ class Bridge:
         Line for line :meth:`_stream`, and that is the point -- what differs is
         how an iterator is driven, which is the only thing either pump knows.
         """
+        request = plan.request
+        if self._needs_model_list(request.connection, request.plan.model):
+            connection, launch = await asyncio.to_thread(
+                self._with_resolved_model,
+                request.connection,
+                request.plan,
+                request.options,
+            )
+            request = replace(
+                request, connection=connection, plan=launch, model=launch.model
+            )
+            plan = replace(plan, request=request)
         receipt = await self._areceipt_for(plan)
         prepared = plan.prepared(receipt)
         deadline = Deadline(prepared.timeout) if prepared.timeout else None
@@ -3691,7 +3823,12 @@ class Bridge:
         target = call.failover
         if (
             target is not None
-            and target.runtime not in API_RUNTIMES
+            # openai-api too: the second leg may have to request a model list
+            # before it can read a short name.
+            and (
+                target.runtime not in API_RUNTIMES
+                or target.runtime is Runtime.OPENAI_API
+            )
             and call.failover_due()
         ):
             return await asyncio.to_thread(call.advance)
@@ -3873,8 +4010,12 @@ class Bridge:
         # model lands, and that used to cross too: the target ran a model from
         # somebody else's connection, and its receipt called it "requested for
         # this call". The target's own model is the target's to choose.
+        # A short name crosses as written, so the target reads it against its
+        # own list rather than inheriting the first account's answer.
         caller_model = (
-            primary.model if primary.plan.model_source == _CALL_MODEL_SOURCE else None
+            primary.plan.model_named or primary.model
+            if primary.plan.model_source == _CALL_MODEL_SOURCE
+            else None
         )
         carried = caller_model if target.runtime is origin.runtime else None
         # Passed as an override only when it differs from what the target would

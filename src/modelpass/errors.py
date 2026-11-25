@@ -296,9 +296,11 @@ class NoSuchModel(SubpassError, ValueError):
     """A model name or version does not pick a model from a catalogue.
 
     Raised by :meth:`~modelpass.models.ModelCatalogue.resolve` and
-    :meth:`~modelpass.bridge.Bridge.with_model` (2026-11-18). An argument
-    problem, so also a ``ValueError`` -- nothing in a config file is wrong.
-    The message lists what the catalogue does offer.
+    :meth:`~modelpass.bridge.Bridge.with_model` (2026-11-18), whose message
+    lists what the catalogue does offer. Also raised, since 2026-11-25, by any
+    call that names ``sol``, ``astra``, ``terra`` or ``luna`` where the
+    connection's model list cannot say which id that is. An argument problem,
+    so also a ``ValueError``.
     """
 
 

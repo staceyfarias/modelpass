@@ -77,11 +77,14 @@ __all__ = [
     "ANTHROPIC_ALIASES",
     "CODEX_MODELS_CACHE",
     "MODEL_VERSIONS",
+    "OPENAI_SHORT_NAMES",
     "ModelCatalogue",
     "ModelChoice",
     "ModelName",
     "codex_home",
     "models_for",
+    "openai_full_id",
+    "openai_series",
     "parse_model_id",
 ]
 
@@ -103,6 +106,29 @@ ANTHROPIC_ALIASES: tuple[tuple[str, str], ...] = (
     ("opus", "Opus (alias)"),
     ("haiku", "Haiku (alias)"),
 )
+
+#: The OpenAI series a caller may name where a model id goes (2026-11-25), in any
+#: case, bare or as ``gpt-<name>``. A closed list on purpose: any other string is
+#: a model id and is sent as typed.
+OPENAI_SHORT_NAMES: tuple[str, ...] = ("sol", "astra", "terra", "luna")
+
+_SHORT = "|".join(OPENAI_SHORT_NAMES)
+_OPENAI_SHORT = re.compile(rf"(?:gpt-)?({_SHORT})", re.IGNORECASE)
+_OPENAI_FULL = re.compile(
+    rf"gpt-\d{{1,2}}(?:\.\d{{1,2}})*-(?:{_SHORT})(?:-\d{{8}})?", re.IGNORECASE
+)
+
+
+def openai_series(name: str) -> str | None:
+    """The series a short name means (``"Sol"`` -> ``"gpt-sol"``), else ``None``."""
+    match = _OPENAI_SHORT.fullmatch(name.strip())
+    return f"gpt-{match.group(1).lower()}" if match else None
+
+
+def openai_full_id(name: str) -> str | None:
+    """A versioned id of one of those series, lower-cased, else ``None``."""
+    wanted = name.strip()
+    return wanted.lower() if _OPENAI_FULL.fullmatch(wanted) else None
 
 
 @dataclass(frozen=True, slots=True)

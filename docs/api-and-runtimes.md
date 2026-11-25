@@ -3141,6 +3141,37 @@ resolution and `with_model`. No generation was requested. No capability cell
 changed. The OpenAI API and Gemini lists were not read; their ids are covered
 by parser cases only.
 
+### Short OpenAI names as model ids (2026-11-25)
+
+`sol`, `astra`, `terra` and `luna` are accepted wherever a model id goes on
+`openai-sdk` and `openai-api`: `model=` on a call, a session, `preflight`,
+`input_support` or `start_research`, and a connection's `model` key.
+
+- Case and surrounding space are ignored, and `gpt-sol` means `sol`. A
+  versioned id of one of the four series (`GPT-6.1-Sol`) is lower-cased and
+  keeps its version. Every other string, and every other runtime, is sent as
+  written.
+- A short name is the newest version of that series in the connection's own
+  list, by the reading of ids described above. `openai-sdk` reads the Codex
+  cache file. `openai-api` uses the list this Bridge holds and requests it
+  once, metadata only, if it holds none; `achat` and `aask` make that request
+  off the event loop. A disabled connection is asked nothing and keeps the name.
+- The request, its receipt and its run log line carry the id. The receipt adds
+  the note `model 'Sol' was read as 'gpt-6.2-sol', the newest in its series`.
+  The stored connection keeps the name.
+- A managed conversation reads the name once, when it is created, and stores
+  the id.
+- A failover on the same runtime reads a name given on the call against the
+  target's own list.
+- When the list is missing, unreadable or has no such series, the call raises
+  `NoSuchModel` before the preflight. `input_support` reports it in `detail`,
+  and a failover reports it on the first leg's terminal.
+
+Evidence: offline tests in `tests/test_model_names.py`. The `openai-sdk` list
+was also read on 2026-11-25 from a cache written by codex 0.171.0. The OpenAI
+API list was not read live. No generation was requested, so no id was shown to
+be accepted by a vendor, and no capability cell changed.
+
 
 ### Subscription desktop-chat verification (2026-11-01)
 
