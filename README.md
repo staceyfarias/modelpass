@@ -106,19 +106,22 @@ for event in bridge.chat(connection=older, message="hello"):
     ...
 ```
 
-On the two OpenAI runtimes you can also write `sol`, `astra`, `terra` or `luna`
-wherever a model id goes, on a call or on a connection, in any case:
+You can also write a short name wherever a model id goes, on a call or on a
+connection, in any case: `sol`, `astra`, `terra` or `luna` on the OpenAI
+runtimes, and `haiku`, `sonnet`, `opus` or `fable` on the Anthropic ones.
 
 ```python
-bridge.ask("my-account", "hello", model="Sol")                  # newest Sol
+bridge.ask("my-openai", "hello", model="Sol")                   # newest Sol
+bridge.ask("my-claude-api", "hello", model="Opus")              # newest Opus
 ```
 
 It is read against that connection's model list each time, so a connection saved
 with `sol` moves to a newer Sol when the vendor lists one, and the receipt says
-which id was sent. A managed conversation keeps the id it was created with. These
-names set the model only; reasoning stays as the connection or call says. If the
-list cannot answer, the call is refused with `NoSuchModel`. Any other string is
-sent as typed.
+which id was sent. A managed conversation keeps the id it was created with. The
+Claude subscription has no model list: it is sent the lower-case alias, and the
+Claude Code runtime picks the model. These names set the model only; reasoning
+stays as the connection or call says. If a list cannot answer, the call is
+refused with `NoSuchModel`. Any other string is sent as typed.
 
 The result of `with_model` is an ordinary connection held in memory, not saved. For anything
 beyond a model and a reasoning level, configure it yourself as before: `model`

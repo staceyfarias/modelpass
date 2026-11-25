@@ -1,12 +1,14 @@
-"""``sol``, ``astra``, ``terra`` and ``luna`` as model names (2026-11-25).
+"""Short series names as model names (2026-11-25).
 
-A caller or a connection may name one of these OpenAI series where a model id
-goes, in any case. modelpass sends the newest id of that series from the
-connection's own model list, and the receipt says which name became which id.
-Everything else is sent as typed.
+A caller or a connection may write ``sol``, ``astra``, ``terra`` or ``luna`` on
+an OpenAI runtime, or ``haiku``, ``sonnet``, ``opus`` or ``fable`` on an
+Anthropic one, where a model id goes, in any case. Where modelpass has a model
+list it sends the newest id of that series; the Claude subscription has none, so
+there the lower-cased alias goes to the runtime to resolve. The receipt says
+what was written and what was sent. Everything else is sent as typed.
 
 All offline: the Codex list is a cache file in a temporary directory and the API
-list comes from a fake client.
+lists come from fake clients.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from types import SimpleNamespace as Obj
 import pytest
 
 from modelpass import Bridge, Connection, CredentialRef, NoSuchModel, Runtime
+from modelpass.adapters.anthropic_api import AnthropicAPIAdapter
 from modelpass.adapters.openai_api import OpenAIAPIAdapter
 from modelpass.connections import Guards, QuotaAction, QuotaPolicy
 from modelpass.store import ConnectionStore
@@ -108,8 +111,8 @@ def test_any_other_name_is_sent_as_typed(tmp_path, name):
 def test_another_runtime_keeps_the_name(tmp_path):
     adapter = FakeAdapter(runtime=Runtime.ANTHROPIC_SDK)
     bridge = bridge_with(tmp_path, adapter, runtime=Runtime.ANTHROPIC_SDK)
-    connection = Connection(name="c", runtime=Runtime.ANTHROPIC_SDK, auth_mode="subscription")
-    assert bridge.preflight(connection, model="sol").model == "sol"
+    assert bridge.preflight(claude(), model="Sol").model == "Sol"
+    assert bridge_with(tmp_path).preflight(codex(tmp_path), model="Opus").model == "Opus"
 
 
 @pytest.mark.parametrize("slugs", [None, ("gpt-6-astra",)])
@@ -250,3 +253,98 @@ def test_achat_reads_the_api_list_off_the_event_loop(tmp_path):
     assert seen == ["off the loop"]
     assert adapter.requests[0].model == "gpt-6.2-sol"
     assert events[0].receipt.model == "gpt-6.2-sol"
+
+
+# --- the Claude names ----------------------------------------------------------------
+
+CLAUDE = (
+    "claude-fable-5-2", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5",
+    "claude-fable-5-1", "claude-opus-5", "claude-sonnet-5",
+    "claude-opus-4-5-20251101", "claude-haiku-4-5-20251001",
+)
+
+
+def claude(**extra):
+    return Connection(name="c", runtime=Runtime.ANTHROPIC_SDK,
+                      auth_mode="subscription", **extra)
+
+
+@pytest.mark.parametrize("name,sent", [
+    ("Haiku", "haiku"),
+    ("SONNET", "sonnet"),
+    ("oPuS", "opus"),
+    (" Fable ", "fable"),
+    ("claude-opus", "opus"),
+    ("Claude-Haiku", "haiku"),
+    ("Claude-Opus-5-5", "claude-opus-5-5"),
+    ("CLAUDE-HAIKU-4-5-20251001", "claude-haiku-4-5-20251001"),
+    ("opus", "opus"),
+    ("Claude-Next", "Claude-Next"),
+])
+def test_the_subscription_gets_the_lower_cased_alias(tmp_path, name, sent):
+    adapter = FakeAdapter(runtime=Runtime.ANTHROPIC_SDK)
+    bridge = bridge_with(tmp_path, adapter, runtime=Runtime.ANTHROPIC_SDK)
+    list(bridge.chat(connection=claude(), message="x", model=name))
+    assert adapter.requests[0].model == sent
+    notes = bridge.preflight(claude(), model=name).notes
+    assert not any("newest" in note for note in notes)
+    assert any("was read as" in note for note in notes) is (name != sent)
+
+
+def test_a_claude_name_on_a_subscription_connection_is_lower_cased(tmp_path):
+    adapter = FakeAdapter(runtime=Runtime.ANTHROPIC_SDK)
+    bridge = bridge_with(tmp_path, adapter, runtime=Runtime.ANTHROPIC_SDK)
+    list(bridge.chat(connection=claude(model="Opus"), message="x"))
+    assert adapter.requests[0].connection.model == "opus"
+
+
+class _AnthropicAdapter(FakeAdapter):
+    def __init__(self, client):
+        super().__init__(runtime=Runtime.ANTHROPIC_API)
+        self.lister = AnthropicAPIAdapter(
+            client_factory=lambda **_: client, env={"KEY": "k"}
+        )
+
+    def list_models(self, connection, *, timeout):
+        return self.lister.list_models(connection, timeout=timeout)
+
+
+def anthropic_api(**extra):
+    return Connection(name="a", runtime=Runtime.ANTHROPIC_API, auth_mode="api_key",
+                      credential_ref=CredentialRef.parse("env:KEY"), **extra)
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("Haiku", "claude-haiku-5-5"),
+    ("sonnet", "claude-sonnet-5-5"),
+    ("OPUS", "claude-opus-5-5"),
+    ("Fable", "claude-fable-5-2"),
+    ("claude-opus", "claude-opus-5-5"),
+    ("Claude-Opus-5", "claude-opus-5"),
+])
+def test_a_claude_name_on_the_api_is_sent_as_the_newest_id(tmp_path, name, expected):
+    adapter = _AnthropicAdapter(_Client(CLAUDE))
+    bridge = bridge_with(tmp_path, adapter, Runtime.ANTHROPIC_API, env={"KEY": "k"})
+    list(bridge.chat(connection=anthropic_api(), message="x", model=name))
+    assert adapter.requests[0].model == expected
+
+
+def test_achat_resolves_a_claude_api_name(tmp_path):
+    adapter = _AnthropicAdapter(_Client(CLAUDE))
+    bridge = bridge_with(tmp_path, adapter, Runtime.ANTHROPIC_API, env={"KEY": "k"})
+
+    async def drive():
+        return [e async for e in bridge.achat(
+            connection=anthropic_api(model="Opus"), message="x"
+        )]
+
+    events = asyncio.run(drive())
+    assert events[0].receipt.model == "claude-opus-5-5"
+    assert any("'Opus'" in n and "newest" in n for n in events[0].receipt.notes)
+
+
+def test_a_claude_name_the_api_list_lacks_is_refused(tmp_path):
+    adapter = _AnthropicAdapter(_Client(("claude-opus-5-5",)))
+    bridge = bridge_with(tmp_path, adapter, Runtime.ANTHROPIC_API, env={"KEY": "k"})
+    with pytest.raises(NoSuchModel, match=r"'haiku'.*full model id"):
+        bridge.chat(connection=anthropic_api(), message="x", model="haiku")

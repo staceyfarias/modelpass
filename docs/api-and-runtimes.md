@@ -3141,36 +3141,44 @@ resolution and `with_model`. No generation was requested. No capability cell
 changed. The OpenAI API and Gemini lists were not read; their ids are covered
 by parser cases only.
 
-### Short OpenAI names as model ids (2026-11-25)
+### Short model names as model ids (2026-11-25)
 
-`sol`, `astra`, `terra` and `luna` are accepted wherever a model id goes on
-`openai-sdk` and `openai-api`: `model=` on a call, a session, `preflight`,
-`input_support` or `start_research`, and a connection's `model` key.
+A short series name is accepted wherever a model id goes: `model=` on a call, a
+session, `preflight`, `input_support` or `start_research`, and a connection's
+`model` key.
 
-- Case and surrounding space are ignored, and `gpt-sol` means `sol`. A
-  versioned id of one of the four series (`GPT-6.1-Sol`) is lower-cased and
-  keeps its version. Every other string, and every other runtime, is sent as
-  written.
-- A short name is the newest version of that series in the connection's own
-  list, by the reading of ids described above. `openai-sdk` reads the Codex
-  cache file. `openai-api` uses the list this Bridge holds and requests it
-  once, metadata only, if it holds none; `achat` and `aask` make that request
+| Runtime | Names | What is sent |
+|---|---|---|
+| `openai-sdk`, `openai-api` | `sol`, `astra`, `terra`, `luna` (also `gpt-sol`) | the newest id of the series in the connection's list |
+| `anthropic-api` | `haiku`, `sonnet`, `opus`, `fable` (also `claude-opus`) | the newest id of the series in the connection's list |
+| `anthropic-sdk` | the same four | the bare lower-case alias; the runtime picks the model |
+
+- Case and surrounding space are ignored. A versioned id of one of these series
+  (`GPT-6.1-Sol`, `Claude-Opus-5-5`) is lower-cased and keeps its version. A
+  name from the other vendor, every other string, and every other runtime is
+  sent as written.
+- "Newest" is by the reading of ids described above. `openai-sdk` reads the
+  Codex cache file. An API runtime uses the list this Bridge holds and requests
+  it once, metadata only, if it holds none; `achat` and `aask` make that request
   off the event loop. A disabled connection is asked nothing and keeps the name.
-- The request, its receipt and its run log line carry the id. The receipt adds
-  the note `model 'Sol' was read as 'gpt-6.2-sol', the newest in its series`.
-  The stored connection keeps the name.
+- The request, its receipt and its run log line carry what was sent. When that
+  differs from what was written, the receipt adds a note such as `model 'Sol'
+  was read as 'gpt-6.2-sol', the newest in its series`. On `anthropic-sdk` the
+  note stops after the alias, because modelpass chose no model. The stored
+  connection keeps the name.
 - A managed conversation reads the name once, when it is created, and stores
-  the id.
+  the result: an id, or on `anthropic-sdk` the alias, which that runtime may
+  later resolve to a newer model.
 - A failover on the same runtime reads a name given on the call against the
   target's own list.
-- When the list is missing, unreadable or has no such series, the call raises
+- When a list is missing, unreadable or has no such series, the call raises
   `NoSuchModel` before the preflight. `input_support` reports it in `detail`,
   and a failover reports it on the first leg's terminal.
 
 Evidence: offline tests in `tests/test_model_names.py`. The `openai-sdk` list
-was also read on 2026-11-25 from a cache written by codex 0.171.0. The OpenAI
-API list was not read live. No generation was requested, so no id was shown to
-be accepted by a vendor, and no capability cell changed.
+was also read on 2026-11-25 from a cache written by codex 0.171.0. Neither API
+list was read live for this change. No generation was requested, so nothing was
+shown to be accepted by a vendor, and no capability cell changed.
 
 
 ### Subscription desktop-chat verification (2026-11-01)

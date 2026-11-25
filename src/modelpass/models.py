@@ -75,6 +75,7 @@ from .runtimes import Runtime
 
 __all__ = [
     "ANTHROPIC_ALIASES",
+    "ANTHROPIC_SHORT_NAMES",
     "CODEX_MODELS_CACHE",
     "MODEL_VERSIONS",
     "OPENAI_SHORT_NAMES",
@@ -82,10 +83,10 @@ __all__ = [
     "ModelChoice",
     "ModelName",
     "codex_home",
+    "full_model_id",
     "models_for",
-    "openai_full_id",
-    "openai_series",
     "parse_model_id",
+    "short_series",
 ]
 
 #: The two answers ``Bridge.models(..., versions=)`` takes. ``"latest"`` is the
@@ -107,28 +108,65 @@ ANTHROPIC_ALIASES: tuple[tuple[str, str], ...] = (
     ("haiku", "Haiku (alias)"),
 )
 
-#: The OpenAI series a caller may name where a model id goes (2026-11-25), in any
-#: case, bare or as ``gpt-<name>``. A closed list on purpose: any other string is
-#: a model id and is sent as typed.
+#: The series a caller may name where a model id goes (2026-11-25), in any case,
+#: bare or with the vendor's prefix (``gpt-sol``, ``claude-opus``). Closed lists
+#: on purpose: any other string is a model id and is sent as typed.
 OPENAI_SHORT_NAMES: tuple[str, ...] = ("sol", "astra", "terra", "luna")
+ANTHROPIC_SHORT_NAMES: tuple[str, ...] = tuple(a for a, _ in ANTHROPIC_ALIASES)
 
-_SHORT = "|".join(OPENAI_SHORT_NAMES)
-_OPENAI_SHORT = re.compile(rf"(?:gpt-)?({_SHORT})", re.IGNORECASE)
-_OPENAI_FULL = re.compile(
-    rf"gpt-\d{{1,2}}(?:\.\d{{1,2}})*-(?:{_SHORT})(?:-\d{{8}})?", re.IGNORECASE
+
+def _spellings(
+    prefix: str, names: tuple[str, ...], versioned: str
+) -> tuple[str, re.Pattern[str], re.Pattern[str]]:
+    """One vendor's prefix, short-name pattern and versioned-id pattern."""
+    group = "|".join(names)
+    return (
+        prefix,
+        re.compile(rf"(?:{prefix}-)?({group})", re.IGNORECASE),
+        re.compile(
+            rf"{prefix}-{versioned.replace('NAMES', group)}(?:-\d{{8}})?",
+            re.IGNORECASE,
+        ),
+    )
+
+
+# OpenAI writes the version before the name (``gpt-6.2-sol``), Anthropic after it
+# (``claude-opus-5-5``).
+_OPENAI = _spellings(
+    "gpt", OPENAI_SHORT_NAMES, r"\d{1,2}(?:\.\d{1,2})*-(?:NAMES)"
 )
+_ANTHROPIC = _spellings(
+    "claude", ANTHROPIC_SHORT_NAMES, r"(?:NAMES)(?:-\d{1,2})+"
+)
+_NAMED_RUNTIMES = {
+    Runtime.OPENAI_SDK: _OPENAI,
+    Runtime.OPENAI_API: _OPENAI,
+    Runtime.ANTHROPIC_SDK: _ANTHROPIC,
+    Runtime.ANTHROPIC_API: _ANTHROPIC,
+}
 
 
-def openai_series(name: str) -> str | None:
-    """The series a short name means (``"Sol"`` -> ``"gpt-sol"``), else ``None``."""
-    match = _OPENAI_SHORT.fullmatch(name.strip())
-    return f"gpt-{match.group(1).lower()}" if match else None
+def short_series(runtime: Runtime, name: str) -> str | None:
+    """The series a short name means on this runtime, else ``None``.
+
+    ``"Sol"`` is ``"gpt-sol"`` on an OpenAI runtime and ``"Opus"`` is
+    ``"claude-opus"`` on an Anthropic one; neither means anything on the other.
+    """
+    spelling = _NAMED_RUNTIMES.get(runtime)
+    if spelling is None:
+        return None
+    prefix, short, _ = spelling
+    match = short.fullmatch(name.strip())
+    return f"{prefix}-{match.group(1).lower()}" if match else None
 
 
-def openai_full_id(name: str) -> str | None:
+def full_model_id(runtime: Runtime, name: str) -> str | None:
     """A versioned id of one of those series, lower-cased, else ``None``."""
+    spelling = _NAMED_RUNTIMES.get(runtime)
     wanted = name.strip()
-    return wanted.lower() if _OPENAI_FULL.fullmatch(wanted) else None
+    if spelling is None or not spelling[2].fullmatch(wanted):
+        return None
+    return wanted.lower()
 
 
 @dataclass(frozen=True, slots=True)

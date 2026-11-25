@@ -14,15 +14,18 @@ work landed.
 
 ### Added
 
-- **`sol`, `astra`, `terra` and `luna` work wherever a model id goes**
-  (2026-11-25), in any case, bare or as `gpt-sol`, on `openai-sdk` and
-  `openai-api`. Each is sent as the newest id of its series in the connection's
-  own model list, and the receipt says which name became which id. A versioned
-  id of one of these series is accepted in any case. A name the list cannot
-  answer raises `NoSuchModel` before anything runs; it used to be sent to the
-  vendor as typed. On `openai-api` the first such name requests the model list,
-  metadata only. `PreflightPlan.model_named` is new, as are
-  `modelpass.models.OPENAI_SHORT_NAMES`, `openai_series` and `openai_full_id`.
+- **Short model names work wherever a model id goes** (2026-11-25), in any
+  case: `sol`, `astra`, `terra` and `luna` on `openai-sdk` and `openai-api`;
+  `haiku`, `sonnet`, `opus` and `fable` on `anthropic-sdk` and `anthropic-api`.
+  `gpt-sol` and `claude-opus` mean the same. Where the connection has a model
+  list, each is sent as the newest id of its series and the receipt says which
+  name became which id. `anthropic-sdk` has no list, so it is sent the
+  lower-case alias. A versioned id of one of these series is accepted in any
+  case. A name the list cannot answer raises `NoSuchModel` before anything
+  runs; it used to be sent to the vendor as typed. On the API runtimes the first
+  such name requests the model list, metadata only. `PreflightPlan.model_named`
+  is new, as are `modelpass.models.OPENAI_SHORT_NAMES`,
+  `ANTHROPIC_SHORT_NAMES`, `short_series` and `full_model_id`.
 - Picking a model by name (2026-11-18). `Bridge.with_model(connection, name,
   version=None, reasoning=...)` returns an unsaved connection set to that model,
   with reasoning defaulting to `medium` where the runtime has an effort control.

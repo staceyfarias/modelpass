@@ -117,7 +117,7 @@ from .errors import (
     SubpassError,
     VendorRunFailed,
 )
-from .models import codex_home, models_for, openai_full_id, openai_series
+from .models import codex_home, full_model_id, models_for, short_series
 from .preflight import PreflightPlan, Receipt, plan_launch
 from .prompt_cache import (
     PROMPT_CACHE_MARKER,
@@ -862,23 +862,26 @@ class Bridge:
     ) -> str:
         """The model id to send for what was written where a model goes.
 
-        On the two OpenAI runtimes ``sol``, ``astra``, ``terra`` and ``luna``
-        (any case, also as ``gpt-sol``) mean the newest id of that series in
-        this connection's own model list, and a versioned id of one of them is
+        ``sol``, ``astra``, ``terra`` and ``luna`` on the OpenAI runtimes, and
+        ``haiku``, ``sonnet``, ``opus`` and ``fable`` on the Anthropic ones
+        (any case, also as ``gpt-sol`` or ``claude-opus``), mean the newest id
+        of that series in this connection's own model list. ``anthropic-sdk``
+        has no list, so there the answer is the bare lower-case alias, which
+        the runtime resolves. A versioned id of one of these series is
         lower-cased. Everything else, and every other runtime, is returned as
         written.
 
-        The subscription list is a local file. An API list this Bridge has not
-        fetched is requested here, model metadata only; a disabled connection is
-        asked nothing and keeps the name. Raises
+        The Codex list is a local file. An API list this Bridge has not fetched
+        is requested here, model metadata only; a disabled connection is asked
+        nothing and keeps the name. Raises
         :class:`~modelpass.errors.NoSuchModel` when the list cannot say which id
         the name means, before anything runs.
         """
-        if connection.runtime not in (Runtime.OPENAI_SDK, Runtime.OPENAI_API):
-            return name
-        series = openai_series(name)
+        series = short_series(connection.runtime, name)
         if series is None:
-            return openai_full_id(name) or name
+            return full_model_id(connection.runtime, name) or name
+        if connection.runtime is Runtime.ANTHROPIC_SDK:
+            return series.removeprefix("claude-")
         if connection.runtime is Runtime.OPENAI_SDK:
             root = (
                 (options or {}).get("codex_home")
@@ -903,8 +906,8 @@ class Bridge:
     def _needs_model_list(self, connection: Connection, name: str | None) -> bool:
         """Whether reading ``name`` would take a request to the vendor."""
         return (
-            connection.runtime is Runtime.OPENAI_API
-            and openai_series(name or "") is not None
+            connection.runtime in (Runtime.OPENAI_API, Runtime.ANTHROPIC_API)
+            and short_series(connection.runtime, name or "") is not None
             and repr(connection) not in getattr(self, "_model_catalogues", {})
         )
 
@@ -937,7 +940,11 @@ class Bridge:
         written, sent = request.plan.model_named, request.plan.model
         if not written:
             return receipt
-        newest = ", the newest in its series" if openai_series(written) else ""
+        # "newest" only where modelpass chose from a list. The subscription
+        # runtime chooses for itself, and a lower-cased id is no choice at all.
+        runtime = request.connection.runtime
+        chosen = runtime is not Runtime.ANTHROPIC_SDK and short_series(runtime, written)
+        newest = ", the newest in its series" if chosen else ""
         note = f"model {written!r} was read as {sent!r}{newest}"
         return replace(receipt, notes=(*receipt.notes, note))
 
@@ -3426,8 +3433,8 @@ class Bridge:
         refusal here is a caller mistake, and a caller mistake should never
         reach the point of launching a runtime.
 
-        One exception since 2026-11-25: a short model name on an ``openai-api``
-        connection whose list is not cached needs that list. ``achat`` passes
+        One exception since 2026-11-25: a short model name on an API connection
+        whose model list is not cached needs that list. ``achat`` passes
         ``defer_model_list`` and reads it off the loop instead.
         """
         resolved = self._resolve(connection)
@@ -3823,11 +3830,12 @@ class Bridge:
         target = call.failover
         if (
             target is not None
-            # openai-api too: the second leg may have to request a model list
+            # An API target too, when its leg has to request a model list
             # before it can read a short name.
             and (
                 target.runtime not in API_RUNTIMES
-                or target.runtime is Runtime.OPENAI_API
+                or self._needs_model_list(target, target.model)
+                or self._needs_model_list(target, call.leg.request.plan.model_named)
             )
             and call.failover_due()
         ):

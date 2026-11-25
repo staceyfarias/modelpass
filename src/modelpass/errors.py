@@ -298,9 +298,9 @@ class NoSuchModel(SubpassError, ValueError):
     Raised by :meth:`~modelpass.models.ModelCatalogue.resolve` and
     :meth:`~modelpass.bridge.Bridge.with_model` (2026-11-18), whose message
     lists what the catalogue does offer. Also raised, since 2026-11-25, by any
-    call that names ``sol``, ``astra``, ``terra`` or ``luna`` where the
-    connection's model list cannot say which id that is. An argument problem,
-    so also a ``ValueError``.
+    call that names a short series name (``sol``, ``opus`` and the rest) where
+    the connection's model list cannot say which id that is. An argument
+    problem, so also a ``ValueError``.
     """
 
 
